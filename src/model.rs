@@ -96,11 +96,15 @@ pub struct DeviceUsage {
     pub available_bytes: u64,
     /// The device, a partition or a stacked device is active swap.
     pub swap: bool,
-    /// Block devices of the filesystems counted above, so totals over several
-    /// disks count a filesystem spanning them (LVM, btrfs RAID) once. Empty
-    /// from older helpers.
+    /// Actual block device names of the filesystems counted above. Empty
+    /// from older helpers; synthetic accounting IDs never appear here.
     #[serde(default)]
     pub block_devices: Vec<String>,
+    /// Accounting IDs for deduplicating filesystems across disks: block device
+    /// names, or `zfs:<pool>` for a pool shared by datasets and disks. Older
+    /// helpers omit this field; consumers fall back to `block_devices`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounting_keys: Vec<String>,
 }
 
 impl DeviceUsage {
@@ -125,11 +129,14 @@ impl DeviceUsage {
         };
         let mut seen = std::collections::BTreeSet::new();
         for filesystem in filesystems {
-            let Some(device) = filesystem.block_device.as_ref() else {
+            let Some(device) = filesystem.accounting_key() else {
                 continue;
             };
             // Multi-device btrfs counts on every member disk.
-            let on_member = members.contains(device)
+            let on_member = filesystem
+                .block_device
+                .as_ref()
+                .is_some_and(|name| members.contains(name))
                 || filesystem
                     .member_devices
                     .iter()
@@ -137,13 +144,14 @@ impl DeviceUsage {
             if !on_member || !seen.insert(device.clone()) {
                 continue;
             }
-            usage.block_devices.push(device.clone());
-            match (
-                filesystem.total_bytes,
-                filesystem.used_bytes,
-                filesystem.available_bytes,
-            ) {
-                (Some(total), Some(used), Some(available)) => {
+            usage.accounting_keys.push(device);
+            if let Some(name) = &filesystem.block_device
+                && !usage.block_devices.contains(name)
+            {
+                usage.block_devices.push(name.clone());
+            }
+            match filesystem.accounting_usage() {
+                Some((total, used, available)) => {
                     usage.filesystems += 1;
                     usage.total_bytes = usage.total_bytes.saturating_add(total);
                     usage.used_bytes = usage.used_bytes.saturating_add(used);
@@ -229,10 +237,13 @@ pub struct Filesystem {
     pub dev: String,
     /// Block device in /proc/diskstats that backs this filesystem.
     pub block_device: Option<String>,
-    /// All devices of a multi-device btrfs filesystem, including
+    /// All known devices of a multi-device btrfs filesystem or ZFS pool, including
     /// `block_device`; empty for single-device filesystems.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub member_devices: Vec<String>,
+    /// Pool-wide physical allocation, separate from this dataset's statvfs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zfs: Option<ZfsPool>,
     pub read_only: bool,
     pub total_bytes: Option<u64>,
     pub used_bytes: Option<u64>,
@@ -252,6 +263,20 @@ pub struct Filesystem {
 }
 
 impl Filesystem {
+    pub fn accounting_key(&self) -> Option<String> {
+        if self.fs_type == "zfs" {
+            return self.zfs.as_ref().map(|pool| format!("zfs:{}", pool.name));
+        }
+        self.block_device.clone()
+    }
+
+    pub fn accounting_usage(&self) -> Option<(u64, u64, u64)> {
+        if self.fs_type == "zfs" {
+            let pool = self.zfs.as_ref()?;
+            return Some((pool.total_bytes?, pool.used_bytes?, pool.available_bytes?));
+        }
+        Some((self.total_bytes?, self.used_bytes?, self.available_bytes?))
+    }
     /// Usage like df: used / (used + available), so reserved blocks count as full.
     pub fn use_percent(&self) -> Option<f64> {
         let used = self.used_bytes? as f64;
@@ -263,6 +288,17 @@ impl Filesystem {
         let total = self.inodes_total.filter(|total| *total > 0)? as f64;
         Some(self.inodes_used? as f64 / total * 100.0)
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZfsPool {
+    pub name: String,
+    pub total_bytes: Option<u64>,
+    pub used_bytes: Option<u64>,
+    pub available_bytes: Option<u64>,
+    /// Membership/usage unavailable or incomplete; never silently infer it
+    /// from a dataset's quota-dependent statvfs values.
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,6 +523,7 @@ mod tests {
         assert_eq!(usage.unmeasured, 1);
         assert_eq!((usage.used_bytes, usage.total_bytes), (320, 400));
         assert_eq!(usage.percent(), Some(80.0));
+        assert_eq!(usage.accounting_keys, usage.block_devices);
         let none =
             DeviceUsage::from_filesystems(&filesystems, &BTreeSet::from(["sdb".into()]), true);
         assert_eq!(none.filesystems, 0);
@@ -500,5 +537,69 @@ mod tests {
         )
         .unwrap();
         assert!(device.usage.is_none());
+        let legacy: DeviceUsage = serde_json::from_str(
+            r#"{"filesystems":1,"unmeasured":0,"total_bytes":100,"used_bytes":40,"available_bytes":60,"swap":false,"block_devices":["sda1"]}"#
+        ).unwrap();
+        assert_eq!(legacy.block_devices, ["sda1"]);
+        assert!(legacy.accounting_keys.is_empty());
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("accounting_keys")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn zfs_counts_each_pool_once_across_datasets_on_every_member() {
+        let dataset = |source: &str, pool: &str, used: u64| Filesystem {
+            source: source.into(),
+            fs_type: "zfs".into(),
+            block_device: Some("sda1".into()),
+            member_devices: vec!["sda1".into(), "sdb1".into()],
+            // Deliberately contradictory quota-dependent dataset values.
+            total_bytes: Some(80),
+            used_bytes: Some(10),
+            available_bytes: Some(70),
+            zfs: Some(ZfsPool {
+                name: pool.into(),
+                total_bytes: Some(1000),
+                used_bytes: Some(used),
+                available_bytes: Some(1000 - used),
+                error: None,
+            }),
+            ..Filesystem::default()
+        };
+        let rows = vec![
+            dataset("tank/home", "tank", 400),
+            dataset("tank", "tank", 400),
+            dataset("tank/home/user", "tank", 400),
+            dataset("other/child", "other", 200),
+        ];
+        for disk in ["sda1", "sdb1"] {
+            let usage = DeviceUsage::from_filesystems(&rows, &BTreeSet::from([disk.into()]), false);
+            assert_eq!(usage.filesystems, 2);
+            assert_eq!(
+                (usage.total_bytes, usage.used_bytes, usage.available_bytes),
+                (2000, 600, 1400)
+            );
+            assert_eq!(usage.accounting_keys, ["zfs:tank", "zfs:other"]);
+            assert_eq!(usage.block_devices, ["sda1"]);
+        }
+        let mut unavailable = dataset("tank/home", "tank", 400);
+        unavailable.zfs.as_mut().unwrap().used_bytes = None;
+        let usage =
+            DeviceUsage::from_filesystems([&unavailable], &BTreeSet::from(["sdb1".into()]), false);
+        assert_eq!(
+            (usage.filesystems, usage.unmeasured, usage.used_bytes),
+            (0, 1, 0)
+        );
+        unavailable.zfs = None; // An older helper must not count a dataset as a pool.
+        assert!(unavailable.accounting_usage().is_none());
+        unavailable.member_devices.clear();
+        unavailable.block_device = None;
+        let usage =
+            DeviceUsage::from_filesystems([&unavailable], &BTreeSet::from(["sdb1".into()]), false);
+        assert_eq!(usage.filesystems, 0);
     }
 }

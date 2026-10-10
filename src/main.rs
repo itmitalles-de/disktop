@@ -781,6 +781,23 @@ fn print_snapshot(out: &mut impl Write, app: &App, snapshot: &Snapshot) -> io::R
     if !snapshot.truncated.is_empty() {
         writeln!(out, "WARNING {}", Lang::En.truncated(&snapshot.truncated))?;
     }
+    let mut warned_pools = std::collections::BTreeSet::new();
+    for pool in snapshot
+        .filesystems
+        .iter()
+        .filter_map(|row| row.zfs.as_ref())
+    {
+        if let Some(error) = &pool.error
+            && warned_pools.insert(&pool.name)
+        {
+            writeln!(
+                out,
+                "WARNING ZFS pool {}: {}",
+                disktop::text::sanitize(&pool.name),
+                disktop::text::sanitize(error)
+            )?;
+        }
+    }
     match app.selected_rates() {
         Some(rates) => writeln!(
             out,
@@ -1025,6 +1042,34 @@ mod tests {
             "hidden devices stay hidden: {text}"
         );
         assert!(text.contains("HOME /home"), "{text}");
+    }
+
+    #[test]
+    fn once_reports_unavailable_zfs_once_per_pool() {
+        let pool = disktop::model::ZfsPool {
+            name: "tank".into(),
+            error: Some("ZFS pool discovery pending".into()),
+            ..Default::default()
+        };
+        let snapshot = Snapshot {
+            filesystems: ["tank", "tank/home"]
+                .into_iter()
+                .map(|source| disktop::model::Filesystem {
+                    source: source.into(),
+                    fs_type: "zfs".into(),
+                    zfs: Some(pool.clone()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut app = App::new(None, Settings::default(), false);
+        app.update(snapshot.clone());
+        let mut output = Vec::new();
+        print_snapshot(&mut output, &app, &snapshot).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("WARNING ZFS pool tank:").count(), 1);
+        assert!(output.contains("ZFS pool discovery pending"));
     }
 
     #[test]

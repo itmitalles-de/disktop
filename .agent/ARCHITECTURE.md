@@ -41,8 +41,18 @@ size and dm/md label every sample, and resolves partitions (one map per
 sample), holders (cached per sample) and slaves to map mounts to devices and
 the home path to a whole disk. Devices with slaves and bcache/drbd/zd/nbd are
 kind `Stacked` (virtual). Multi-device btrfs maps to every member from
-/sys/fs/btrfs/<uuid>/devices; `DeviceUsage.block_devices` lets the all-disks
-total count such filesystems once. Pseudo-files are read up to 16 MiB, cut at
+/sys/fs/btrfs/<uuid>/devices. `zfs.rs` discovers mounted pools asynchronously
+through a trusted root-owned `zpool list -H -p -L -P -v` executable, with a
+cleared environment, no child capabilities, NO_NEW_PRIVS and parent-death kill.
+Queries have a 500 ms/1 MiB bound, one outstanding worker and a 5 s refresh.
+Known leaf members map through the same partition/holder logic; pool allocation
+is separate from quota-dependent dataset statvfs. Pending/failed refreshes keep
+last known membership with unknown capacity. File-backed/unresolved vdevs are
+reported, not inferred. No subprocess runs without a mounted ZFS dataset.
+`DeviceUsage.accounting_keys` deduplicates block-backed filesystems and
+`zfs:<pool>` allocations across disks/datasets. `block_devices` retains real
+device names for compatibility; the UI falls back to it for older helpers.
+Pseudo-files are read up to 16 MiB, cut at
 the last complete line and listed in `Snapshot.truncated`. `probe.rs` keeps
 blocking calls off the sampling thread: lstat/statvfs of storage mounts run in a
 worker with a 0.5 s timeout (hung mounts become `not_responding` and are
@@ -59,7 +69,7 @@ reply's own statvfs values, sysfs, /proc/swaps); `main.rs` then shows a
 one-time "helper is older" notice. `mounts.rs` parses mountinfo
 (octal escapes decoded, IDs and superblock options kept), drops over-mounted
 mounts (`visible`), filters to storage filesystems (no pseudo, network or
-FUSE mounts, no file bind mounts), dedupes bind mounts by (dev, root) and calls
+generic FUSE mounts (fuseblk is eligible), no file bind mounts), dedupes bind mounts by (dev, root) and calls
 statvfs. The home filesystem is the longest visible mount prefix of any type,
 marked only if it is storage. `procio.rs` reads /proc/PID/stat, io and cmdline
 with bounded reads, keys baselines by (pid, start time), computes rates from
@@ -67,15 +77,24 @@ per-thread /proc/PID/task/TID/io deltas keyed by (tid, start time) (read only
 when the process total changed; >10,000 threads fall back to the total), counts
 EACCES as hidden, resolves user names only outside the helper, and in the
 helper applies /proc's hidepid to other users (1: comm only, 2: omitted).
+Direct collection also detects hidepid: stat EACCES counts as unreadable,
+while invisible processes have no fabricated total. The TUI warns even when
+the kernel hides enumeration; gid exemptions retain the kernel's behavior.
 
 `scanner.rs` runs the home scan in a `disktop-scan` thread (idle I/O priority,
 nice 10, only DAC_READ_SEARCH). It walks with fdopendir/readdir, fstatat
 (AT_SYMLINK_NOFOLLOW) and openat (O_DIRECTORY|O_NOFOLLOW), re-checks dev/inode
 after opening, skips other filesystems, dedupes hard links in a bounded set and
 stops at entry, time, depth or cancellation limits. Retained directories live
-in a slab: per directory an exact streaming top-K, and globally an eviction
-that keeps shallower, then larger finished directories, so visit order does not
-decide what is shown; everything evicted is folded into the parent's summary.
+in a slab: per directory a streaming top-K; global eviction divides nodes
+equally between root-child subtrees, lending unused shares to subtrees with
+more detail. Within each share, shallower then larger finished directories
+win. Active ancestors count against their subtree; a keep_depth allowance
+during the walk protects finished neighbours. Output obeys max_nodes; the
+working slab stays below 2*max_nodes+keep_depth+1. Evicted totals fold into
+parent summaries. If root children exceed top_children/max_nodes, some are
+necessarily summarized. Streaming evictions are irreversible, so surviving
+descendant names can still vary with traversal order.
 `HomeService` rescans periodically or on request, numbers reports by
 generation (only newer trees are sent), and annotates growth per retained path
 (only for complete scans; budget-stopped scans are neither annotated nor a
