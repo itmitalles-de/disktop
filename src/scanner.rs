@@ -2055,7 +2055,7 @@ mod tests {
                 names.push(name);
             }
         }
-        for pair in names.chunks_exact(2) {
+        for pair in names.as_chunks::<2>().0 {
             assert_eq!(display_name(&pair[0]), display_name(&pair[1]));
             assert_ne!(name_key(&pair[0]), name_key(&pair[1]));
         }
