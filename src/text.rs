@@ -68,6 +68,49 @@ pub fn format_bytes(bytes: f64) -> String {
     format!("{value:.decimals$} {unit}")
 }
 
+/// htop-style compact bytes for meters: "512B", "12.3M", "160M", "1.4T".
+pub fn format_bytes_short(bytes: f64) -> String {
+    let units = ["B", "K", "M", "G", "T", "P"];
+    let mut value = if bytes.is_finite() {
+        bytes.max(0.0)
+    } else {
+        0.0
+    };
+    let mut index = 0;
+    loop {
+        let decimals = usize::from(index > 0 && value < 99.95);
+        let factor = 10f64.powi(decimals as i32);
+        let rounded = (value * factor).round() / factor;
+        if rounded < 1023.5 || index + 1 == units.len() {
+            return format!("{rounded:.decimals$}{}", units[index]);
+        }
+        value /= 1024.0;
+        index += 1;
+    }
+}
+
+/// At most four characters for one-row meters: "5.9M", "80M", "512B".
+pub fn format_bytes_tiny(bytes: f64) -> String {
+    let units = ["B", "K", "M", "G", "T", "P"];
+    let mut value = if bytes.is_finite() {
+        bytes.max(0.0)
+    } else {
+        0.0
+    };
+    let mut index = 0;
+    loop {
+        let decimals = usize::from(index > 0 && value < 9.95);
+        let factor = 10f64.powi(decimals as i32);
+        let rounded = (value * factor).round() / factor;
+        // Three digits at most, so 1000-1023 of a unit move to the next one.
+        if rounded < 999.5 || index + 1 == units.len() {
+            return format!("{rounded:.decimals$}{}", units[index]);
+        }
+        value /= 1024.0;
+        index += 1;
+    }
+}
+
 pub fn format_rate(bytes: f64) -> String {
     format!("{}/s", format_bytes(bytes))
 }
@@ -215,6 +258,33 @@ mod tests {
         assert_eq!(format_delta(-2048), "-2.0 KiB");
         assert_eq!(format_delta(i64::MIN), "-8192.0 PiB");
         assert_eq!(format_delta(1536), "+1.5 KiB");
+        assert_eq!(format_bytes_short(512.0), "512B");
+        assert_eq!(format_bytes_short(1023.6), "1.0K");
+        assert_eq!(format_bytes_short(12.34 * 1024.0 * 1024.0), "12.3M");
+        assert_eq!(format_bytes_short(160.4 * 1024.0 * 1024.0), "160M");
+        assert_eq!(format_bytes_short(1.4 * 1024f64.powi(4)), "1.4T");
+        assert_eq!(format_bytes_short(f64::NAN), "0B");
+        let mut value = 0.5;
+        while value < 1e17 {
+            assert!(
+                format_bytes_short(value).len() <= 5,
+                "{}",
+                format_bytes_short(value)
+            );
+            value *= 1.0007;
+        }
+        assert_eq!(format_bytes_tiny(5.94 * 1024.0 * 1024.0), "5.9M");
+        assert_eq!(format_bytes_tiny(79.7 * 1024.0 * 1024.0), "80M");
+        assert_eq!(format_bytes_tiny(1010.0), "1.0K");
+        let mut value = 0.5;
+        while value < 1e17 {
+            assert!(
+                format_bytes_tiny(value).len() <= 4,
+                "{}",
+                format_bytes_tiny(value)
+            );
+            value *= 1.0007;
+        }
         assert_eq!(format_count(0), "0");
         assert_eq!(format_count(1_234_567), "1,234,567");
         assert_eq!(format_short_count(999.4), "999");

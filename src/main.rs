@@ -1,5 +1,9 @@
 use std::{
     io::{self, IsTerminal, Write},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -7,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use crossterm::event::{self, Event, KeyEventKind};
 use disktop::{
-    collector::{Collector, default_device},
+    collector::{Collector, complete_storage, default_device},
     config::{ConfigFile, RootWithForeignSettings, Settings, SortKey, View},
     demo, diskstats,
     helper::Client,
@@ -112,7 +116,12 @@ fn parse_home_path(value: &str) -> Result<String, String> {
 
 enum Source {
     Live(Box<Collector>),
-    Helper(Client),
+    /// `outdated` is set once a reply lacked fields that newer helpers send.
+    Helper {
+        client: Client,
+        sysfs: diskstats::Sysfs,
+        outdated: bool,
+    },
     Demo {
         tick: u64,
         start: Instant,
@@ -127,7 +136,16 @@ impl Source {
     fn sample(&mut self, request: &HomeRequest, shutdown: &SignalGuard) -> Result<Snapshot> {
         match self {
             Self::Live(collector) => collector.sample(request),
-            Self::Helper(client) => client.sample(request, || shutdown.requested()),
+            Self::Helper {
+                client,
+                sysfs,
+                outdated,
+            } => {
+                let mut snapshot = client.sample(request, || shutdown.requested())?;
+                // An older helper sends no fill levels; they need no privilege.
+                *outdated |= complete_storage(sysfs, &mut snapshot);
+                Ok(snapshot)
+            }
             Self::Demo { tick, start } => {
                 let snapshot = demo::snapshot(
                     *tick,
@@ -147,7 +165,7 @@ impl Source {
     /// monitor; direct, unprivileged collection replaces it.
     fn is_helper(&self) -> bool {
         match self {
-            Self::Helper(_) => true,
+            Self::Helper { .. } => true,
             #[cfg(test)]
             Self::Failing { helper } => *helper,
             _ => false,
@@ -160,6 +178,7 @@ enum Notice {
     Settings(String),
     UnknownKeys(Vec<String>),
     DeviceUnavailable(String),
+    HelperOutdated,
 }
 
 impl Notice {
@@ -168,6 +187,7 @@ impl Notice {
             Self::Settings(error) => lang.settings_problem(error),
             Self::UnknownKeys(keys) => lang.unknown_keys(keys),
             Self::DeviceUnavailable(name) => lang.device_unavailable(name),
+            Self::HelperOutdated => lang.helper_outdated(),
         }
     }
 }
@@ -265,7 +285,11 @@ fn main() -> Result<()> {
         }
     } else if !args.no_helper && unsafe { libc::geteuid() } != 0 {
         match Client::start() {
-            Ok(client) => Source::Helper(client),
+            Ok(client) => Source::Helper {
+                client,
+                sysfs: diskstats::Sysfs::default(),
+                outdated: false,
+            },
             Err(error) => {
                 helper_error = Some(error);
                 direct_collector()?
@@ -303,6 +327,11 @@ fn main() -> Result<()> {
         && !format!("{error:#}").contains("not installed")
     {
         eprintln!("Helper: {error:#}. Run scripts/setup-helper.sh once; see README.");
+    }
+    if matches!(source, Source::Helper { outdated: true, .. }) {
+        let notice = Notice::HelperOutdated;
+        eprintln!("{}", notice.text(Lang::En));
+        notices.push(notice);
     }
     if let Some(name) = app.device.clone()
         && !first.devices.iter().any(|device| device.name == name)
@@ -347,6 +376,7 @@ fn main() -> Result<()> {
     // Setup can also reset previously colored cells and override NO_COLOR.
     crossterm::style::force_color_output(true);
     let mut terminal = ratatui::init();
+    let finished = spawn_hangup_watchdog(&shutdown);
     let result = run(
         &mut terminal,
         &mut source,
@@ -354,8 +384,107 @@ fn main() -> Result<()> {
         config.as_ref(),
         &shutdown,
     );
-    ratatui::restore();
+    // A failed write to a terminal that hung up is a hangup, not an error.
+    if result.is_err() && terminal_input() == Input::HangUp {
+        shutdown.request();
+    }
+    // ratatui::restore and Terminal's drop report failures with eprintln!,
+    // which panics (and then aborts in the panic hook) when stderr is the
+    // hung-up terminal. There is nothing left to restore on it.
+    if shutdown.requested() && terminal_input() == Input::HangUp {
+        std::mem::forget(terminal);
+    } else {
+        drop(terminal);
+    }
+    if let Err(error) = ratatui::try_restore()
+        && !shutdown.requested()
+    {
+        let _ = writeln!(io::stderr(), "Failed to restore terminal: {error}");
+    }
+    // The helper is stopped and reaped before the watchdog may give up.
+    drop(source);
+    finished.store(true, Ordering::Relaxed);
     if shutdown.requested() { Ok(()) } else { result }
+}
+
+/// State of the terminal input (standard input) after waiting for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Input {
+    Ready,
+    Idle,
+    /// The terminal hung up: its window closed or the PTY master went away.
+    HangUp,
+}
+
+/// Wait up to `timeout` for terminal input. A hung-up terminal reports
+/// POLLHUP/POLLERR and end of file; crossterm 0.29 retries such reads in an
+/// endless loop, so it must only read once this check has passed.
+fn wait_for_input(timeout: Duration) -> Input {
+    let mut descriptor = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
+    // SAFETY: one valid pollfd for the duration of the call.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
+    if ready < 0 {
+        // EINTR from a signal: the caller checks the shutdown flag.
+        return Input::Idle;
+    }
+    if descriptor.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        Input::HangUp
+    } else if descriptor.revents & libc::POLLIN != 0 {
+        Input::Ready
+    } else {
+        Input::Idle
+    }
+}
+
+fn terminal_input() -> Input {
+    wait_for_input(Duration::ZERO)
+}
+
+/// Safety net for the short window between `wait_for_input` and crossterm's
+/// read: if the terminal hangs up and the monitor has not finished within two
+/// seconds, exit like SIGHUP instead of spinning on end of file. The helper
+/// then sees end of file on its private pipe and exits by itself.
+fn spawn_hangup_watchdog(shutdown: &SignalGuard) -> Arc<AtomicBool> {
+    let finished = Arc::new(AtomicBool::new(false));
+    let done = Arc::clone(&finished);
+    let requested = shutdown.flag();
+    let spawned = std::thread::Builder::new()
+        .name("disktop-hangup".into())
+        .spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                let mut descriptor = libc::pollfd {
+                    fd: libc::STDIN_FILENO,
+                    events: 0,
+                    revents: 0,
+                };
+                // SAFETY: one valid pollfd for the duration of the call.
+                let ready = unsafe { libc::poll(&mut descriptor, 1, 250) };
+                let hung_up = ready > 0
+                    && descriptor.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+                if !hung_up {
+                    continue;
+                }
+                requested.store(true, Ordering::Relaxed);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline {
+                    if done.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                std::process::exit(0);
+            }
+        });
+    if spawned.is_err() {
+        // Without the safety net the main loop still detects hangups itself.
+        finished.store(true, Ordering::Relaxed);
+    }
+    finished
 }
 
 /// Wait without blocking termination signals.
@@ -501,7 +630,14 @@ fn run(
             if remaining.is_zero() {
                 break false;
             }
-            if event::poll(remaining.min(Duration::from_millis(100)))? {
+            if wait_for_input(remaining.min(Duration::from_millis(100))) == Input::HangUp {
+                // A closed terminal window ends the monitor like SIGHUP.
+                shutdown.request();
+                break 'running;
+            }
+            // Keys, and resizes from crossterm's own signal pipe; the input
+            // was checked above, so this read cannot spin on end of file.
+            if event::poll(Duration::ZERO)? {
                 break true;
             }
         };
@@ -591,6 +727,59 @@ fn print_snapshot(out: &mut impl Write, app: &App, snapshot: &Snapshot) -> io::R
         )?,
         None => writeln!(out, "READ -  WRITE -  (no rates for this interval)")?,
     }
+    // Every disk of the overview, as the terminal UI shows them.
+    writeln!(out)?;
+    writeln!(
+        out,
+        "{:<12}  {:<5}  {:>12}  {:>12}  {:>6}  {:>9}  {:>4}  {:<21}  MOUNTS",
+        "DISK", "TYPE", "READ/s", "WRITE/s", "UTIL", "AWAIT", "USE", "USED / SIZE"
+    )?;
+    for device in app.overview_devices() {
+        let rates = device.rates.as_ref();
+        let usage = device.usage.as_ref();
+        let (percent, used) = match usage {
+            Some(usage) => match usage.percent() {
+                Some(percent) => (
+                    format!("{percent:.0}%"),
+                    format!(
+                        "{} / {}",
+                        format_bytes(usage.used_bytes as f64),
+                        format_bytes(usage.used_bytes.saturating_add(usage.available_bytes) as f64)
+                    ),
+                ),
+                None if usage.filesystems == 0 && usage.unmeasured == 0 => (
+                    "-".into(),
+                    if usage.swap {
+                        "swap only"
+                    } else {
+                        "not mounted"
+                    }
+                    .into(),
+                ),
+                None => ("-".into(), "-".into()),
+            },
+            None => ("-".into(), "-".into()),
+        };
+        writeln!(
+            out,
+            "{:<12}  {:<5}  {:>12}  {:>12}  {:>6}  {:>9}  {:>4}  {:<21}  {}",
+            truncate(&device.name, 12),
+            device.kind.label(),
+            optional_rate(rates.map(|rates| rates.read_rate)),
+            optional_rate(rates.map(|rates| rates.write_rate)),
+            rates.map_or_else(
+                || "-".to_owned(),
+                |rates| format!("{:.1}%", rates.utilization_percent)
+            ),
+            rates
+                .and_then(|rates| rates.await_ms)
+                .map_or_else(|| "-".to_owned(), |value| format!("{value:.2} ms")),
+            percent,
+            used,
+            truncate(&device.mounts.join(" "), 40)
+        )?;
+    }
+    writeln!(out)?;
     let access = &snapshot.process_access;
     writeln!(
         out,
@@ -749,6 +938,18 @@ mod tests {
         let text = String::from_utf8(output).unwrap();
         assert!(text.starts_with("disktop DEMO  nvme0n1 (NVMe"), "{text}");
         assert!(text.contains("*/home"), "{text}");
+        // Every disk of the overview is listed with rates and fill level.
+        for disk in ["nvme0n1 ", "nvme1n1 ", "sda ", "sdb "] {
+            assert!(
+                text.lines().any(|line| line.starts_with(disk)),
+                "{disk} missing: {text}"
+            );
+        }
+        assert!(text.contains("not mounted"), "{text}");
+        assert!(
+            !text.contains("\nloop0 "),
+            "hidden devices stay hidden: {text}"
+        );
         assert!(text.contains("HOME /home"), "{text}");
     }
 
@@ -780,7 +981,10 @@ mod tests {
         assert!(matches!(source, Source::Demo { .. }));
         assert!(app.notice_error);
         assert!(app.notice.as_deref().unwrap().starts_with("Helper failed"));
-        assert_eq!(app.history.len(), 1, "fallback samples immediately");
+        assert!(
+            !app.history.is_empty() && app.history.values().all(|samples| samples.len() == 1),
+            "fallback samples immediately"
+        );
 
         let mut app = App::new(Some("nvme0n1".into()), Settings::default(), true);
         let mut source = Source::Failing { helper: true };

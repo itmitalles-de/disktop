@@ -118,7 +118,7 @@ def check_threads(binary, account):
             start_new_session=True,
             **unprivileged(account),
         )
-        wait_until(lambda: read_terminal(master, output, 0.05) or b"Device" in output, "PTY monitor")
+        wait_until(lambda: read_terminal(master, output, 0.05) or b"Focus" in output, "PTY monitor")
         helper_pid = wait_until(lambda: children(monitor.pid), "helper child")[0]
 
         def scanner_started():
@@ -292,7 +292,7 @@ def start_pty_monitor(binary, account, interval):
     )
     output = bytearray()
     deadline = time.monotonic() + 5
-    while b"Device" not in output or b"\x1b[?1049h" not in output:
+    while b"Focus" not in output or b"\x1b[?1049h" not in output:
         assert monitor.poll() is None, f"PTY monitor exited: {output!r}"
         assert time.monotonic() < deadline, f"PTY monitor did not draw: {output!r}"
         read_terminal(master, output, 0.05)
@@ -441,6 +441,30 @@ def check_installer(script, build, account):
           "changed/untracked/symlink refusal")
 
 
+def check_terminal_hangup(binary, account):
+    """A terminal that goes away (PTY master closed, no SIGHUP) ends the UI
+    promptly; the UI stops and reaps its helper itself."""
+    master, slave, before, monitor, helper_pid, _ = start_pty_monitor(binary, account, "60")
+    try:
+        os.close(master)
+        master = None
+        started = time.monotonic()
+        monitor.wait(timeout=3)
+        elapsed = time.monotonic() - started
+        assert monitor.returncode == 0, f"hangup exit code {monitor.returncode}"
+        assert not Path(f"/proc/{helper_pid}").exists(), "helper was not stopped and reaped by the UI"
+        print(f"PASS terminal hangup: UI exited cleanly after {elapsed:.2f}s and reaped its helper")
+    finally:
+        if monitor.poll() is None:
+            monitor.kill()
+            monitor.wait(timeout=3)
+        if master is not None:
+            # Only a terminal that is still open can be restored.
+            termios.tcsetattr(slave, termios.TCSANOW, before)
+            os.close(master)
+        os.close(slave)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--isolated", action="store_true", help="confirm this is a disposable container/runner")
@@ -484,6 +508,7 @@ def main():
                 check_stopped_helper(binary, account)
                 check_stopped_helper(binary, account, signal_exit=False)
                 check_abrupt_exit(binary, account)
+                check_terminal_hangup(binary, account)
     finally:
         # These paths were absent before this explicitly isolated test started.
         for path in (HELPER, RECEIPT):

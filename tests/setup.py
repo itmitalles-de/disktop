@@ -52,7 +52,7 @@ DEFAULT_ARGUMENTS = ("--interval", "0.1", "--history", "10")
 
 
 class Terminal:
-    def __init__(self, binary, config_home, arguments=DEFAULT_ARGUMENTS, ready=b"Device", **env):
+    def __init__(self, binary, config_home, arguments=DEFAULT_ARGUMENTS, ready=b"Focus", **env):
         self.binary = binary
         self.config_home = config_home
         self.arguments = arguments
@@ -166,9 +166,14 @@ DEFAULTS = {
     "show_idle": False,
     "language": "auto",
     "show_virtual": False,
+    "show_stacked": False,
     "home_path": "/home",
     "rescan_minutes": 5,
     "apparent_size": False,
+    "process_rows": 5,
+    "show_io_series": True,
+    "show_usage_series": True,
+    "usage_color": "magenta",
 }
 
 
@@ -182,8 +187,8 @@ def persistence_and_overrides(binary, config_home):
         # General: move from Color to the update interval and increase it.
         mark = terminal.send(RIGHT + DOWN + b"+")
         terminal.expect(b"Unsaved changes", mark)
-        # Device: show loop/ram/zram, then select All disks.
-        terminal.send(LEFT + DOWN + RIGHT + b" " + DOWN + DOWN + b"\r")
+        # Device: show loop/ram/zram and stacked devices, then select All disks.
+        terminal.send(LEFT + DOWN + RIGHT + b" " + DOWN + b" " + DOWN + DOWN + b"\r")
         # Chart: Braille drawing and the next read color.
         terminal.send(LEFT + DOWN + RIGHT + DOWN + DOWN + b"\r" + DOWN + b"+")
         # Home: apparent sizes, then edit the path to /tmp.
@@ -205,6 +210,7 @@ def persistence_and_overrides(binary, config_home):
             "read_color": "yellow",
             "device": "all",
             "show_virtual": True,
+            "show_stacked": True,
             "apparent_size": True,
             "home_path": "/tmp",
         }
@@ -284,7 +290,7 @@ def overrides_not_persisted(binary, config_home):
 
 def german_interface(binary, config_home):
     path = config_home / "disktop/config.json"
-    with Terminal(binary, config_home, ready="Gerät".encode(), LC_ALL=None, LANG="de_DE.UTF-8") as terminal:
+    with Terminal(binary, config_home, ready="Fokus".encode(), LC_ALL=None, LANG="de_DE.UTF-8") as terminal:
         terminal.expect("Hilfe".encode())
         terminal.expect("Speichern".encode())
         terminal.expect(b"LESEN/s")
@@ -301,6 +307,54 @@ def german_interface(binary, config_home):
         terminal.send(F10)
         terminal.quit()
     print("PASS language: German from LANG, Setup switches to English and F12 saves it")
+
+
+def disk_overview(binary, config_home):
+    """All disks are visible at once; the new overview options persist."""
+    path = config_home / "disktop/config.json"
+    with Terminal(binary, config_home) as terminal:
+        # Unchanged (blank) cells are not redrawn, so look for space-free text.
+        for text in (b"Disks", b"nvme0n1", b"nvme1n1", b"sda", b"sdb", b"mounted]", b"100%",
+                     b"COMMAND"):
+            terminal.expect(text)
+        # Tab moves the focus to the next disk; F12 below saves it.
+        terminal.send(b"\t")
+        mark = terminal.send(F2)
+        terminal.expect(b"Options", mark)
+        # Chart: hide the fill-level series and change its color.
+        terminal.send(DOWN + DOWN + RIGHT + DOWN * 6 + b"\r" + DOWN + b"+")
+        # Table: three process rows.
+        mark = terminal.send(LEFT + DOWN + RIGHT + DOWN * 3 + b"-")
+        # Only changed cells are redrawn: 5 -> 4 -> 3 shows as "4" then "3".
+        terminal.expect(b"Process rows", mark)
+        mark = terminal.send(b"-")
+        terminal.expect(b"3", mark)
+        terminal.send(F12)
+        terminal.wait_for(lambda: read_saved(path) is not None, "F12 saved overview options")
+        saved = read_saved(path)
+        expected = {
+            **DEFAULTS,
+            "show_usage_series": False,
+            "usage_color": "white",
+            "process_rows": 3,
+            "device": "nvme1n1",
+        }
+        assert saved == expected, f"overview options were not saved exactly: {saved}"
+        terminal.send(F10)
+        terminal.quit()
+    stdout, _ = run_once(binary, config_home, "--interval", "0.1")
+    disks = [line.split()[0] for line in stdout.splitlines()
+             if line.startswith(("nvme", "sd", "loop", "dm-"))]
+    assert disks == ["nvme0n1", "nvme1n1", "sda", "sdb"], f"--once disk list: {stdout}"
+    assert "not mounted" in stdout, stdout
+    stdout, _ = run_once(binary, config_home, "--interval", "0.1", mode="--json")
+    devices = {d["name"]: d for d in json.loads(stdout)["devices"]}
+    assert devices["sdb"]["usage"]["filesystems"] == 0, devices["sdb"]
+    assert devices["nvme0n1"]["usage"]["filesystems"] == 3, devices["nvme0n1"]
+    # LUKS on nvme1n1 is listed in JSON but folded into nvme1n1 on screen.
+    assert devices["dm-0"]["backing_disks"] == ["nvme1n1"], devices["dm-0"]
+    assert devices["nvme1n1"]["usage"]["filesystems"] == 1, devices["nvme1n1"]
+    print("PASS overview: all disks with meters and graphs, Tab focus, options saved, --once/--json usage")
 
 
 def views_and_home(binary, config_home):
@@ -374,6 +428,7 @@ def main():
         persistence_and_overrides(binary, root / "preferences")
         overrides_not_persisted(binary, root / "overrides")
         german_interface(binary, root / "german")
+        disk_overview(binary, root / "overview")
         views_and_home(binary, root / "views")
         malformed_settings(binary, root / "malformed")
         vanished_device(binary, root / "vanished")

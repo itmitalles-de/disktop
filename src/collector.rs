@@ -15,7 +15,9 @@ use anyhow::{Context, Result};
 
 use crate::{
     diskstats::{self, Counters, Info, Sysfs},
-    model::{Device, Filesystem, HomeRequest, HomeStatus, JSON_VERSION, ScanState, Snapshot},
+    model::{
+        Device, DeviceUsage, Filesystem, HomeRequest, HomeStatus, JSON_VERSION, ScanState, Snapshot,
+    },
     mounts::{self, Mount},
     privilege,
     procio::ProcessTable,
@@ -136,6 +138,7 @@ impl Collector {
             }
         }
         let mut devices = Vec::with_capacity(lines.len());
+        let mut members = Vec::with_capacity(lines.len());
         let mut current = HashMap::with_capacity(lines.len());
         for line in &lines {
             let info = self.infos.get(&line.name).cloned().unwrap_or_default();
@@ -151,11 +154,22 @@ impl Collector {
                 .map(|(name, _)| name.clone())
                 .collect();
             let mut device_mounts = BTreeSet::new();
-            for name in self.sysfs.descendants(&line.name, &partitions) {
-                if let Some(points) = mounts_by_device.get(&name) {
+            let descendants = self.sysfs.descendants(&line.name, &partitions);
+            for name in &descendants {
+                if let Some(points) = mounts_by_device.get(name) {
                     device_mounts.extend(points.iter().cloned());
                 }
             }
+            members.push(descendants);
+            let backing_disks = if info.kind.is_stacked() {
+                self.sysfs
+                    .backing_disks(&line.name, &self.infos)
+                    .into_iter()
+                    .map(|name| sanitize(&name))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             devices.push(Device {
                 name: sanitize(&line.name),
                 kind: info.kind,
@@ -181,6 +195,8 @@ impl Collector {
                 reads: line.counters.reads,
                 writes: line.counters.writes,
                 in_flight: line.counters.in_flight,
+                usage: None,
+                backing_disks,
             });
             current.insert(
                 line.name.clone(),
@@ -194,6 +210,7 @@ impl Collector {
         // Removed devices drop out, so a re-added device starts a new baseline.
         self.previous = current;
         let filesystems = filesystems(&mount_list, &devices, &request.root, &mount_device);
+        apply_usage(&mut devices, &members, &filesystems);
         let (processes, process_access) = self.processes.sample(self.privileged);
         let (home, home_tree) = self.home(request);
         Ok(Snapshot {
@@ -347,6 +364,95 @@ fn filesystems(
     rows
 }
 
+/// Capacity use per device from the filesystems backed by its members (the
+/// device, its partitions and holders). Members are raw kernel names, as are
+/// the filesystems' block devices.
+fn apply_usage(devices: &mut [Device], members: &[BTreeSet<String>], filesystems: &[Filesystem]) {
+    let swaps = swap_devices();
+    for (device, members) in devices.iter_mut().zip(members) {
+        let swap = members.iter().any(|name| swaps.contains(name));
+        device.usage = Some(DeviceUsage::from_filesystems(filesystems, members, swap));
+    }
+}
+
+/// Fill storage fields that a helper from an older release does not send:
+/// fill levels and the disks below dm/md devices. Everything used here is
+/// readable without privileges: the snapshot's own filesystems (with their
+/// statvfs values), world-readable sysfs links and /proc/swaps. Returns true
+/// when something was missing, so the UI can suggest updating the helper.
+pub fn complete_storage(sysfs: &Sysfs, snapshot: &mut Snapshot) -> bool {
+    let devices = &snapshot.devices;
+    let missing_usage = devices.iter().any(|device| device.usage.is_none());
+    let missing_backing = devices
+        .iter()
+        .any(|device| device.kind.is_stacked() && device.backing_disks.is_empty());
+    if !missing_usage && !missing_backing {
+        return false;
+    }
+    if missing_usage {
+        let members: Vec<BTreeSet<String>> = devices
+            .iter()
+            .map(|device| {
+                let partitions: Vec<String> = devices
+                    .iter()
+                    .filter(|other| other.parent.as_deref() == Some(device.name.as_str()))
+                    .map(|other| other.name.clone())
+                    .collect();
+                sysfs.descendants(&device.name, &partitions)
+            })
+            .collect();
+        apply_usage(&mut snapshot.devices, &members, &snapshot.filesystems);
+    }
+    if missing_backing {
+        let infos: HashMap<String, Info> = snapshot
+            .devices
+            .iter()
+            .map(|device| {
+                (
+                    device.name.clone(),
+                    Info {
+                        kind: device.kind,
+                        partition: device.partition,
+                        parent: device.parent.clone(),
+                        ..Info::default()
+                    },
+                )
+            })
+            .collect();
+        for device in &mut snapshot.devices {
+            if device.kind.is_stacked() && device.backing_disks.is_empty() {
+                device.backing_disks = sysfs.backing_disks(&device.name, &infos);
+            }
+        }
+    }
+    true
+}
+
+/// Block device names with active swap, from /proc/swaps. Swap files are
+/// skipped; they live on a filesystem that is already counted.
+fn swap_devices() -> BTreeSet<String> {
+    let Ok(bytes) = read_pseudo("/proc/swaps") else {
+        return BTreeSet::new();
+    };
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let path = fields.next()?;
+            (fields.next()? == "partition").then_some(path)
+        })
+        .take(64)
+        .filter_map(|path| {
+            let decoded = mounts::unescape(path.as_bytes());
+            let path = Path::new(std::ffi::OsStr::from_bytes(&decoded));
+            let resolved = fs::canonicalize(path).ok()?;
+            let name = resolved.file_name()?.to_string_lossy().into_owned();
+            diskstats::valid_name(&name).then_some(name)
+        })
+        .collect()
+}
+
 /// The physical whole disk that holds `home_root`, for the automatic device
 /// choice. Reads only world-readable mountinfo and sysfs.
 pub fn default_device(home_root: &str) -> Option<String> {
@@ -428,10 +534,62 @@ mod tests {
             })
             .unwrap();
         assert_eq!(invalid.home.unwrap().state, ScanState::Failed);
+        // Stacked devices name the whole disks below them.
+        for device in &snapshot.devices {
+            assert_eq!(
+                device.kind.is_stacked(),
+                !device.backing_disks.is_empty(),
+                "{}",
+                device.name
+            );
+        }
+        // Every device reports its capacity use; mounted ones have totals.
+        assert!(snapshot.devices.iter().all(|device| device.usage.is_some()));
+        for filesystem in &snapshot.filesystems {
+            let Some(name) = &filesystem.block_device else {
+                continue;
+            };
+            let device = snapshot.devices.iter().find(|device| &device.name == name);
+            if let (Some(device), Some(_)) = (device, filesystem.total_bytes) {
+                assert!(device.usage.as_ref().unwrap().filesystems >= 1, "{name}");
+            }
+        }
         // JSON round-trips through the helper protocol types.
         let json = serde_json::to_string(&snapshot.devices).unwrap();
         let back: Vec<Device> = serde_json::from_str(&json).unwrap();
         assert_eq!(back.len(), snapshot.devices.len());
+    }
+
+    #[test]
+    fn older_helper_snapshots_get_fill_levels_and_backing_disks() {
+        let mut collector = Collector::new(false).unwrap();
+        let complete = collector.sample(&HomeRequest::default()).unwrap();
+        let sysfs = Sysfs::default();
+        let mut current = complete.clone();
+        assert!(!complete_storage(&sysfs, &mut current), "nothing to add");
+        // A reply from an older helper: the device fields did not exist.
+        let json = serde_json::to_value(&complete).unwrap();
+        let mut old = json.clone();
+        for device in old["devices"].as_array_mut().unwrap() {
+            let device = device.as_object_mut().unwrap();
+            device.remove("usage");
+            device.remove("backing_disks");
+        }
+        let mut snapshot: Snapshot = serde_json::from_value(old).unwrap();
+        if snapshot.devices.is_empty() {
+            return;
+        }
+        assert!(snapshot.devices.iter().all(|device| device.usage.is_none()));
+        assert!(complete_storage(&sysfs, &mut snapshot));
+        for (filled, expected) in snapshot.devices.iter().zip(&complete.devices) {
+            assert_eq!(filled.name, expected.name);
+            assert_eq!(filled.usage, expected.usage, "{}", filled.name);
+            assert_eq!(
+                filled.backing_disks, expected.backing_disks,
+                "{}",
+                filled.name
+            );
+        }
     }
 
     #[test]

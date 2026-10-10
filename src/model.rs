@@ -27,6 +27,11 @@ pub enum DeviceKind {
 }
 
 impl DeviceKind {
+    /// Device mapper and MD devices are stacked on other block devices.
+    pub fn is_stacked(self) -> bool {
+        matches!(self, Self::Dm | Self::Md)
+    }
+
     /// Loop, ram and zram devices are hidden unless the user asks for them.
     pub fn hidden_by_default(self) -> bool {
         matches!(self, Self::Loop | Self::Zram | Self::Ram)
@@ -73,6 +78,67 @@ pub struct DeviceRates {
     pub queue_depth: f64,
 }
 
+/// Capacity use of the filesystems mounted from a device, its partitions and
+/// stacked devices (LVM, LUKS, MD), each block device counted once.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceUsage {
+    /// Mounted filesystems with statvfs values; 0 means nothing is mounted.
+    pub filesystems: u32,
+    /// Mounted filesystems whose statvfs failed; they are not in the sums.
+    pub unmeasured: u32,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+    /// The device, a partition or a stacked device is active swap.
+    pub swap: bool,
+}
+
+impl DeviceUsage {
+    /// Usage like df: used / (used + available), so reserved blocks count as full.
+    pub fn percent(&self) -> Option<f64> {
+        let used = self.used_bytes as f64;
+        let room = used + self.available_bytes as f64;
+        (self.filesystems > 0 && room > 0.0).then(|| used / room * 100.0)
+    }
+
+    /// Sum the filesystems backed by any of `members` (a device and its
+    /// partitions and holders). A block device holds one filesystem, so each
+    /// is counted once even when bind mounts or subvolumes list it repeatedly.
+    pub fn from_filesystems<'a>(
+        filesystems: impl IntoIterator<Item = &'a Filesystem>,
+        members: &std::collections::BTreeSet<String>,
+        swap: bool,
+    ) -> Self {
+        let mut usage = Self {
+            swap,
+            ..Self::default()
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for filesystem in filesystems {
+            let Some(device) = filesystem.block_device.as_ref() else {
+                continue;
+            };
+            if !members.contains(device) || !seen.insert(device.clone()) {
+                continue;
+            }
+            match (
+                filesystem.total_bytes,
+                filesystem.used_bytes,
+                filesystem.available_bytes,
+            ) {
+                (Some(total), Some(used), Some(available)) => {
+                    usage.filesystems += 1;
+                    usage.total_bytes = usage.total_bytes.saturating_add(total);
+                    usage.used_bytes = usage.used_bytes.saturating_add(used);
+                    usage.available_bytes = usage.available_bytes.saturating_add(available);
+                }
+                _ => usage.unmeasured += 1,
+            }
+        }
+        usage
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Device {
     pub name: String,
@@ -97,6 +163,13 @@ pub struct Device {
     pub reads: u64,
     pub writes: u64,
     pub in_flight: u64,
+    /// `None` when not measured (for example from an older helper).
+    #[serde(default)]
+    pub usage: Option<DeviceUsage>,
+    /// Whole disks below a device-mapper or MD device, through partitions and
+    /// further stacked devices; empty for other devices or when unknown.
+    #[serde(default)]
+    pub backing_disks: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -321,4 +394,54 @@ pub struct HomeRequest {
     pub rescan: bool,
     /// Highest report generation the requester already has.
     pub known_generation: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn filesystem(device: &str, total: Option<u64>, used: u64) -> Filesystem {
+        Filesystem {
+            block_device: Some(device.into()),
+            total_bytes: total,
+            used_bytes: total.map(|_| used),
+            available_bytes: total.map(|total| total - used),
+            ..Filesystem::default()
+        }
+    }
+
+    #[test]
+    fn usage_sums_each_backing_filesystem_once_including_holders() {
+        let filesystems = [
+            filesystem("nvme0n1p2", Some(100), 40),
+            // A bind mount or subvolume of the same block device.
+            filesystem("nvme0n1p2", Some(100), 40),
+            // A LUKS holder of the disk's other partition.
+            filesystem("dm-0", Some(300), 280),
+            filesystem("dm-1", None, 0),
+            filesystem("sda1", Some(1000), 1),
+        ];
+        let members: BTreeSet<String> = ["nvme0n1", "nvme0n1p1", "nvme0n1p2", "dm-0", "dm-1"]
+            .map(String::from)
+            .into();
+        let usage = DeviceUsage::from_filesystems(&filesystems, &members, false);
+        assert_eq!(usage.filesystems, 2);
+        assert_eq!(usage.unmeasured, 1);
+        assert_eq!((usage.used_bytes, usage.total_bytes), (320, 400));
+        assert_eq!(usage.percent(), Some(80.0));
+        let none =
+            DeviceUsage::from_filesystems(&filesystems, &BTreeSet::from(["sdb".into()]), true);
+        assert_eq!(none.filesystems, 0);
+        assert!(none.swap && none.percent().is_none());
+        // Older helpers without the field deserialize as "not measured".
+        let device: Device = serde_json::from_str(
+            r#"{"name":"sda","kind":"hdd","partition":false,
+            "parent":null,"model":null,"vendor":null,"label":null,"size_bytes":null,
+            "rotational":null,"removable":false,"hw_sector_size":null,"mounts":[],"rates":null,
+            "read_bytes":0,"write_bytes":0,"reads":0,"writes":0,"in_flight":0}"#,
+        )
+        .unwrap();
+        assert!(device.usage.is_none());
+    }
 }

@@ -38,6 +38,16 @@ impl SignalGuard {
     pub fn requested(&self) -> bool {
         self.requested.load(Ordering::Relaxed)
     }
+
+    /// Request shutdown as if SIGHUP had arrived, for a terminal that hung up.
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::Relaxed);
+    }
+
+    /// The shared flag, for a watchdog thread.
+    pub fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.requested)
+    }
 }
 
 impl Drop for SignalGuard {
