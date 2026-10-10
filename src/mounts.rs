@@ -344,7 +344,7 @@ garbage line without separator\n\
             ]
         );
         // Lexical fallback for paths that do not exist on this machine.
-        let root = containing(&mounts[..2], Path::new("/nonexistent-disktop/home/x")).unwrap();
+        let root = containing(&mounts[..2], Path::new("/nonexistent-spctop/home/x")).unwrap();
         assert_eq!(root.mount_point, Path::new("/"), "not below /home");
         let lexical = [
             Mount {
@@ -352,13 +352,13 @@ garbage line without separator\n\
                 ..mounts[0].clone()
             },
             Mount {
-                mount_point: "/disktop-test-home".into(),
+                mount_point: "/spctop-test-home".into(),
                 ..mounts[1].clone()
             },
         ];
-        let home = containing(&lexical, Path::new("/disktop-test-home/tim/./x")).unwrap();
-        assert_eq!(home.mount_point, Path::new("/disktop-test-home"));
-        let other = containing(&lexical, Path::new("/disktop-test-home2/tim")).unwrap();
+        let home = containing(&lexical, Path::new("/spctop-test-home/tim/./x")).unwrap();
+        assert_eq!(home.mount_point, Path::new("/spctop-test-home"));
+        let other = containing(&lexical, Path::new("/spctop-test-home2/tim")).unwrap();
         assert_eq!(other.mount_point, Path::new("/"));
     }
 
@@ -394,7 +394,7 @@ garbage line without separator\n\
         let usage = statvfs(Path::new("/")).expect("statvfs on /");
         assert!(usage.used <= usage.total);
         assert!(usage.available <= usage.total);
-        assert!(statvfs(Path::new("/nonexistent-disktop-path")).is_none());
+        assert!(statvfs(Path::new("/nonexistent-spctop-path")).is_none());
         assert!(statvfs(Path::new("a\0b")).is_none());
     }
 }

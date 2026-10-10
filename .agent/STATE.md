@@ -1,5 +1,36 @@
 # Verified state
 
+## spctop space-first transition (2026-10-10)
+
+- Repository renamed to public `itmitalles-de/spctop`, GPL-3.0-or-later.
+  Issue #9 tracks the rename and the used-space-first interface.
+- Space is the default view: used/free capacity, fill percentage and history,
+  plus filesystems. Home keeps directory sizes and growth; F4 opens the view
+  menu with a separate I/O view for disk throughput/utilization and processes.
+- Executables are `spctop` and `/usr/local/libexec/spctop-collector`.
+  Legacy disktop preferences remain readable until a new spctop configuration
+  is saved. Legacy process-first preferences migrate to the Space view.
+- The helper policy uses `/etc/spctop/scan-roots`, falling back to the legacy
+  `/etc/disktop/scan-roots` when absent; invalid policies fail closed. Only
+  when both are absent does the default /home root apply.
+- Website hostname remains `disktop.wutz.io`; branding, examples and public
+  DEMO media reflect spctop. Evidence: `../disktop-review/rename-spctop/`.
+- Verified: 86 Rust tests on stable and Rust 1.88, Clippy, formatting,
+  terminal restoration and Setup/navigation/migration PTY tests; isolated live
+  I/O and helper tests including legacy policy precedence and unsafe ancestors;
+  ShellCheck, 32 site references, EN/DE desktop/mobile browser checks and video
+  playback. Public DEMO media comes from the actual new release, not mockups.
+- UI and helper installed with matching release hashes; legacy executables
+  removed only after verifying their installation receipts and known hashes.
+  Helper root:tim 0750, DAC_READ_SEARCH and SYS_PTRACE; UI no capabilities.
+  Live default --once, explicit --view io --once and JSON verified both NVMe,
+  /home, 1,073 readable processes and no nonresponding mounts. Both policy
+  files are absent on this host, so /home is the default allowed scan root.
+  UI SHA-256: `05dd96706f2f581a67fd4b3d09f9d55b8b4a4786b129226e5e5f1c4bdb13fa9e`;
+  helper: `a6247db58edd8267c24976ad7b0bd74582165aaf76663178f7a45bf841e9f646`.
+- The following entries record the verified pre-rename baseline and historical
+  evidence paths; installation/test results for this transition are recorded above.
+
 - Public repository `itmitalles-de/disktop`, branch `main`, Linux/Rust 1.88+,
   GPL-3.0-or-later. Overview and website PRs #1/#2 are merged. Review round 1
   merged as [PR #3](https://github.com/itmitalles-de/disktop/pull/3) on

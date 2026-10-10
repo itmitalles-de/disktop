@@ -718,7 +718,7 @@ mod tests {
         const MIB: u64 = 1024 * 1024;
         let file = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
-            .join(format!("disktop-child-io-{}", std::process::id()));
+            .join(format!("spctop-child-io-{}", std::process::id()));
         let script = format!(
             "sleep 0.5; dd if=/dev/zero of='{}' bs=1M count=8 conv=fsync status=none; sleep 10",
             file.display()
@@ -775,6 +775,6 @@ mod tests {
         let (rows, _) = table.sample(false);
         let row = rows.iter().find(|row| row.pid == me).unwrap();
         assert!(row.read_rate.is_some() && row.write_rate.is_some());
-        assert!(row.command.contains("disktop") || row.command.starts_with('['));
+        assert!(row.command.contains("spctop") || row.command.starts_with('['));
     }
 }

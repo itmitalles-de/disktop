@@ -607,7 +607,7 @@ mod tests {
 
     #[test]
     fn sysfs_facts_partitions_and_stacks_from_a_fake_tree() {
-        let root = std::env::temp_dir().join(format!("disktop-sysfs-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("spctop-sysfs-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let disk = root.join("devices/pci/nvme/nvme0n1");
         let part = disk.join("nvme0n1p2");
@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn partitions_of_md_arrays_reach_the_disks_and_btrfs_members_are_listed() {
-        let root = std::env::temp_dir().join(format!("disktop-sysfs-md-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("spctop-sysfs-md-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let block = root.join("class/block");
         let md = root.join("devices/virtual/block/md0");

@@ -3,18 +3,18 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="disktop is a Linux terminal disk monitor inspired by htop and nvtop. Every disk at once with read, write, utilization and fill-level meters, per-process I/O, filesystems and a /home size view.">
+  <meta name="description" content="spctop is a Linux terminal space monitor. Watch used and free space, disk fill history and directory growth. Open the separate I/O view for disk activity and processes.">
   <meta name="theme-color" content="#0b1725" media="(prefers-color-scheme: dark)">
   <meta name="theme-color" content="#f4f7f2" media="(prefers-color-scheme: light)">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; media-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="disktop — your disks, in view">
-  <meta property="og:description" content="Every disk at once. A familiar terminal. Meet disktop for Linux.">
+  <meta property="og:title" content="spctop — your space, in view">
+  <meta property="og:description" content="Used space, free space and growth. Meet spctop for Linux.">
   <meta property="og:url" content="https://disktop.wutz.io/">
   <meta property="og:image" content="https://disktop.wutz.io/assets/social-card.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
-  <meta property="og:image:alt" content="disktop: all your disks at once, with an actual DEMO terminal view">
+  <meta property="og:image:alt" content="spctop: your space in plain sight, with an actual DEMO terminal view">
   <meta name="twitter:card" content="summary_large_image">
   <link rel="canonical" href="https://disktop.wutz.io/">
   <link rel="icon" href="assets/mark.svg" type="image/svg+xml">
@@ -22,62 +22,62 @@
   <script src="preferences.js"></script>
   <link rel="stylesheet" href="style.css">
   <script src="app.js" defer></script>
-  <title>disktop — your disks, in view</title>
+  <title>spctop — your space, in view</title>
 </head>
 <body>
   <a class="skip-link" href="#main" data-i18n="skip">Skip to content</a>
   <header class="site-header wrap">
-    <a class="brand" href="#" aria-label="disktop home" data-i18n-attr="aria-label:homeLabel"><img src="assets/mark.svg" width="42" height="42" alt=""><span>disktop</span></a>
-    <nav aria-label="Main navigation" data-i18n-attr="aria-label:navLabel"><a href="#inside" data-i18n="navInside">Inside disktop</a><a href="#install" data-i18n="navInstall">Install</a><a class="github-link" href="https://github.com/itmitalles-de/disktop">GitHub <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 15 15 5M5 5h10v10"/></svg></a></nav>
+    <a class="brand" href="#" aria-label="spctop home" data-i18n-attr="aria-label:homeLabel"><img src="assets/mark.svg" width="42" height="42" alt=""><span>spctop</span></a>
+    <nav aria-label="Main navigation" data-i18n-attr="aria-label:navLabel"><a href="#inside" data-i18n="navInside">Inside spctop</a><a href="#install" data-i18n="navInstall">Install</a><a class="github-link" href="https://github.com/itmitalles-de/spctop">GitHub <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 15 15 5M5 5h10v10"/></svg></a></nav>
     <div class="site-tools"><button class="tool-button" id="language-toggle" type="button" lang="de" aria-label="Auf Deutsch umschalten" title="Auf Deutsch umschalten">DE</button><button class="tool-button" id="theme-toggle" type="button" aria-label="Switch to light theme" title="Switch to light theme"><svg class="icon-sun" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3.6"/><path d="M10 1.8v2.1M10 16.1v2.1M1.8 10h2.1M16.1 10h2.1M4.2 4.2l1.5 1.5M14.3 14.3l1.5 1.5M4.2 15.8l1.5-1.5M14.3 5.7l1.5-1.5"/></svg><svg class="icon-moon" viewBox="0 0 20 20" aria-hidden="true"><path d="M16.5 12.6A7 7 0 0 1 7.4 3.5a7 7 0 1 0 9.1 9.1Z"/></svg></button></div>
   </header>
   <main id="main">
     <section class="hero wrap" aria-labelledby="hero-title">
       <div class="hero-copy">
         <p class="intro" data-i18n="intro"><span class="status-dot" aria-hidden="true"></span>At home in your terminal.</p>
-        <h1 id="hero-title" data-i18n="heroTitle">Your disks.<br>All at once.</h1>
-        <p class="hero-description" data-i18n="heroDescription">See which disk is busy, which process writes, and where the space went. A Linux disk monitor with live meters, history graphs, and the familiar feel of htop and nvtop.</p>
-        <div class="hero-actions"><a class="button primary" href="#install" data-i18n="getDisktop">Get disktop <span aria-hidden="true">↗</span></a><a class="text-link" href="#inside" data-i18n="closerLook">Take a closer look</a></div>
+        <h1 id="hero-title" data-i18n="heroTitle">Your space.<br>In plain sight.</h1>
+        <p class="hero-description" data-i18n="heroDescription">Watch used and free space across your disks. Follow fill levels over time and find growing directories. A Linux terminal space monitor with the familiar feel of htop and nvtop.</p>
+        <div class="hero-actions"><a class="button primary" href="#install" data-i18n="getSpctop">Get spctop <span aria-hidden="true">↗</span></a><a class="text-link" href="#inside" data-i18n="closerLook">Take a closer look</a></div>
         <p class="hero-facts" data-i18n="heroFacts">Built in Rust <span aria-hidden="true">/</span> Made for Linux <span aria-hidden="true">/</span> GPLv3 licensed</p>
       </div>
       <div class="hero-product">
-        <div class="product-note"><span data-i18n="read"><i class="rd-dot" aria-hidden="true"></i>Read</span><span data-i18n="write"><i class="wr-dot" aria-hidden="true"></i>Write</span><span data-i18n="util"><i class="io-dot" aria-hidden="true"></i>IO</span><span data-i18n="fill"><i class="us-dot" aria-hidden="true"></i>Fill</span><span class="product-note-end" data-i18n="compactView">Every disk, one view.</span></div>
-        <div class="terminal-window"><div class="window-bar"><span class="window-command"><span aria-hidden="true">❯</span> disktop --demo</span><span class="window-host">Linux / bash</span></div><img class="hero-terminal" src="assets/disktop-demo.png" width="1080" height="684" data-i18n-attr="alt:heroAlt" alt="Actual disktop demo: four disks side by side, each with read, write, utilization and fill-level meters and a graph, above the process I/O table" fetchpriority="high"></div>
+        <div class="product-note"><span data-i18n="fill"><i class="us-dot" aria-hidden="true"></i>Fill</span><span class="product-note-end" data-i18n="compactView">Every disk, one view.</span></div>
+        <div class="terminal-window"><div class="window-bar"><span class="window-command"><span aria-hidden="true">❯</span> spctop --demo</span><span class="window-host">Linux / bash</span></div><img class="hero-terminal" src="assets/disktop-demo.png" width="1080" height="684" data-i18n-attr="alt:heroAlt" alt="Actual spctop Space view with disk fill levels and history above the filesystem table" fetchpriority="high"></div>
         <div class="product-caption"><span data-i18n="demoCaption">Actual terminal output. Demo data.</span><a href="#demo-video" data-i18n="watchRun">Watch it run <span aria-hidden="true">▷</span></a></div>
       </div>
     </section>
 
     <section class="signal-strip" aria-label="Monitoring capabilities" data-i18n-attr="aria-label:capabilitiesLabel"><div class="wrap signal-grid">
-      <div><span class="signal-icon" aria-hidden="true">▤</span><p><strong data-i18n="signal1Title">Every disk at once.</strong><span data-i18n="signal1Text">RD, WR, IO and fill meters, htop style.</span></p></div>
-      <div><span class="signal-icon" aria-hidden="true">⇅</span><p><strong data-i18n="signal2Title">Find the process.</strong><span data-i18n="signal2Text">Reads and writes per PID, in a compact strip.</span></p></div>
-      <div><span class="signal-icon" aria-hidden="true">◔</span><p><strong data-i18n="signal3Title">See where space goes.</strong><span data-i18n="signal3Text">Filesystems and a /home size scanner.</span></p></div>
+      <div><span class="signal-icon" aria-hidden="true">▤</span><p><strong data-i18n="signal1Title">Know what is full.</strong><span data-i18n="signal1Text">Used and free space, with fill history per disk.</span></p></div>
+      <div><span class="signal-icon" aria-hidden="true">⇅</span><p><strong data-i18n="signal2Title">Follow the growth.</strong><span data-i18n="signal2Text">Directory sizes and changes across scans.</span></p></div>
+      <div><span class="signal-icon" aria-hidden="true">◔</span><p><strong data-i18n="signal3Title">Inspect I/O when needed.</strong><span data-i18n="signal3Text">Disk activity and process rates in a separate view.</span></p></div>
     </div></section>
 
     <section class="inside wrap" id="inside" aria-labelledby="inside-title">
-      <div class="section-intro"><h2 id="inside-title" data-i18n="insideTitle">Every disk.<br>One screen.</h2><p data-i18n="insideText">Like htop shows every core, disktop gives every disk its own block: four meters and a graph of utilization and fill level over time. It adapts from a wide screen down to a 36 × 16 terminal.</p></div>
+      <div class="section-intro"><h2 id="inside-title" data-i18n="insideTitle">Every disk.<br>Room to spare.</h2><p data-i18n="insideText">spctop opens on storage space: fill levels, history and filesystems. Switch to Home to follow directory growth, or open the I/O view for reads, writes and processes. It adapts from a wide screen down to a 36 × 16 terminal.</p></div>
       <div class="explorer">
         <div class="explorer-controls">
-          <div class="view-tabs" role="tablist" aria-label="Explore disktop views" data-i18n-attr="aria-label:tablistLabel">
-            <button id="tab-disks" class="view-tab" role="tab" aria-selected="true" aria-controls="view-disks" data-view="disks"><span class="keycap" aria-hidden="true">1</span><span><strong data-i18n="tab-disks-title">All disks</strong><small data-i18n="tab-disks-text">Meters and graphs. Processes below.</small></span></button>
-            <button id="tab-filesystems" class="view-tab" role="tab" aria-selected="false" aria-controls="view-filesystems" tabindex="-1" data-view="filesystems"><span class="keycap" aria-hidden="true">2</span><span><strong data-i18n="tab-filesystems-title">Filesystems</strong><small data-i18n="tab-filesystems-text">Use, free space, inodes and rates.</small></span></button>
-            <button id="tab-home" class="view-tab" role="tab" aria-selected="false" aria-controls="view-home" tabindex="-1" data-view="home"><span class="keycap" aria-hidden="true">3</span><span><strong data-i18n="tab-home-title">Home sizes</strong><small data-i18n="tab-home-text">Where the space went. How fast it grows.</small></span></button>
+          <div class="view-tabs" role="tablist" aria-label="Explore spctop views" data-i18n-attr="aria-label:tablistLabel">
+            <button id="tab-disks" class="view-tab" role="tab" aria-selected="true" aria-controls="view-disks" data-view="disks"><span class="keycap" aria-hidden="true">1</span><span><strong data-i18n="tab-disks-title">Space overview</strong><small data-i18n="tab-disks-text">Used, free and fill history. Filesystems below.</small></span></button>
+            <button id="tab-home" class="view-tab" role="tab" aria-selected="false" aria-controls="view-home" tabindex="-1" data-view="home"><span class="keycap" aria-hidden="true">2</span><span><strong data-i18n="tab-home-title">Home growth</strong><small data-i18n="tab-home-text">Directory sizes and changes across scans.</small></span></button>
+            <button id="tab-io" class="view-tab" role="tab" aria-selected="false" aria-controls="view-io" tabindex="-1" data-view="io"><span class="keycap" aria-hidden="true">3</span><span><strong data-i18n="tab-io-title">I/O details</strong><small data-i18n="tab-io-text">Open the secondary view for reads and writes.</small></span></button>
           </div>
           <p class="explorer-hint" data-i18n="explorerHint">Select a view to see the real interface.</p>
-          <div class="key-shortcuts"><p data-i18n="shortcut1"><kbd>F5</kbd> Focus a disk</p><p data-i18n="shortcut2"><kbd>F2</kbd> Graphs, colors, rows</p><p data-i18n="shortcut3"><kbd>/</kbd> Search the table</p><p data-i18n="shortcut4"><kbd>F12</kbd> Save your setup</p></div>
+          <div class="key-shortcuts"><p data-i18n="shortcut1"><kbd>F5</kbd> Focus a disk</p><p data-i18n="shortcut2"><kbd>F4</kbd> Choose Space, Home or I/O</p><p data-i18n="shortcut3"><kbd>/</kbd> Search the table</p><p data-i18n="shortcut4"><kbd>F12</kbd> Save your setup</p></div>
         </div>
         <div class="explorer-screen">
-          <div id="view-disks" class="view-panel" role="tabpanel" aria-labelledby="tab-disks" tabindex="0"><img src="assets/disktop-demo.png" width="1080" height="684" loading="lazy" data-i18n-attr="alt:disksAlt" alt="disktop in DEMO mode: four disk blocks with meters and utilization and fill-level graphs, and the process I/O strip"></div>
-          <div id="view-filesystems" class="view-panel" role="tabpanel" aria-labelledby="tab-filesystems" tabindex="0" hidden><img src="assets/disktop-filesystems.png" width="1080" height="684" loading="lazy" data-i18n-attr="alt:filesystemsAlt" alt="Actual Filesystems view with mount, device, type, use bar, size, free space, inodes and read and write rates"></div>
-          <div id="view-home" class="view-panel" role="tabpanel" aria-labelledby="tab-home" tabindex="0" hidden><img src="assets/disktop-home.png" width="1080" height="684" loading="lazy" data-i18n-attr="alt:homeAlt" alt="Actual Home view with directory sizes, share bars, file counts and growth since the previous and first scan"></div>
+          <div id="view-disks" class="view-panel" role="tabpanel" aria-labelledby="tab-disks" tabindex="0"><img src="assets/disktop-demo.png" width="1080" height="684" loading="lazy" data-i18n-attr="alt:disksAlt" alt="spctop in DEMO mode showing disk space and fill history with filesystem usage"></div>
+          <div id="view-home" class="view-panel" role="tabpanel" aria-labelledby="tab-home" tabindex="0" hidden><img src="assets/disktop-home.png" width="1080" height="684" loading="lazy" data-i18n-attr="alt:homeAlt" alt="Actual Home view with directory sizes and growth since the previous and first scan"></div>
+          <div id="view-io" class="view-panel" role="tabpanel" aria-labelledby="tab-io" tabindex="0" hidden><img src="assets/spctop-io.png" width="1080" height="684" loading="lazy" data-i18n-attr="alt:ioAlt" alt="Actual secondary I/O view with disk read and write meters, activity graphs and process I/O"></div>
           <p class="screen-caption" data-i18n="screenCaption">Native terminal colors. English or German. Your theme comes with you.</p>
         </div>
       </div>
     </section>
 
     <section class="setup-section" id="install" aria-labelledby="install-title"><div class="wrap install-grid">
-      <div class="install-copy"><h2 id="install-title" data-i18n="installTitle">Set up once.<br>Just run disktop.</h2><p data-i18n="installText">Build from source and install to your user directory. disktop runs as your regular user right away; the optional helper adds every user’s processes and the directory sizes below approved roots (default <code>/home</code>). Either way, start <code>disktop</code> without sudo.</p><p class="requirements" data-i18n="requirements">You’ll need Linux and Rust 1.88+. The commands here use Ubuntu 24.04 or newer.</p><details><summary data-i18n="adminSummary">What does the optional helper do?</summary><p data-i18n="adminText">Without it, disktop shows your own processes and the directories you can read, and says how many processes are hidden. Setting up the helper asks for administrator authentication once and installs a root-owned collector with only <code>cap_dac_read_search</code> and <code>cap_sys_ptrace</code>. Members of your primary group can then see all processes’ storage I/O and the directory names and sizes below the scan roots an administrator lists in <code>/etc/disktop/scan-roots</code> (default <code>/home</code>), never file names or contents. Setup refuses a shared primary group unless you opt in, and the administrator who authenticates must trust your checkout, since root installs the helper you built. The terminal UI itself never gains privileges.</p><a href="https://github.com/itmitalles-de/disktop#install" data-i18n="helperLink">Read how the helper works</a></details><p class="access-note" data-i18n="accessNote">Open source under the GNU GPLv3 or later. No GitHub account needed to clone.</p></div>
-      <div class="install-terminal"><div class="code-heading"><span data-i18n="installHeading">Install from source</span><button class="copy-button" data-copy="install-command" type="button" data-i18n="copyCommands">Copy commands</button></div><pre id="install-command"><code>git clone https://github.com/itmitalles-de/disktop.git
-cd disktop
+      <div class="install-copy"><h2 id="install-title" data-i18n="installTitle">Set up once.<br>Just run spctop.</h2><p data-i18n="installText">Build from source and install to your user directory. spctop runs as your regular user right away; the optional helper adds every user’s processes and the directory sizes below approved roots (default <code>/home</code>). Either way, start <code>spctop</code> without sudo.</p><p class="requirements" data-i18n="requirements">You’ll need Linux and Rust 1.88+. The commands here use Ubuntu 24.04 or newer.</p><details><summary data-i18n="adminSummary">What does the optional helper do?</summary><p data-i18n="adminText">Without it, spctop shows your own processes and the directories you can read, and says how many processes are hidden. Setting up the helper asks for administrator authentication once and installs a root-owned collector with only <code>cap_dac_read_search</code> and <code>cap_sys_ptrace</code>. Members of your primary group can then see all processes’ storage I/O and the directory names and sizes below the scan roots an administrator lists in <code>/etc/spctop/scan-roots</code> (default <code>/home</code>), never file names or contents. Setup refuses a shared primary group unless you opt in, and the administrator who authenticates must trust your checkout, since root installs the helper you built. The terminal UI itself never gains privileges.</p><a href="https://github.com/itmitalles-de/spctop#install" data-i18n="helperLink">Read how the helper works</a></details><p class="access-note" data-i18n="accessNote">Open source under the GNU GPLv3 or later. No GitHub account needed to clone.</p></div>
+      <div class="install-terminal"><div class="code-heading"><span data-i18n="installHeading">Install from source</span><button class="copy-button" data-copy="install-command" type="button" data-i18n="copyCommands">Copy commands</button></div><pre id="install-command"><code>git clone https://github.com/itmitalles-de/spctop.git
+cd spctop
 ./scripts/install.sh
 
 <span class="code-comment" data-i18n="commentHelper"># Optional, once: setcap tools + helper</span>
@@ -85,16 +85,16 @@ sudo apt install libcap2-bin
 ./scripts/setup-helper.sh
 
 <span class="code-comment" data-i18n="commentNoSudo"># From now on, no sudo</span>
-~/.local/bin/disktop</code></pre><div class="code-bottom"><span aria-hidden="true">❯</span><code>disktop --demo</code><span data-i18n="demoText">A labeled preview with synthetic data.</span></div></div>
+~/.local/bin/spctop</code></pre><div class="code-bottom"><span aria-hidden="true">❯</span><code>spctop --demo</code><span data-i18n="demoText">A labeled preview with synthetic data.</span></div></div>
     </div></section>
 
     <section class="details-section wrap" aria-labelledby="details-title">
-      <div class="detail-copy"><h2 id="details-title" data-i18n="detailsTitle">Real counters.<br>Clear boundaries.</h2><p data-i18n="detailsText1">Disk rates come from the kernel’s /proc/diskstats counters. Fill levels come from the mounted filesystems, mapped to their disks through partitions, LUKS, LVM and MD. Process rates come from /proc/PID/io.</p><p data-i18n="detailsText2">Process I/O cannot be attributed to a device, and processes that exit between refreshes are not listed. disktop shows hidden processes and partial scans instead of inventing numbers.</p><a class="text-link" href="https://github.com/itmitalles-de/disktop#what-the-numbers-mean" data-i18n="measurementsLink">Understand the measurements</a></div>
-      <figure class="video-figure" id="demo-video"><video controls playsinline muted preload="none" poster="assets/disktop-demo.png" width="1080" height="684" data-i18n-attr="aria-label:videoLabel" aria-label="Actual disktop DEMO recording showing all disks, the Filesystems and Home views and F2 Setup"><source src="assets/disktop-demo.mp4" type="video/mp4"></video><figcaption data-i18n="videoCaption">See all disks, the Filesystems and Home views, and F2 Setup in an actual terminal recording. Synthetic DEMO data.</figcaption></figure>
+      <div class="detail-copy"><h2 id="details-title" data-i18n="detailsTitle">Real counters.<br>Clear boundaries.</h2><p data-i18n="detailsText1">Used and free space come from mounted filesystems, mapped to their disks through partitions, LUKS, LVM and MD. Directory scans stay on one filesystem and track growth within the session without reading file contents.</p><p data-i18n="detailsText2">Partial scans and unavailable data remain visible. The separate I/O view uses kernel disk and process counters; process I/O cannot be attributed to a device, and processes that exit between refreshes are not listed.</p><a class="text-link" href="https://github.com/itmitalles-de/spctop#what-the-numbers-mean" data-i18n="measurementsLink">Understand the measurements</a></div>
+      <figure class="video-figure" id="demo-video"><video controls playsinline muted preload="none" poster="assets/disktop-demo.png" width="1080" height="684" data-i18n-attr="aria-label:videoLabel" aria-label="Actual spctop DEMO recording of Space, Home growth and the I/O submenu"><source src="assets/disktop-demo.mp4" type="video/mp4"></video><figcaption data-i18n="videoCaption">See the Space overview, Home growth, and the I/O submenu in an actual terminal recording. Synthetic DEMO data.</figcaption></figure>
     </section>
-    <section class="closing wrap"><img src="assets/mark.svg" width="54" height="54" alt=""><h2 data-i18n="closingTitle">A small window into<br>what your disks are doing.</h2><a class="button primary" href="#install" data-i18n="makeRoom">Make room for disktop <span aria-hidden="true">↗</span></a></section>
+    <section class="closing wrap"><img src="assets/mark.svg" width="54" height="54" alt=""><h2 data-i18n="closingTitle">A small window into<br>where your space goes.</h2><a class="button primary" href="#install" data-i18n="makeRoom">Make room for spctop <span aria-hidden="true">↗</span></a></section>
   </main>
-  <footer class="site-footer wrap"><a class="brand" href="#" aria-label="Back to top" data-i18n-attr="aria-label:topLabel">disktop<span class="version">v0.1.0</span></a><p data-i18n="madeBy">Made by <a href="https://itmitalles.de">itmitalles</a>. Inspired by <a href="https://github.com/htop-dev/htop">htop</a> and <a href="https://github.com/Syllo/nvtop">nvtop</a>. The disk counterpart of <a href="https://nettop.wutz.io">nettop</a>.</p><a href="https://github.com/itmitalles-de/disktop" data-i18n="sourceDocs">Source &amp; documentation</a></footer>
+  <footer class="site-footer wrap"><a class="brand" href="#" aria-label="Back to top" data-i18n-attr="aria-label:topLabel">spctop<span class="version">v0.1.0</span></a><p data-i18n="madeBy">Made by <a href="https://itmitalles.de">itmitalles</a>. Inspired by <a href="https://github.com/htop-dev/htop">htop</a> and <a href="https://github.com/Syllo/nvtop">nvtop</a>. The disk counterpart of <a href="https://nettop.wutz.io">nwtop</a>.</p><a href="https://github.com/itmitalles-de/spctop" data-i18n="sourceDocs">Source &amp; documentation</a></footer>
   <div id="copy-status" class="sr-only" role="status" aria-live="polite"></div>
 </body>
 </html>

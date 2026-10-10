@@ -36,7 +36,8 @@ pub const MAX_ROOT_BYTES: usize = 4096;
 pub const MAX_NAME_CHARS: usize = 256;
 /// Root-owned list of the trees the helper may scan, one absolute path per
 /// line; `#` starts a comment. Without the file only /home is allowed.
-pub const SCAN_ROOTS_PATH: &str = "/etc/disktop/scan-roots";
+pub const SCAN_ROOTS_PATH: &str = "/etc/spctop/scan-roots";
+pub const LEGACY_SCAN_ROOTS_PATH: &str = "/etc/disktop/scan-roots";
 pub const DEFAULT_SCAN_ROOTS: &[&str] = &["/home"];
 const MAX_SCAN_ROOTS: usize = 64;
 
@@ -256,12 +257,53 @@ fn open_component(parent: Option<&OwnedFd>, name: &Path) -> io::Result<OwnedFd> 
     }
 }
 
+/// Check every existing component before treating a missing policy as absent.
+/// A missing leaf below an unsafe or dangling symlink must not enable defaults.
+fn trusted_policy_exists(path: &Path) -> std::result::Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+    let components: Vec<_> = path
+        .ancestors()
+        .filter(|part| !part.as_os_str().is_empty())
+        .collect();
+    for component in components.into_iter().rev() {
+        let metadata = match std::fs::symlink_metadata(component) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(format!("{}: {error}", component.display())),
+        };
+        if metadata.file_type().is_symlink()
+            || metadata.uid() != 0
+            || metadata.mode() & 0o022 != 0
+            || if component == path {
+                !metadata.is_file()
+            } else {
+                !metadata.is_dir()
+            }
+        {
+            return Err(format!(
+                "{} must be a root-owned file/directory that others cannot write; \
+                 no helper scans are allowed",
+                component.display()
+            ));
+        }
+    }
+    Ok(true)
+}
+
+/// Prefer the current policy; only a safely absent path permits legacy fallback.
+pub fn load_scan_roots_with_legacy(path: &Path, legacy: &Path) -> (RootPolicy, Option<String>) {
+    match trusted_policy_exists(path) {
+        Ok(false) => load_scan_roots(legacy),
+        Ok(true) => load_scan_roots(path),
+        Err(problem) => (RootPolicy::Allowed(Vec::new()), Some(problem)),
+    }
+}
+
 /// The helper's scan roots from `path`. The file and every directory above it
 /// must be root-owned regular files/directories that others cannot write;
-/// otherwise nothing may be scanned with privileges. Missing file: /home.
+/// otherwise nothing may be scanned with privileges. Safely missing file: /home.
 /// The second value describes a problem with the file, for diagnostics.
 pub fn load_scan_roots(path: &Path) -> (RootPolicy, Option<String>) {
-    use std::os::unix::fs::MetadataExt;
     let parse_roots = |entries: Vec<String>| {
         RootPolicy::Allowed(
             entries
@@ -281,8 +323,8 @@ pub fn load_scan_roots(path: &Path) -> (RootPolicy, Option<String>) {
                 .collect(),
         )
     };
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+    match trusted_policy_exists(path) {
+        Ok(false) => {
             return (
                 parse_roots(
                     DEFAULT_SCAN_ROOTS
@@ -293,34 +335,8 @@ pub fn load_scan_roots(path: &Path) -> (RootPolicy, Option<String>) {
                 None,
             );
         }
-        Err(error) => {
-            return (
-                RootPolicy::Allowed(Vec::new()),
-                Some(format!("{}: {error}", path.display())),
-            );
-        }
-        Ok(_) => {}
-    }
-    for component in path.ancestors().filter(|part| !part.as_os_str().is_empty()) {
-        let unsafe_file = match std::fs::symlink_metadata(component) {
-            Ok(metadata) => {
-                metadata.file_type().is_symlink()
-                    || metadata.uid() != 0
-                    || metadata.mode() & 0o022 != 0
-                    || (component == path && !metadata.is_file())
-            }
-            Err(_) => true,
-        };
-        if unsafe_file {
-            return (
-                RootPolicy::Allowed(Vec::new()),
-                Some(format!(
-                    "{} must be a root-owned file that others cannot write; \
-                     no helper scans are allowed",
-                    component.display()
-                )),
-            );
-        }
+        Err(problem) => return (RootPolicy::Allowed(Vec::new()), Some(problem)),
+        Ok(true) => {}
     }
     let mut bytes = Vec::new();
     let read = std::fs::File::open(path)
@@ -1023,7 +1039,7 @@ impl HomeService {
         });
         let worker = Arc::clone(&shared);
         std::thread::Builder::new()
-            .name("disktop-scan".into())
+            .name("spctop-scan".into())
             // Directory recursion is depth-bounded; leave generous room.
             .stack_size(16 * 1024 * 1024)
             .spawn(move || run(worker, limits, prepare))?;
@@ -1239,7 +1255,7 @@ mod tests {
         fn new(label: &str) -> Self {
             static SEQUENCE: AtomicU64 = AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
-                "disktop-scan-{label}-{}-{}",
+                "spctop-scan-{label}-{}-{}",
                 std::process::id(),
                 SEQUENCE.fetch_add(1, Ordering::Relaxed)
             ));
@@ -1753,7 +1769,7 @@ mod tests {
         }
         assert!(
             scan(
-                Path::new("/nonexistent-disktop"),
+                Path::new("/nonexistent-spctop"),
                 &Limits::default(),
                 &AtomicBool::new(false),
                 &AtomicU64::new(0)
@@ -1812,7 +1828,18 @@ mod tests {
     #[test]
     fn scan_roots_default_to_home_and_unsafe_files_allow_nothing() {
         let tree = TempTree::new("roots");
-        let (policy, problem) = load_scan_roots(&tree.0.join("missing"));
+        // / is trusted even when tests run as an ordinary user. /tmp and the
+        // user-owned fixture are deliberately not trusted policy ancestors.
+        let missing = PathBuf::from(format!(
+            "/nonexistent-spctop-policy-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(!missing.exists());
+        let (policy, problem) = load_scan_roots(&missing.join("scan-roots"));
         assert!(problem.is_none());
         let RootPolicy::Allowed(roots) = &policy else {
             panic!("helper policy expected");
@@ -1829,6 +1856,46 @@ mod tests {
             assert_eq!(policy, RootPolicy::Allowed(Vec::new()));
             assert!(problem.unwrap().contains("root-owned"));
             assert!(!policy.allows(Path::new("/srv")) && !policy.allows(Path::new("/home")));
+        }
+    }
+
+    #[test]
+    fn policy_migration_never_uses_defaults_below_unsafe_ancestors() {
+        let tree = TempTree::new("policy-migration");
+        let missing = PathBuf::from(format!(
+            "/nonexistent-spctop-migration-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let current = missing.join("spctop/scan-roots");
+        let legacy = missing.join("disktop/scan-roots");
+        let (policy, problem) = load_scan_roots_with_legacy(&current, &legacy);
+        assert!(problem.is_none());
+        assert!(policy.allows(Path::new("/home/alice")));
+        assert!(!policy.allows(Path::new("/root")));
+
+        // Missing policy below a writable/user-owned parent is an error,
+        // whether it is the current policy or the legacy fallback.
+        let unsafe_missing = tree.0.join("missing/scan-roots");
+        for (new, old) in [(&unsafe_missing, &legacy), (&current, &unsafe_missing)] {
+            let (policy, problem) = load_scan_roots_with_legacy(new, old);
+            assert_eq!(policy, RootPolicy::Allowed(Vec::new()));
+            assert!(problem.unwrap().contains("root-owned"));
+        }
+
+        // /proc/self is a root-owned symlink under trusted /proc. Looking only
+        // at the missing leaf would miss it and incorrectly enable /home.
+        let symlink_parent = Path::new("/proc/self/nonexistent-spctop-policy/scan-roots");
+        for (new, old) in [
+            (symlink_parent, legacy.as_path()),
+            (current.as_path(), symlink_parent),
+        ] {
+            let (policy, problem) = load_scan_roots_with_legacy(new, old);
+            assert_eq!(policy, RootPolicy::Allowed(Vec::new()));
+            assert!(problem.unwrap().contains("/proc/self"));
         }
     }
 
@@ -1959,7 +2026,7 @@ mod tests {
             "new root resets growth"
         );
         service.configure(
-            PathBuf::from("/nonexistent-disktop"),
+            PathBuf::from("/nonexistent-spctop"),
             Duration::from_secs(3600),
         );
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1975,7 +2042,7 @@ mod tests {
                 .status()
                 .error
                 .unwrap()
-                .contains("nonexistent-disktop")
+                .contains("nonexistent-spctop")
         );
     }
 }

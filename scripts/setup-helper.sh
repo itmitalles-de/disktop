@@ -5,8 +5,8 @@
 # authenticates must trust that checkout and build.
 set -euo pipefail
 
-destination=/usr/local/libexec/disktop-collector
-receipt=/usr/local/libexec/.disktop-collector.sha256
+destination=/usr/local/libexec/spctop-collector
+receipt=/usr/local/libexec/.spctop-collector.sha256
 capabilities=cap_dac_read_search,cap_sys_ptrace=ep
 usage="Usage: $0 [--allow-shared-group] [--allow-owner-change]"
 # Upper bounds for enumerating accounts that share the helper group.
@@ -173,8 +173,8 @@ if [[ "${1:-}" == --install ]]; then
     safe_directory /usr/local/libexec
     check_destination
     check_owner_change "$owner_gid" "$allow_owner_change"
-    staged_binary="$(mktemp /usr/local/libexec/.disktop-collector.XXXXXX)"
-    staged_receipt="$(mktemp /usr/local/libexec/.disktop-collector-receipt.XXXXXX)"
+    staged_binary="$(mktemp /usr/local/libexec/.spctop-collector.XXXXXX)"
+    staged_receipt="$(mktemp /usr/local/libexec/.spctop-collector-receipt.XXXXXX)"
     # The user can still swap the source (or a parent directory) for a symlink
     # after the checks above. Copy it without following a final symlink into a
     # root:root 0700 file, bounded in size, and grant group access only after
@@ -195,9 +195,9 @@ if [[ "${1:-}" == --install ]]; then
     staged_binary=''
     mv -T -- "$staged_receipt" "$receipt"
     staged_receipt=''
-    printf 'Installed root-owned disktop helper for primary group %s.\n' "$owner_gid"
+    printf 'Installed root-owned spctop helper for primary group %s.\n' "$owner_gid"
     getcap "$destination"
-    printf 'Start normally: disktop\n'
+    printf 'Start normally: spctop\n'
     exit 0
 fi
 
@@ -220,8 +220,8 @@ check_group "$(id -u)" "$(id -g)" "$allow_shared_group"
 check_owner_change "$(id -g)" "$allow_owner_change"
 # Resolve symlinks: the root side refuses a build path that contains any.
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
-cargo build --release --locked --bin disktop-collector --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target"
-binary="$repo_dir/target/release/disktop-collector"
+cargo build --release --locked --bin spctop-collector --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target"
+binary="$repo_dir/target/release/spctop-collector"
 read -r digest _ < <(sha256sum -- "$binary")
 printf 'One-time setup: install %s with /proc and directory read capabilities.\n' "$destination"
 printf 'Every member of your primary group (%s) will be able to run it. The terminal UI stays unprivileged.\n' "$(id -gn)"

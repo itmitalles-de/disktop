@@ -2,7 +2,7 @@
 """Check terminal restoration after keyboard, signal and error exits, and
 clean non-interactive output into a closed pipe.
 
-Run without root: python3 tests/terminal.py target/release/disktop
+Run without root: python3 tests/terminal.py target/release/spctop
 Each case owns a fresh pseudo-terminal and affects no interactive terminal.
 """
 
@@ -212,7 +212,7 @@ def run_hangup_case(binary, mode):
 
 def main():
     if len(sys.argv) != 2:
-        raise SystemExit("Usage: python3 tests/terminal.py /path/to/disktop")
+        raise SystemExit("Usage: python3 tests/terminal.py /path/to/spctop")
     binary = Path(sys.argv[1]).resolve(strict=True)
     for exit_signal in (None, signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         run_case(binary, exit_signal)

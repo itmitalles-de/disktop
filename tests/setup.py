@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise Setup and persisted preferences through the real terminal UI.
 
-Run without root: python3 tests/setup.py target/release/disktop
+Run without root: python3 tests/setup.py target/release/spctop
 Every process uses a temporary XDG directory and its own pseudo-terminal.
 """
 
@@ -161,7 +161,7 @@ DEFAULTS = {
     "graph_style": "steps",
     "read_color": "green",
     "write_color": "yellow",
-    "view": "processes",
+    "view": "filesystems",
     "sort": "io",
     "show_idle": False,
     "language": "auto",
@@ -178,7 +178,7 @@ DEFAULTS = {
 
 
 def persistence_and_overrides(binary, config_home):
-    path = config_home / "disktop/config.json"
+    path = config_home / "spctop/config.json"
     with Terminal(binary, config_home) as terminal:
         assert not path.exists(), "opening the monitor unexpectedly wrote settings"
         assert b"Settings:" not in terminal.output, "missing settings should silently use defaults"
@@ -218,8 +218,8 @@ def persistence_and_overrides(binary, config_home):
         assert stat.S_IMODE(path.stat().st_mode) == 0o600, "saved settings are not private"
         terminal.expect(b"Saved ")
         mark = terminal.send(F10)
-        terminal.expect(b"READ/s", mark)
-        assert terminal.child.poll() is None, "F10 in Setup unexpectedly quit disktop"
+        terminal.expect(b"MOUNT", mark)
+        assert terminal.child.poll() is None, "F10 in Setup unexpectedly quit spctop"
         terminal.quit()
 
     before = path.read_bytes()
@@ -242,17 +242,17 @@ def persistence_and_overrides(binary, config_home):
     assert not stderr, f"unexpected warning with CLI overrides: {stderr}"
     assert json.loads(stdout)["home"]["root"] == "/srv", "--home-path did not override"
     stdout, _ = run_once(binary, config_home, "--interval", "0.1", "--device", "/dev/nvme0n1")
-    assert stdout.startswith("disktop DEMO  nvme0n1"), "--device did not override the saved choice"
+    assert stdout.startswith("spctop DEMO  nvme0n1"), "--device did not override the saved choice"
     assert path.read_bytes() == before, "temporary CLI overrides overwrote saved preferences"
     print("PASS Setup: F2 edits incl. home path, F12 persistence, F10 returns, restart and CLI overrides")
 
 
 def overrides_not_persisted(binary, config_home):
-    path = config_home / "disktop/config.json"
+    path = config_home / "spctop/config.json"
     path.parent.mkdir(mode=0o700, parents=True)
     original = {
         "version": 1,
-        "device": "disktop-gone",
+        "device": "spctop-gone",
         "interval_ms": 1000,
         "history_seconds": 120,
         "color": True,
@@ -264,7 +264,7 @@ def overrides_not_persisted(binary, config_home):
                  "--sort", "write", "--home-path", "/srv")
     with Terminal(binary, config_home, arguments, NO_COLOR="1") as terminal:
         terminal.expect(b"unknown keys")
-        terminal.expect(b"Saved device disktop-gone unavailable")
+        terminal.expect(b"Saved device spctop-gone unavailable")
         # Saving without changes keeps every file value, despite CLI overrides,
         # NO_COLOR and the automatic fallback for the missing device.
         before = path.read_bytes()
@@ -289,11 +289,11 @@ def overrides_not_persisted(binary, config_home):
 
 
 def german_interface(binary, config_home):
-    path = config_home / "disktop/config.json"
+    path = config_home / "spctop/config.json"
     with Terminal(binary, config_home, ready="Fokus".encode(), LC_ALL=None, LANG="de_DE.UTF-8") as terminal:
         terminal.expect("Hilfe".encode())
         terminal.expect("Speichern".encode())
-        terminal.expect(b"LESEN/s")
+        terminal.expect(b"FREI")
         mark = terminal.send(F2)
         terminal.expect(b"Optionen: Allgemein", mark)
         # General > Language: Auto -> English switches the running UI at once.
@@ -319,11 +319,11 @@ def german_interface(binary, config_home):
 
 def disk_overview(binary, config_home):
     """All disks are visible at once; the new overview options persist."""
-    path = config_home / "disktop/config.json"
+    path = config_home / "spctop/config.json"
     with Terminal(binary, config_home) as terminal:
         # Unchanged (blank) cells are not redrawn, so look for space-free text.
         for text in (b"Disks", b"nvme0n1", b"nvme1n1", b"sda", b"sdb", b"mounted]", b"100%",
-                     b"COMMAND"):
+                     b"MOUNT"):
             terminal.expect(text)
         # Tab moves the focus to the next disk; F12 below saves it.
         terminal.send(b"\t")
@@ -367,31 +367,44 @@ def disk_overview(binary, config_home):
 
 def views_and_home(binary, config_home):
     with Terminal(binary, config_home) as terminal:
+        terminal.expect(b"*/home")
+        initial = ANSI.sub(b"", bytes(terminal.output))
+        assert b"READ/s" not in initial and b"IOPS" not in initial and b"COMMAND" not in initial, initial
+        mark = terminal.send(b"v")
+        terminal.expect(b"I/O:", mark)
+        mark = terminal.send(DOWN + DOWN + b"\r")
+        terminal.expect(b"COMMAND", mark)
+        mark = terminal.send(b"\x1b")
+        terminal.expect(b"MOUNT", mark)
+        mark = terminal.send(b"i")
+        terminal.expect(b"COMMAND", mark)
         mark = terminal.send(b"2")
-        terminal.expect(b"*/home", mark)
-        mark = terminal.send(b"3")
         terminal.expect(b"tim/", mark)
         mark = terminal.send(b"\r")
-        # Only changed cells are redrawn, so look for new, distinct rows.
         terminal.expect(b".cache/", mark)
         terminal.expect(b"smaller dirs]", mark)
         mark = terminal.send(BACKSPACE)
         terminal.expect(b"anna/", mark)
         mark = terminal.send(b"1")
-        terminal.expect(b"COMMAND", mark)
+        terminal.expect(b"MOUNT", mark)
         terminal.quit()
-    print("PASS views: filesystems mark the home filesystem; home view opens and leaves directories")
+    stdout, _ = run_once(binary, config_home, "--interval", "0.1")
+    assert "READ/s" not in stdout and "IOPS" not in stdout and "COMMAND" not in stdout, stdout
+    for view in ("io", "processes"):
+        stdout, _ = run_once(binary, config_home, "--interval", "0.1", "--view", view)
+        assert "READ/s" in stdout and "IOPS" in stdout and "COMMAND" in stdout, stdout
+    print("PASS views: Space default, F4/v menu, I/O shortcuts/back, Home drill-down and CLI alias")
 
 
 def malformed_settings(binary, config_home):
-    path = config_home / "disktop/config.json"
+    path = config_home / "spctop/config.json"
     path.parent.mkdir(mode=0o700, parents=True)
     original = b'{"show_idle": true, this is deliberately incomplete\n'
     path.write_bytes(original)
     path.chmod(0o600)
     stdout, stderr = run_once(binary, config_home, "--interval", "0.1")
     assert "Settings:" in stderr and "cannot load" in stderr, "malformed JSON had no warning"
-    assert stdout.splitlines()[1].startswith("READ "), "malformed JSON did not fall back to defaults"
+    assert stdout.splitlines()[1].startswith("SPACE "), "malformed JSON did not fall back to defaults"
 
     with Terminal(binary, config_home) as terminal:
         terminal.expect(b"Settings:")
@@ -402,42 +415,70 @@ def malformed_settings(binary, config_home):
         assert path.read_bytes() == original, "F12 discarded the malformed settings file"
         assert list(path.parent.iterdir()) == [path], "failed save left temporary files"
         mark = terminal.send(F10)
-        terminal.expect(b"READ/s", mark)
+        terminal.expect(b"MOUNT", mark)
         terminal.quit()
     assert path.read_bytes() == original, "exit overwrote malformed settings"
     print("PASS invalid settings: visible warning, usable defaults, original file preserved")
 
 
 def vanished_device(binary, config_home):
-    path = config_home / "disktop/config.json"
+    path = config_home / "spctop/config.json"
     path.parent.mkdir(mode=0o700, parents=True)
-    path.write_text(json.dumps({"version": 1, "device": "disktop-gone"}))
+    path.write_text(json.dumps({"version": 1, "device": "spctop-gone"}))
     path.chmod(0o600)
     original = path.read_bytes()
     stdout, stderr = run_once(binary, config_home, "--interval", "0.1")
-    assert "Saved device disktop-gone unavailable" in stderr, "missing device had no warning"
+    assert "Saved device spctop-gone unavailable" in stderr, "missing device had no warning"
     assert "automatic selection" in stderr, "device warning did not explain the fallback"
     assert "nvme0n1" in stdout.splitlines()[0], "missing device did not use the demo default"
     assert path.read_bytes() == original, "automatic fallback overwrote the saved device"
     result = subprocess.run(
-        [str(binary), "--demo", "--once", "--device", "disktop-gone"],
+        [str(binary), "--demo", "--once", "--device", "spctop-gone"],
         env=environment(config_home), capture_output=True, text=True, timeout=3, check=False,
     )
     assert result.returncode != 0 and "does not exist" in result.stderr, result
     print("PASS vanished device: visible warning, automatic fallback, saved choice preserved")
 
 
+def legacy_preferences(binary, config_home):
+    legacy = config_home / "disktop/config.json"
+    current = config_home / "spctop/config.json"
+    legacy.parent.mkdir(mode=0o700, parents=True)
+    original = json.dumps({"view": "processes", "home_path": "/srv", "future_option": True})
+    legacy.write_text(original)
+    legacy.chmod(0o600)
+    stdout, stderr = run_once(binary, config_home, "--interval", "0.1")
+    assert "READ/s" not in stdout and "SPACE " in stdout, "legacy process default did not migrate"
+    assert "future_option" in stderr, "legacy unknown key was not reported"
+    assert not current.exists(), "reading legacy preferences wrote a new file"
+    with Terminal(binary, config_home) as terminal:
+        terminal.send(F12)
+        terminal.wait_for(lambda: read_saved(current) is not None, "F12 migrated legacy settings")
+        saved = read_saved(current)
+        assert saved["view"] == "filesystems" and saved["home_path"] == "/srv", saved
+        assert saved["future_option"] is True, saved
+        terminal.send(b"i" + F12)
+        terminal.wait_for(lambda: read_saved(current)["view"] == "io", "F12 persisted explicit I/O")
+        terminal.quit()
+    assert legacy.read_text() == original, "migration modified the original file"
+    legacy.write_text("invalid")
+    stdout, _ = run_once(binary, config_home, "--interval", "0.1")
+    assert "READ/s" in stdout, "new I/O preference lost to legacy/default preferences"
+    print("PASS migration: legacy processes opens Space; F12 preserves values; explicit new I/O wins")
+
+
 def main():
     if len(sys.argv) != 2:
-        raise SystemExit("Usage: python3 tests/setup.py /path/to/disktop")
+        raise SystemExit("Usage: python3 tests/setup.py /path/to/spctop")
     binary = Path(sys.argv[1]).resolve(strict=True)
-    with tempfile.TemporaryDirectory(prefix="disktop-setup-test-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="spctop-setup-test-") as temporary:
         root = Path(temporary)
         persistence_and_overrides(binary, root / "preferences")
         overrides_not_persisted(binary, root / "overrides")
         german_interface(binary, root / "german")
         disk_overview(binary, root / "overview")
         views_and_home(binary, root / "views")
+        legacy_preferences(binary, root / "legacy")
         malformed_settings(binary, root / "malformed")
         vanished_device(binary, root / "vanished")
     print("All Setup and configuration integration checks passed.")

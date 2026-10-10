@@ -44,6 +44,7 @@ const SORTS: [Sort; 6] = [
     Sort::Name,
 ];
 const CATEGORY_COUNT: usize = 5;
+const VIEWS: [View; 3] = [View::Filesystems, View::Home, View::Processes];
 const RESCAN_STEPS: [u16; 11] = [1, 2, 5, 10, 15, 30, 60, 120, 240, 720, 1440];
 /// Smallest graph scale, so idle noise does not fill the whole graph.
 const GRAPH_FLOOR: f64 = 64.0 * 1024.0;
@@ -92,8 +93,8 @@ impl Sort {
 
 fn view_label(view: View, lang: Lang) -> &'static str {
     match view {
-        View::Processes => lang.pick("Processes", "Prozesse"),
-        View::Filesystems => lang.pick("Filesystems", "Dateisysteme"),
+        View::Processes => "I/O",
+        View::Filesystems => lang.pick("Space", "Speicher"),
         View::Home => "Home",
     }
 }
@@ -106,6 +107,7 @@ pub enum Overlay {
     Devices,
     Setup,
     Sort,
+    Views,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -495,10 +497,16 @@ impl App {
                 self.setup_focus = false;
             }
             KeyCode::F(3) | KeyCode::Char('/') => self.searching = true,
-            KeyCode::F(4) | KeyCode::Char('v') => return self.set_view(self.settings.view.next(1)),
-            KeyCode::Char('1') => return self.set_view(View::Processes),
-            KeyCode::Char('2') => return self.set_view(View::Filesystems),
-            KeyCode::Char('3') => return self.set_view(View::Home),
+            KeyCode::F(4) | KeyCode::Char('v') => {
+                self.overlay = Overlay::Views;
+                self.picker = VIEWS
+                    .iter()
+                    .position(|view| *view == self.settings.view)
+                    .unwrap_or(0);
+            }
+            KeyCode::Char('1') => return self.set_view(View::Filesystems),
+            KeyCode::Char('2') => return self.set_view(View::Home),
+            KeyCode::Char('3') | KeyCode::Char('i') => return self.set_view(View::Processes),
             KeyCode::F(5) | KeyCode::Char('d') => {
                 self.overlay = Overlay::Devices;
                 let visible = self.visible_devices();
@@ -527,19 +535,22 @@ impl App {
                 self.set_device(names[next].clone());
                 return Action::DeviceChanged;
             }
-            KeyCode::F(6) => {
+            KeyCode::F(6) if self.settings.view == View::Processes => {
                 self.overlay = Overlay::Sort;
                 self.picker = SORTS
                     .iter()
                     .position(|sort| *sort == self.settings.sort)
                     .unwrap_or(0);
             }
-            KeyCode::Char('s') => {
+            KeyCode::Char('s') if self.settings.view == View::Processes => {
                 self.settings.sort = self.settings.sort.next();
                 self.table.select(Some(0));
             }
             KeyCode::F(9) | KeyCode::Char(' ') => self.paused = !self.paused,
-            KeyCode::Esc if home && self.filter.is_empty() => self.home_up(),
+            KeyCode::Esc if home && self.filter.is_empty() && !self.home_cwd.is_empty() => {
+                self.home_up()
+            }
+            KeyCode::Esc if self.filter.is_empty() => return self.set_view(View::Filesystems),
             KeyCode::Esc => self.filter.clear(),
             KeyCode::Enter | KeyCode::Right if home => self.home_enter(),
             KeyCode::Backspace | KeyCode::Left if home => self.home_up(),
@@ -607,6 +618,25 @@ impl App {
     }
 
     fn overlay_key(&mut self, key: KeyEvent) -> Action {
+        if self.overlay == Overlay::Views {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.picker = self.picker.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.picker = (self.picker + 1).min(VIEWS.len() - 1)
+                }
+                KeyCode::Enter => {
+                    self.overlay = Overlay::None;
+                    return self.set_view(VIEWS[self.picker.min(VIEWS.len() - 1)]);
+                }
+                KeyCode::Char(c @ '1'..='3') => {
+                    self.overlay = Overlay::None;
+                    return self.set_view(VIEWS[(c as u8 - b'1') as usize]);
+                }
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(4) => self.overlay = Overlay::None,
+                _ => {}
+            }
+            return Action::None;
+        }
         let device_count = self.visible_devices().len();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(1) | KeyCode::Char('?') => {
@@ -1140,8 +1170,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if area.width < 36 || area.height < 16 {
         frame.render_widget(
             Paragraph::new(app.lang().pick(
-                "disktop\nTerminal too small.\nUse at least 36 x 16.\nq / F10 to quit.",
-                "disktop\nTerminal zu klein.\nMindestens 36 x 16.\nq / F10 beendet.",
+                "spctop\nTerminal too small.\nUse at least 36 x 16.\nq / F10 to quit.",
+                "spctop\nTerminal zu klein.\nMindestens 36 x 16.\nq / F10 beendet.",
             ))
             .style(Style::default().fg(if app.settings.color {
                 KEY
@@ -1166,8 +1196,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
     .min(body.saturating_sub(2));
     let count = app.overview_devices().len();
-    let graphs =
-        app.settings.show_graph && (app.settings.show_io_series || app.settings.show_usage_series);
+    let graphs = app.settings.show_graph
+        && (app.settings.show_usage_series
+            || (app.settings.view == View::Processes && app.settings.show_io_series));
     let mut layout = disk_layout(area.width, body - reserved, count, graphs);
     if count == 0 {
         layout.visible_rows = 0;
@@ -1228,6 +1259,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Overlay::Devices => draw_devices(frame, app, area),
         Overlay::Setup => draw_setup(frame, app, area),
         Overlay::Sort => draw_sort(frame, app, area),
+        Overlay::Views => draw_views(frame, app, area),
         Overlay::None => {}
     }
     if !app.settings.color {
@@ -1265,7 +1297,7 @@ fn draw_title(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
     let used: usize = spans.iter().map(|span| span.content.columns()).sum();
     // View tabs on the right; narrow terminals show only the current view.
-    let views = [View::Processes, View::Filesystems, View::Home];
+    let views = VIEWS;
     let tabs_width: usize = views
         .iter()
         .map(|view| view_label(*view, lang).columns() + 3)
@@ -1376,6 +1408,81 @@ fn combined_usage(app: &App) -> (u64, u64) {
 /// The row below the title: details of the focused device, or of all disks.
 fn summary_line(app: &App, width: u16) -> String {
     let lang = app.lang();
+    if app.settings.view != View::Processes {
+        let (used, total, partial) = if let Some(name) = &app.device {
+            let Some(device) = app.selected_device() else {
+                return format!("[{name}] {}", lang.pick("unavailable", "nicht verfügbar"));
+            };
+            let Some(usage) = device.usage.as_ref() else {
+                return lang
+                    .pick(
+                        "Used -  Free -  (unavailable)",
+                        "Belegt -  Frei -  (nicht verfügbar)",
+                    )
+                    .into();
+            };
+            if usage.percent().is_none() {
+                return if usage.unmeasured > 0 {
+                    lang.pick(
+                        "Used -  Free -  (unavailable)",
+                        "Belegt -  Frei -  (nicht verfügbar)",
+                    )
+                } else if usage.swap {
+                    lang.pick("swap only", "nur Swap")
+                } else {
+                    lang.pick("not mounted", "nicht eingehängt")
+                }
+                .into();
+            }
+            (
+                usage.used_bytes,
+                usage.used_bytes.saturating_add(usage.available_bytes),
+                usage.unmeasured > 0,
+            )
+        } else {
+            let (used, total) = combined_usage(app);
+            if total == 0 {
+                return lang
+                    .pick(
+                        "Used -  Free -  (no measured filesystems)",
+                        "Belegt -  Frei -  (keine gemessenen Dateisysteme)",
+                    )
+                    .into();
+            }
+            let partial = physical_disks(app).any(|device| {
+                device
+                    .usage
+                    .as_ref()
+                    .is_none_or(|usage| usage.unmeasured > 0)
+            });
+            (used, total, partial)
+        };
+        return fit_pieces(
+            vec![
+                format!(
+                    "{} {}",
+                    if partial {
+                        lang.pick("Used (partial)", "Belegt (teilweise)")
+                    } else {
+                        lang.pick("Used", "Belegt")
+                    },
+                    format_bytes(used as f64)
+                ),
+                format!(
+                    "{} {}",
+                    lang.pick("Free", "Frei"),
+                    format_bytes(total.saturating_sub(used) as f64)
+                ),
+                if total > 0 {
+                    format!("{:.1}%", used as f64 * 100.0 / total as f64)
+                } else {
+                    "-".into()
+                },
+                graph_note(app),
+            ],
+            width,
+        );
+    }
     let ms =
         |value: Option<f64>| value.map_or_else(|| "-".to_owned(), |value| format!("{value:.2} ms"));
     let rates = app.selected_rates();
@@ -1487,6 +1594,18 @@ fn summary_line(app: &App, width: u16) -> String {
 
 fn graph_note(app: &App) -> String {
     let lang = app.lang();
+    if app.settings.view != View::Processes {
+        return match lang {
+            Lang::En => format!(
+                "used-space history 0-100% over {}s",
+                app.settings.history_seconds
+            ),
+            Lang::De => format!(
+                "Belegungsverlauf 0-100% über {}s",
+                app.settings.history_seconds
+            ),
+        };
+    }
     match lang {
         Lang::En => format!(
             "graphs: IO / {} 0-100% over {}s",
@@ -1594,18 +1713,19 @@ fn disk_meters(app: &App, device: &Device, peak: f64) -> [Meter; 4] {
         (Some(usage), Some(percent)) => {
             let total = usage.used_bytes.saturating_add(usage.available_bytes) as f64;
             let used = usage.used_bytes as f64;
+            let partial = if usage.unmeasured > 0 { "!" } else { "" };
             vec![
                 format!(
-                    "{percent:.0}% {}/{}",
+                    "{percent:.0}%{partial} {}/{}",
                     format_bytes(used),
                     format_bytes(total)
                 ),
                 format!(
-                    "{percent:.0}% {}/{}",
+                    "{percent:.0}%{partial} {}/{}",
                     format_bytes_short(used),
                     format_bytes_short(total)
                 ),
-                format!("{percent:.0}%"),
+                format!("{percent:.0}%{partial}"),
             ]
         }
         (Some(usage), None) if usage.filesystems == 0 && usage.unmeasured == 0 => {
@@ -1841,6 +1961,61 @@ fn draw_disk(
 ) {
     let meters = disk_meters(app, device, scale);
     let line = |y: u16, x: u16, width: u16| Rect::new(x, area.y + y, width, 1);
+    if app.settings.view != View::Processes {
+        if style == BlockStyle::Row {
+            let name_width = name_width.min(area.width.saturating_sub(1));
+            frame.render_widget(
+                Paragraph::new(pad(
+                    &truncate(&device.name, usize::from(name_width)),
+                    usize::from(name_width),
+                ))
+                .style(if focused {
+                    inverse(KEY)
+                } else {
+                    Style::default()
+                }),
+                line(0, area.x, name_width),
+            );
+            frame_meter(
+                frame,
+                &meters[3],
+                line(
+                    0,
+                    area.x + name_width + 1,
+                    area.width.saturating_sub(name_width + 1),
+                ),
+            );
+            return;
+        }
+        frame.render_widget(
+            Paragraph::new(disk_label(app, device, area.width, focused)),
+            line(0, area.x, area.width),
+        );
+        frame_meter(frame, &meters[3], line(1, area.x, area.width));
+        if area.height >= 3 {
+            let free = device
+                .usage
+                .as_ref()
+                .filter(|usage| usage.percent().is_some())
+                .map_or_else(
+                    || "-".to_owned(),
+                    |usage| format_bytes(usage.available_bytes as f64),
+                );
+            frame.render_widget(
+                Paragraph::new(format!("{} {free}", app.lang().pick("Free", "Frei"))),
+                line(2, area.x, area.width),
+            );
+        }
+        if style.has_graph() && area.height >= 6 {
+            draw_disk_graph(
+                frame,
+                app,
+                &device.name,
+                Rect::new(area.x, area.y + 3, area.width, area.height - 3),
+            );
+        }
+        return;
+    }
     if style == BlockStyle::Row {
         let name_width = name_width.min(area.width.saturating_sub(1));
         let name = truncate(&device.name, usize::from(name_width));
@@ -1950,7 +2125,11 @@ fn draw_disk_graph(frame: &mut Frame<'_>, app: &App, name: &str, area: Rect) {
     // The legend sits in the axis column, so it never hides the curves.
     let mut legend_row = 1;
     for (enabled, label, color) in [
-        (app.settings.show_io_series, "IO", UTIL),
+        (
+            app.settings.view == View::Processes && app.settings.show_io_series,
+            "IO",
+            UTIL,
+        ),
         (app.settings.show_usage_series, us_label(lang), usage_color),
     ] {
         if enabled && legend_row < area.height - 1 {
@@ -1987,9 +2166,11 @@ fn draw_disk_graph(frame: &mut Frame<'_>, app: &App, name: &str, area: Rect) {
             usage_color,
             (|sample: &Sample| sample.used) as SampleValue,
         ),
-        (app.settings.show_io_series, UTIL, |sample: &Sample| {
-            sample.util
-        }),
+        (
+            app.settings.view == View::Processes && app.settings.show_io_series,
+            UTIL,
+            |sample: &Sample| sample.util,
+        ),
     ]
     .into_iter()
     .filter(|(enabled, _, _)| *enabled)
@@ -2357,19 +2538,11 @@ fn draw_filesystems(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let lang = app.lang();
     let records = app.filesystem_rows();
     let count = records.len();
-    let read_color = Style::default().fg(plot_color(app.settings.read_color));
-    let write_color = Style::default().fg(plot_color(app.settings.write_color));
     let mount_header = lang.pick("MOUNT", "EINHÄNGEPUNKT");
     let free_header = lang.pick("FREE", "FREI");
-    let size_header = lang.pick("SIZE", "GRÖSSE");
+    let size_header = lang.pick("USED", "BELEGT");
     let percent =
         |value: Option<f64>| value.map_or_else(|| "-".to_owned(), |value| format!("{value:.0}%"));
-    let rate = |value: Option<f64>| {
-        value.map_or_else(
-            || "-".to_owned(),
-            |value| format_rate(value).trim_end_matches("/s").to_owned(),
-        )
-    };
     let mount = |row: &Filesystem| {
         format!(
             "{}{}{}",
@@ -2391,117 +2564,121 @@ fn draw_filesystems(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Style::default()
         }
     };
-    let (headers, widths, rows): (Vec<(&str, bool)>, Vec<Constraint>, Vec<Row<'_>>) = if wide {
-        (
-            vec![
-                (mount_header, false),
-                (lang.pick("DEVICE", "GERÄT"), false),
-                (lang.pick("TYPE", "TYP"), false),
-                (lang.pick("USE", "BELEGT"), false),
-                (size_header, true),
-                (free_header, true),
-                ("INODES", true),
-                (lang.pick("READ/s", "LESEN/s"), true),
-                (lang.pick("WRITE/s", "SCHREIB/s"), true),
-            ],
-            vec![
-                Constraint::Min(12),
-                Constraint::Length(14),
-                Constraint::Length(6),
-                Constraint::Length(17),
-                Constraint::Length(10),
-                Constraint::Length(10),
-                Constraint::Length(6),
-                Constraint::Length(10),
-                Constraint::Length(10),
-            ],
-            records
-                .into_iter()
-                .map(|row| {
-                    let used = row.use_percent();
-                    let mut usage = bar(
-                        used.unwrap_or(0.0) / 100.0,
-                        10,
-                        use_color(used.unwrap_or(0.0)),
-                    );
-                    usage.push(Span::raw(format!("{:>5}", percent(used))));
-                    Row::new(vec![
-                        Cell::from(mount(row)),
-                        Cell::from(truncate(
-                            row.block_device.as_deref().unwrap_or(&row.source),
-                            14,
-                        )),
-                        Cell::from(truncate(&row.fs_type, 6)),
-                        Cell::from(Line::from(usage)),
-                        number_cell(optional_bytes(row.total_bytes)),
-                        number_cell(optional_bytes(row.available_bytes)),
-                        number_cell(percent(row.inode_percent())),
-                        number_cell(rate(row.read_rate)).style(read_color),
-                        number_cell(rate(row.write_rate)).style(write_color),
-                    ])
-                    .style(style(row))
-                })
-                .collect(),
-        )
-    } else if medium {
-        (
-            vec![
-                (mount_header, false),
-                (lang.pick("USE", "BEL."), true),
-                (size_header, true),
-                (free_header, true),
-                (lang.pick("TYPE", "TYP"), false),
-            ],
-            vec![
-                Constraint::Min(10),
-                Constraint::Length(5),
-                Constraint::Length(10),
-                Constraint::Length(10),
-                Constraint::Length(6),
-            ],
-            records
-                .into_iter()
-                .map(|row| {
-                    let used = row.use_percent();
-                    Row::new(vec![
-                        Cell::from(mount(row)),
-                        number_cell(percent(used))
-                            .style(Style::default().fg(use_color(used.unwrap_or(0.0)))),
-                        number_cell(optional_bytes(row.total_bytes)),
-                        number_cell(optional_bytes(row.available_bytes)),
-                        Cell::from(truncate(&row.fs_type, 6)),
-                    ])
-                    .style(style(row))
-                })
-                .collect(),
-        )
-    } else {
-        (
-            vec![
-                (mount_header, false),
-                (lang.pick("USE", "BEL."), true),
-                (free_header, true),
-            ],
-            vec![
-                Constraint::Min(10),
-                Constraint::Length(5),
-                Constraint::Length(10),
-            ],
-            records
-                .into_iter()
-                .map(|row| {
-                    let used = row.use_percent();
-                    Row::new(vec![
-                        Cell::from(mount(row)),
-                        number_cell(percent(used))
-                            .style(Style::default().fg(use_color(used.unwrap_or(0.0)))),
-                        number_cell(optional_bytes(row.available_bytes)),
-                    ])
-                    .style(style(row))
-                })
-                .collect(),
-        )
-    };
+    let (headers, widths, rows): (Vec<(&str, bool)>, Vec<Constraint>, Vec<Row<'_>>) =
+        if wide {
+            (
+                vec![
+                    (mount_header, false),
+                    (lang.pick("DEVICE", "GERÄT"), false),
+                    (lang.pick("TYPE", "TYP"), false),
+                    (lang.pick("USE", "BELEGT"), false),
+                    (size_header, true),
+                    (free_header, true),
+                    ("INODES", true),
+                ],
+                vec![
+                    Constraint::Min(12),
+                    Constraint::Length(14),
+                    Constraint::Length(6),
+                    Constraint::Length(17),
+                    Constraint::Length(10),
+                    Constraint::Length(10),
+                    Constraint::Length(6),
+                ],
+                records
+                    .into_iter()
+                    .map(|row| {
+                        let used = row.use_percent();
+                        let mut usage = bar(
+                            used.unwrap_or(0.0) / 100.0,
+                            10,
+                            use_color(used.unwrap_or(0.0)),
+                        );
+                        usage.push(Span::raw(format!("{:>5}", percent(used))));
+                        Row::new(vec![
+                            Cell::from(mount(row)),
+                            Cell::from(truncate(
+                                row.block_device.as_deref().unwrap_or(&row.source),
+                                14,
+                            )),
+                            Cell::from(truncate(&row.fs_type, 6)),
+                            Cell::from(Line::from(usage)),
+                            number_cell(optional_bytes(row.used_bytes)),
+                            number_cell(optional_bytes(row.available_bytes)),
+                            number_cell(percent(row.inode_percent())),
+                        ])
+                        .style(style(row))
+                    })
+                    .collect(),
+            )
+        } else if medium {
+            (
+                vec![
+                    (mount_header, false),
+                    (lang.pick("USE", "BEL."), true),
+                    (size_header, true),
+                    (free_header, true),
+                    (lang.pick("TYPE", "TYP"), false),
+                ],
+                vec![
+                    Constraint::Min(10),
+                    Constraint::Length(5),
+                    Constraint::Length(10),
+                    Constraint::Length(10),
+                    Constraint::Length(6),
+                ],
+                records
+                    .into_iter()
+                    .map(|row| {
+                        let used = row.use_percent();
+                        Row::new(vec![
+                            Cell::from(mount(row)),
+                            number_cell(percent(used))
+                                .style(Style::default().fg(use_color(used.unwrap_or(0.0)))),
+                            number_cell(optional_bytes(row.used_bytes)),
+                            number_cell(optional_bytes(row.available_bytes)),
+                            Cell::from(truncate(&row.fs_type, 6)),
+                        ])
+                        .style(style(row))
+                    })
+                    .collect(),
+            )
+        } else {
+            (
+                vec![
+                    (mount_header, false),
+                    (lang.pick("USE", "BEL."), true),
+                    (size_header, true),
+                    (free_header, true),
+                ],
+                vec![
+                    Constraint::Min(10),
+                    Constraint::Length(5),
+                    Constraint::Length(8),
+                    Constraint::Length(8),
+                ],
+                records
+                    .into_iter()
+                    .map(|row| {
+                        let used = row.use_percent();
+                        Row::new(vec![
+                            Cell::from(mount(row)),
+                            number_cell(percent(used))
+                                .style(Style::default().fg(use_color(used.unwrap_or(0.0)))),
+                            number_cell(row.used_bytes.map_or_else(
+                                || "-".into(),
+                                |value| format_bytes_short(value as f64),
+                            )),
+                            number_cell(row.available_bytes.map_or_else(
+                                || "-".into(),
+                                |value| format_bytes_short(value as f64),
+                            )),
+                        ])
+                        .style(style(row))
+                    })
+                    .collect(),
+            )
+        };
     let table = Table::new(rows, widths)
         .header(header_row(headers))
         .column_spacing(1)
@@ -2819,25 +2996,25 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let wide = area.width >= 60;
     let mut keys = vec![
         ("F1", lang.pick("Help", "Hilfe")),
-        ("F2", lang.pick("Setup", "Setup")),
+        ("F2", if area.width < 40 { "Set" } else { "Setup" }),
     ];
-    if area.width >= 44 {
+    if area.width >= 66 {
         keys.push(("F3", lang.pick("Search", "Suche")));
     }
+    keys.push(("F4", lang.pick("View", "Sicht")));
     if area.width >= 80 {
-        keys.extend([
-            ("F4", lang.pick("View", "Ansicht")),
-            ("F5", lang.pick("Focus", "Fokus")),
-        ]);
+        keys.push(("F5", lang.pick("Focus", "Fokus")));
     }
-    keys.push((
-        "F6",
-        if wide {
-            lang.pick("Sort", "Sortieren")
-        } else {
-            lang.pick("Sort", "Sort")
-        },
-    ));
+    if app.settings.view == View::Processes && area.width >= 44 {
+        keys.push((
+            "F6",
+            if wide {
+                lang.pick("Sort", "Sortieren")
+            } else {
+                lang.pick("Sort", "Sort")
+            },
+        ));
+    }
     if area.width >= 94 {
         keys.push((
             "F9",
@@ -3097,8 +3274,8 @@ fn setup_description(app: &App) -> &'static str {
             "Wechselt mit Enter oder +/- durch die Standardfarben des Terminals.",
         ),
         (3, 0) => lang.pick(
-            "Processes, filesystems or the home size view. 1, 2, 3 or F4 switch directly.",
-            "Prozesse, Dateisysteme oder Home-Größen. 1, 2, 3 oder F4 wechseln direkt.",
+            "Space, home directory growth or I/O. 1/2/3 select, F4 opens the view menu.",
+            "Speicher, Home-Wachstum oder I/O. 1/2/3 wählen, F4 öffnet das Ansichtsmenü.",
         ),
         (3, 1) => lang.pick(
             "Choose the process sort order. F6 opens the same choices in the monitor.",
@@ -3277,6 +3454,36 @@ fn draw_sort(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
+fn draw_views(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let area = popup(area, 46, 7);
+    frame.render_widget(Clear, area);
+    let lang = app.lang();
+    let descriptions = match lang {
+        Lang::En => [
+            "1 Space: used / free / history",
+            "2 Home: directory sizes / growth",
+            "3 I/O: activity / processes",
+        ],
+        Lang::De => [
+            "1 Speicher: belegt / frei / Verlauf",
+            "2 Home: Ordnergrößen / Wachstum",
+            "3 I/O: Aktivität / Prozesse",
+        ],
+    };
+    let mut state = TableState::default().with_selected(app.picker.min(VIEWS.len() - 1));
+    let table = Table::new(
+        descriptions.into_iter().map(|text| Row::new([text])),
+        [Constraint::Min(1)],
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(lang.pick(" Views · Enter / Esc ", " Ansichten · Enter / Esc ")),
+    )
+    .row_highlight_style(inverse(KEY));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
 fn popup(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width.saturating_sub(2));
     let height = height.min(area.height.saturating_sub(2));
@@ -3292,7 +3499,7 @@ const HELP_EN: &[&str] = &[
     "F1 / ?         Help     Esc closes",
     "F2             Setup: General, Device, Chart, Table, Home",
     "F3 / /         Search the current table",
-    "F4 / v, 1 2 3  Processes / Filesystems / Home below the disks",
+    "F4 / v         View menu: 1 Space, 2 Home, 3 I/O",
     "F5 / d         Focus a device; Tab / Shift-Tab cycle disks",
     "F6             Choose process sorting; s cycles it",
     "F9 / Space     Pause / resume display",
@@ -3302,7 +3509,10 @@ const HELP_EN: &[&str] = &[
     "               r rescan, a allocated/apparent size",
     "q / F10 / Ctrl-C Quit",
     "",
-    "Every disk has its own block, like htop's CPU meters:",
+    "Space starts with used/free capacity and used-space history.",
+    "2 opens directory sizes/growth; 3 or i opens I/O.",
+    "Esc returns from I/O to Space.",
+    "In I/O, every disk has its own block:",
     "RD read and WR write (green / yellow), all disks on one",
     "scale: the highest rate of any shown disk in the visible",
     "history, so bars compare across disks; IO utilization;",
@@ -3346,7 +3556,7 @@ const HELP_DE: &[&str] = &[
     "F1 / ?         Hilfe    Esc schließt",
     "F2             Setup: Allgemein, Gerät, Diagramm, Tabelle, Home",
     "F3 / /         Aktuelle Tabelle durchsuchen",
-    "F4 / v, 1 2 3  Prozesse / Dateisysteme / Home unter den Disks",
+    "F4 / v         Ansichtsmenü: 1 Speicher, 2 Home, 3 I/O",
     "F5 / d         Gerät fokussieren; Tab / Umschalt-Tab wechselt",
     "F6             Prozess-Sortierung wählen; s wechselt",
     "F9 / Leertaste Anzeige anhalten / fortsetzen",
@@ -3356,7 +3566,10 @@ const HELP_DE: &[&str] = &[
     "               r neu scannen, a belegt/scheinbar",
     "q / F10 / Strg-C Beenden",
     "",
-    "Jede Disk hat einen eigenen Block wie die CPU-Anzeigen",
+    "Speicher zeigt Belegung, freien Platz und Belegungsverlauf.",
+    "2 öffnet Ordner/Wachstum; 3 oder i öffnet I/O.",
+    "Esc wechselt von I/O zurück zu Speicher.",
+    "In I/O hat jede Disk einen eigenen Block wie die CPU-Anzeigen",
     "von htop: LE Lesen und SC Schreiben (grün / gelb), alle",
     "Disks auf einer Skala: höchste Rate aller gezeigten Disks",
     "im sichtbaren Verlauf, Balken sind vergleichbar;",
@@ -3458,7 +3671,28 @@ fn draw_devices(frame: &mut Frame<'_>, app: &App, area: Rect) {
         lang.pick("all", "alle").to_string(),
         lang.pick("no focus", "kein Fokus").to_string(),
         String::new(),
-        rate(total.as_ref()),
+        if app.settings.view == View::Processes {
+            rate(total.as_ref())
+        } else {
+            let (used, total) = combined_usage(app);
+            if total == 0 {
+                "-".into()
+            } else {
+                format!(
+                    "{}{}",
+                    format_bytes(total.saturating_sub(used) as f64),
+                    if physical_disks(app).any(|device| device
+                        .usage
+                        .as_ref()
+                        .is_none_or(|usage| usage.unmeasured > 0))
+                    {
+                        "!"
+                    } else {
+                        ""
+                    }
+                )
+            }
+        },
     ])];
     rows.extend(devices.iter().map(|device| {
         Row::new(vec![
@@ -3472,7 +3706,24 @@ fn draw_devices(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     .unwrap_or_default()
             ),
             used(device),
-            rate(device.rates.as_ref()),
+            if app.settings.view == View::Processes {
+                rate(device.rates.as_ref())
+            } else {
+                device
+                    .usage
+                    .as_ref()
+                    .filter(|usage| usage.percent().is_some())
+                    .map_or_else(
+                        || "-".into(),
+                        |usage| {
+                            format!(
+                                "{}{}",
+                                format_bytes(usage.available_bytes as f64),
+                                if usage.unmeasured > 0 { "!" } else { "" }
+                            )
+                        },
+                    )
+            },
         ])
     }));
     let mut state = TableState::default().with_selected(app.picker);
@@ -3490,7 +3741,11 @@ fn draw_devices(frame: &mut Frame<'_>, app: &App, area: Rect) {
             lang.pick("DEVICE", "GERÄT"),
             lang.pick("TYPE / SIZE", "TYP / GRÖSSE"),
             us_label(lang),
-            lang.pick("READ WRITE /s", "LESEN SCHREIB /s"),
+            if app.settings.view == View::Processes {
+                lang.pick("READ WRITE /s", "LESEN SCHREIB /s")
+            } else {
+                lang.pick("FREE", "FREI")
+            },
         ])
         .style(inverse(Color::Green)),
     )
@@ -3514,7 +3769,14 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     fn app() -> App {
-        let mut app = App::new(Some("nvme0n1".into()), Settings::default(), true);
+        let mut app = App::new(
+            Some("nvme0n1".into()),
+            Settings {
+                view: View::Processes,
+                ..Settings::default()
+            },
+            true,
+        );
         for tick in 0..61 {
             let known = app.take_home_request().known_generation;
             app.update(demo::snapshot(tick, tick as f64, "/home", known));
@@ -3530,6 +3792,83 @@ mod tests {
             .chunks(width)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>() + "\n")
             .collect()
+    }
+
+    #[test]
+    fn space_is_default_and_io_is_an_explicit_reversible_view() {
+        for (width, height) in [(36, 16), (40, 24), (80, 24), (120, 36), (200, 60)] {
+            for language in [Language::En, Language::De] {
+                let mut app = App::new(
+                    Some("nvme0n1".into()),
+                    Settings {
+                        language,
+                        ..Settings::default()
+                    },
+                    true,
+                );
+                app.update(demo::snapshot(1, 1.0, "/home", 0));
+                assert_eq!(app.settings.view, View::Filesystems);
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                let text = screen(&terminal);
+                for forbidden in [
+                    "RD[", "WR[", "IO[", "LE[", "SC[", "READ/s", "WRITE/s", "IOPS", "COMMAND",
+                    "BEFEHL",
+                ] {
+                    assert!(
+                        !text.contains(forbidden),
+                        "{forbidden} on default screen {width}x{height}: {text}"
+                    );
+                }
+                assert!(text.contains("/home"), "{text}");
+                assert!(text.contains(app.lang().pick("FREE", "FREI")), "{text}");
+                assert!(text.contains("F4"), "{text}");
+                app.handle_key(KeyCode::F(4).into());
+                assert_eq!(app.overlay, Overlay::Views);
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                assert!(screen(&terminal).contains("3 I/O"));
+                app.handle_key(KeyCode::Down.into());
+                app.handle_key(KeyCode::Down.into());
+                app.handle_key(KeyCode::Enter.into());
+                assert_eq!(app.settings.view, View::Processes);
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                assert!(screen(&terminal).contains(app.lang().pick("READ/s", "LESEN/s")));
+                app.handle_key(KeyCode::Esc.into());
+                assert_eq!(app.settings.view, View::Filesystems);
+                app.handle_key(KeyCode::Char('i').into());
+                assert_eq!(app.settings.view, View::Processes);
+                app.handle_key(KeyCode::Char('1').into());
+                assert_eq!(app.settings.view, View::Filesystems);
+            }
+        }
+    }
+
+    #[test]
+    fn space_capacity_never_substitutes_all_for_an_unavailable_focused_disk() {
+        let mut app = app();
+        app.settings.view = View::Filesystems;
+        app.snapshot
+            .devices
+            .iter_mut()
+            .find(|device| device.name == "nvme0n1")
+            .unwrap()
+            .usage = None;
+        assert!(summary_line(&app, 120).contains("unavailable"));
+        app.device = Some("sdb".into());
+        assert_eq!(summary_line(&app, 120), "not mounted");
+        app.device = Some("nvme1n1".into());
+        app.snapshot
+            .devices
+            .iter_mut()
+            .find(|device| device.name == "nvme1n1")
+            .unwrap()
+            .usage
+            .as_mut()
+            .unwrap()
+            .unmeasured = 1;
+        assert!(summary_line(&app, 120).contains("partial"));
+        app.device = None;
+        assert!(summary_line(&app, 120).contains("partial"));
     }
 
     const SIZES: [(u16, u16); 7] = [
@@ -3628,7 +3967,7 @@ mod tests {
                     );
                     let footer = text.lines().last().unwrap();
                     // Every required function key must be complete on the bottom row.
-                    for key in ["F1", "F2", "F6", quit, "F12"] {
+                    for key in ["F1", "F2", "F4", quit, "F12"] {
                         assert!(footer.contains(key), "{key} missing {at}: {footer:?}");
                     }
                     assert!(footer.contains(save), "save label cut {at}: {footer:?}");
@@ -3686,12 +4025,21 @@ mod tests {
                         } else {
                             assert_eq!(shown, count, "disk missing {at}\n{text}");
                         }
-                        // RD, WR, IO and US are visible for every shown disk.
-                        for label in [rd_label(app.lang()), wr_label(app.lang()), "IO"] {
-                            let short = &label[..1];
-                            let meters = text.matches(&format!("{label}[")).count()
-                                + text.matches(&format!("{short}[")).count();
-                            assert!(meters >= shown, "{label} meters {at}\n{text}");
+                        // I/O meters belong only to the dedicated I/O view.
+                        if view == View::Processes {
+                            for label in [rd_label(app.lang()), wr_label(app.lang()), "IO"] {
+                                let short = &label[..1];
+                                let meters = text.matches(&format!("{label}[")).count()
+                                    + text.matches(&format!("{short}[")).count();
+                                assert!(meters >= shown, "{label} meters {at}\n{text}");
+                            }
+                        } else {
+                            assert!(
+                                !text.contains("RD[")
+                                    && !text.contains("WR[")
+                                    && !text.contains("IO["),
+                                "{text}"
+                            );
                         }
                         if view == View::Processes {
                             assert!(text.contains(read), "process strip {at}\n{text}");
@@ -3769,7 +4117,14 @@ mod tests {
 
     #[test]
     fn hidepid_warning_does_not_require_a_hidden_process_count() {
-        let mut app = App::new(None, Settings::default(), false);
+        let mut app = App::new(
+            None,
+            Settings {
+                view: View::Processes,
+                ..Settings::default()
+            },
+            false,
+        );
         for privileged in [false, true] {
             app.snapshot.process_access.privileged = privileged;
             app.snapshot.process_access.unreadable = 0;
@@ -3863,7 +4218,14 @@ mod tests {
     #[test]
     fn read_and_write_meters_share_one_scale_across_disks() {
         const MIB: f64 = 1024.0 * 1024.0;
-        let mut app = App::new(None, Settings::default(), true);
+        let mut app = App::new(
+            None,
+            Settings {
+                view: View::Processes,
+                ..Settings::default()
+            },
+            true,
+        );
         let mut snapshot = demo::snapshot(0, 0.0, "/home", 0);
         snapshot
             .devices
@@ -4107,7 +4469,7 @@ mod tests {
             "Hilfe",
             "Speichern",
             "gesamt",
-            "Prozesse",
+            "I/O",
         ] {
             assert!(text.contains(expected), "{expected} missing: {text}");
         }
@@ -4224,7 +4586,7 @@ mod tests {
     fn home_view_drills_down_and_back_and_shows_summaries() {
         let mut app = app();
         assert_eq!(
-            app.handle_key(KeyCode::Char('3').into()),
+            app.handle_key(KeyCode::Char('2').into()),
             Action::HomeChanged
         );
         assert!(app.home_active && app.take_home_request().scan);
@@ -4376,7 +4738,7 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let summary = (0..10).map(|x| &buffer[(x, 1)]).collect::<Vec<_>>();
-        assert_eq!(summary[0].symbol(), "[");
+        assert_eq!(summary[0].symbol(), "U");
         assert!(summary.iter().all(|cell| cell.fg == Color::Reset));
     }
 
@@ -4404,7 +4766,7 @@ mod tests {
         assert_eq!(app.settings.sort, Sort::Read);
         assert_eq!(app.overlay, Overlay::None);
         // Views are saved preferences, too.
-        app.handle_key(KeyCode::Char('2').into());
+        app.handle_key(KeyCode::Char('1').into());
         assert_eq!(app.settings_to_save().view, View::Filesystems);
         assert_eq!(app.handle_key(KeyCode::F(10).into()), Action::Quit);
     }

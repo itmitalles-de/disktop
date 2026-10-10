@@ -1,12 +1,14 @@
-# disktop
+# spctop
 
 Follow `/home/tim/AGENTS.md` when working on the owner's machine.
 
-This is a Linux terminal monitor in Rust, the disk counterpart of nettop and
-visually based on htop/nvtop: an overview of every disk (RD/WR/IO/US meters and
-a per-disk utilization/fill-level graph), a compact process strip or a
-filesystem or home-size table, and function-key help. Keep the layout usable at
-36x16, 40x24, 80x24, 120x36 and 200x60 with 1 to 16 disks, in English and German.
+This is a Linux terminal space monitor in Rust, the storage counterpart of nwtop,
+visually based on htop/nvtop. Used/free space, fill history and filesystem
+capacity are the main view; directory sizes/growth remain easy to reach.
+Disk throughput, utilization and process I/O belong in the separate I/O view
+selected through the view menu. Preserve the compact styling and function-key
+help. Keep the layout usable at 36x16, 40x24, 80x24, 120x36 and 200x60 with
+1 to 16 disks, in English and German.
 
 Device rates come from /proc/diskstats deltas (512-byte sectors); process rates
 from /proc/PID/io and are not attributable to devices. Unavailable data,

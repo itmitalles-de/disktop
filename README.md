@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://disktop.wutz.io">
-    <img src="site/assets/readme-banner.svg" alt="disktop — your disks, in view" width="100%">
+    <img src="site/assets/readme-banner.svg" alt="spctop — your disks, in view" width="100%">
   </a>
 </p>
 
@@ -8,7 +8,7 @@
   <strong>Linux disk activity and storage use. Right in your terminal.</strong><br>
   All disks at once, per-process I/O, filesystems, <code>/home</code> sizes and F2 Setup —
   inspired by htop and nvtop, the disk counterpart of
-  <a href="https://github.com/itmitalles-de/nettop">nettop</a>.
+  <a href="https://github.com/itmitalles-de/nwtop">nwtop</a>.
 </p>
 
 <p align="center">
@@ -21,36 +21,37 @@
   <a href="https://disktop.wutz.io">Website</a> ·
   <a href="#install">Install</a> ·
   <a href="#keyboard">Keyboard</a> ·
-  <a href="https://github.com/itmitalles-de/disktop">Source</a>
+  <a href="https://github.com/itmitalles-de/spctop">Source</a>
 </p>
 
-**disktop** shows **all your disks at once**, like htop shows every CPU core:
-each disk gets its own block with read, write, utilization and fill-level
-meters and a history graph. Below them, a compact strip lists the processes
-causing storage I/O; every mounted filesystem and where the space in `/home`
-goes are one key away. Green for read, yellow for write, cyan for utilization,
-magenta for fill level, stepped history graphs, and your terminal's own ANSI
-palette. The layout works in a split terminal, including 36 × 16.
+**spctop** (formerly disktop) watches **used space across all your disks**.
+The main view combines used/free capacity, fill-level history and a filesystem
+table. Open Home to find large directories and watch growth between scans.
+Disk throughput, utilization and process I/O live in a separate **I/O** view,
+accessible from the F4 view menu.
 
-**Start without sudo.** The interface runs as your regular user and shows your
-own processes and the directories you can read. An optional one-time helper
-setup adds all users' processes and the directory sizes below administrator-
-approved roots (default `/home`); the interface itself never gains privileges.
+The compact htop/nvtop-style layout keeps your terminal's ANSI palette and
+works in a split terminal, including 36 × 16.
+
+**Start without sudo.** The interface runs as your regular user and shows
+disk and filesystem capacity, plus directory sizes you may read. An optional
+one-time helper setup adds directory sizes below administrator-approved roots
+(default `/home`) and other users' process I/O in the secondary view; the
+interface itself never gains privileges.
 
 <p align="center">
-  <img src="site/assets/disktop-demo.png" alt="disktop terminal showing four disks side by side, each with read, write, utilization and fill-level meters and a utilization and fill-level graph, above a process I/O table, with F2 Setup and F12 Save in the function-key bar" width="100%">
+  <img src="site/assets/disktop-demo.png" alt="spctop terminal showing used space and fill-level history for every disk above the filesystem table" width="100%">
   <br>
   <sub>Actual terminal output in explicit DEMO mode. Disks, rates and processes are synthetic.</sub>
 </p>
 
 | At a glance | Under your control |
 | --- | --- |
-| **All disks** | RD, WR, IO and fill-level (US) meters plus a graph per disk |
-| **I/O over time** | Utilization and fill level per disk; IOPS, await, queue depth |
-| **Processes** | READ/s, WRITE/s, cancelled writes and totals per PID; sort and search |
-| **Filesystems** | Use, free space, inodes and backing-device rates; `*` marks home |
+| **All disks** | Used/free space, fill percentage and history per disk |
+| **Filesystems** | Capacity, used/free space and inodes; `*` marks home |
 | **Home sizes** | Background scan, drill-down, share of parent, growth between scans |
-| **F2 Setup** | Focus, refresh rate, graph series, colors, view, process rows, home path; save with F12 |
+| **I/O submenu** | Disk RD/WR/IO, IOPS, await and process I/O, when needed |
+| **F2 Setup** | Focus, refresh rate, colors, view, home path; save with F12 |
 
 ## Install
 
@@ -58,15 +59,15 @@ You need **Linux** and **Rust 1.88+**. The source is licensed under the
 [GNU GPL v3 or later](LICENSE).
 
 ```bash
-git clone https://github.com/itmitalles-de/disktop.git
-cd disktop
+git clone https://github.com/itmitalles-de/spctop.git
+cd spctop
 ./scripts/install.sh
 ./scripts/setup-helper.sh   # Optional, one-time administrator authentication.
-~/.local/bin/disktop
+~/.local/bin/spctop
 ```
 
 The installer builds from source and installs the UI into `~/.local/bin` as your
-regular user. Add that directory to your `PATH`, then start with `disktop`.
+regular user. Add that directory to your `PATH`, then start with `spctop`.
 
 <details>
 <summary><strong>Installation, updates, and permissions</strong></summary>
@@ -76,12 +77,12 @@ unchanged executable previously installed by that script; unrelated files,
 symlinks and modified executables are preserved.
 
 Without the helper, Linux only lets you read `/proc/PID/io` of your own
-processes and only scan directories you may read. disktop shows exactly that and
+processes and only scan directories you may read. spctop shows exactly that and
 says how many processes are hidden; it never fills the gap with estimates.
 
 `scripts/setup-helper.sh [--allow-shared-group] [--allow-owner-change]` builds
 as your regular user and requests administrator authentication through `pkexec`
-(or `sudo`) only to install `/usr/local/libexec/disktop-collector`, owned by
+(or `sudo`) only to install `/usr/local/libexec/spctop-collector`, owned by
 root, mode `0750`, executable by root and your primary group. **Members of that
 group can see all processes' storage I/O and the names and sizes of the
 directories below the allowed scan roots** (never file names or contents). Its
@@ -100,14 +101,15 @@ file capabilities are only `CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`.
   another user ran setup), setup refuses to move access unless
   `--allow-owner-change` is given.
 - **Scan roots:** the helper scans only directories at or below the absolute
-  paths listed one per line in `/etc/disktop/scan-roots` (`#` comments allowed);
-  without the file only `/home` is allowed. The file and its directories must be
+  paths listed one per line in `/etc/spctop/scan-roots` (`#` comments allowed);
+  when absent, the legacy `/etc/disktop/scan-roots` is used if present.
+  Only when both files are absent is `/home` the default. The file and its directories must be
   root-owned and not writable by group or others, otherwise nothing is scanned
   with privileges. Below an allowed root the path is opened component by
   component without following symlinks, so a link such as `/home/alice/x ->
   /root` is refused. For any other path the interface scans without the helper,
   as if it were not installed, and says so. An administrator adds roots with,
-  for example, `echo /srv/home | sudo tee -a /etc/disktop/scan-roots` (create
+  for example, `echo /srv/home | sudo tee -a /etc/spctop/scan-roots` (create
   the file with `/home` first to keep the default).
 - **hidepid:** if `/proc` is mounted with `hidepid`, the helper keeps that policy
   for other users' processes although `CAP_SYS_PTRACE` bypasses it:
@@ -127,31 +129,34 @@ versioned protocol: no service, port, or arbitrary file/command API. Replies hav
 a deadline; a stalled, crashed, outdated or revoked helper is replaced by direct,
 unprivileged collection at startup or at runtime, with a visible notice.
 
-Repeat the helper setup after updating disktop. A helper from an older release
+Repeat the helper setup after updating spctop. A helper from an older release
 keeps working: the interface adds what it does not send (fill levels and the
 disks below dm/md devices, which need no privilege) and suggests rerunning the
 setup once. `--no-helper` bypasses an
 installed helper. An administrator revokes access by removing
-`/usr/local/libexec/disktop-collector` and its receipt
-`/usr/local/libexec/.disktop-collector.sha256`.
+`/usr/local/libexec/spctop-collector` and its receipt
+`/usr/local/libexec/.spctop-collector.sha256`. For an upgraded installation,
+also retire the legacy helper as described below.
 
 </details>
 
 ## Use
 
 ```bash
-disktop                          # All disks; focus on the disk of /home.
-disktop --device sda             # Focus a block device (also /dev/sda).
-disktop --device all             # No focus: summary of physical whole disks.
-disktop --view filesystems       # Or processes, home.
-disktop --home-path /srv/homes   # Tree for the home view (default /home).
-disktop --interval 0.5 --history 120 --sort write
-disktop --all-devices            # Also show loop, ram and zram devices.
-disktop --no-color               # Start in monochrome (also NO_COLOR=1).
-disktop --once                   # Print one measured snapshot (all disks) and exit.
-disktop --json                   # Machine-readable snapshot (stable, English).
-disktop --json --scan-home       # Include a complete home scan.
-disktop --demo                   # Clearly labeled synthetic UI preview.
+spctop                          # All disks; focus on the disk of /home.
+spctop --device sda             # Focus a block device (also /dev/sda).
+spctop --device all             # No focus: summary of physical whole disks.
+spctop --view filesystems       # Default space overview; also home or io.
+spctop --view io                # Disk throughput and process I/O.
+spctop --home-path /srv/homes   # Tree for the home view (default /home).
+spctop --interval 0.5 --history 120
+spctop --view io --sort write    # Sort the secondary process I/O table.
+spctop --all-devices            # Also show loop, ram and zram devices.
+spctop --no-color               # Start in monochrome (also NO_COLOR=1).
+spctop --once                   # Print one measured snapshot (all disks) and exit.
+spctop --json                   # Machine-readable snapshot (stable, English).
+spctop --json --scan-home       # Include a complete home scan.
+spctop --demo                   # Clearly labeled synthetic UI preview.
 ```
 
 The default refresh interval is **1 second** (`-d`, 0.1–60 s); history defaults
@@ -165,9 +170,10 @@ to **60 seconds** (`--history`, 10–600). `-s` sorts processes by `io`, `read`,
 | <kbd>F1</kbd> / `?` | Help |
 | <kbd>F2</kbd> | Open Setup |
 | <kbd>F3</kbd> / `/` | Search the current table |
-| <kbd>F4</kbd> / `v`, `1` `2` `3` | Processes / Filesystems / Home below the disks |
+| <kbd>F4</kbd> / `v` | Open the view menu: Space / Home / I/O |
+| `1`, `2`, `3` / `i` | Space, Home, I/O; Esc returns from I/O to Space |
 | <kbd>F5</kbd> / `d` | Focus a device; Tab / Shift+Tab cycle the disks |
-| <kbd>F6</kbd> | Choose the process sort column; `s` cycles it |
+| <kbd>F6</kbd> | I/O view: choose the process sort column; `s` cycles it |
 | <kbd>F9</kbd> / Space | Pause or resume the display |
 | <kbd>F12</kbd> | Save current settings |
 | Enter / → , Backspace / ← | Home view: open a directory / go up |
@@ -177,42 +183,28 @@ to **60 seconds** (`--history`, 10–600). `-s` sorts processes by `io`, `read`,
 
 ### All disks at once
 
-Every whole disk has its own block: a label row (name, type, size, mounts and
-model) and four htop-style meters with their current values,
-`RD[|||||   12.3 MiB/s]`:
+The default **Space** view gives every whole disk its own block with used and
+free space, a fill-level meter and fill history on a 0–100% scale. Filesystems
+below the disks show capacity, used/free space and inodes. **Home** provides
+sizes and growth for directories below the configured scan root.
 
-- **RD** read and **WR** write (green / yellow; German LE / SC). All disks share
-  one scale, the highest read or write rate of any shown disk in the visible
-  history, so equal bar lengths mean equal rates on every disk.
-- **IO** utilization (cyan).
-- **US** fill level (magenta, red from 90 %; German BL): used and total space of
-  the filesystems mounted from the disk, its partitions and stacked devices
-  such as LUKS, LVM or MD, each block device counted once. `not mounted` means
-  nothing is mounted; `swap only` marks disks used only for swap; `-` means not
-  measured.
+**F4** opens the view menu. Choose **I/O** for read/write meters, utilization
+history, IOPS, await, queue depth and the process table. All disks share one
+RD/WR scale: the highest read or write rate in visible history, so equal bar
+lengths mean equal rates across disks. I/O remains available without crowding
+the space views.
 
-The **graph** of each disk shows utilization and fill level over the visible
-history on one 0–100 % scale, so a disk filling up and its I/O load can be read
-side by side. F2 Chart hides either series or all graphs. Partitions, loop, ram
-and zram devices are hidden (F2 Device shows loop/ram/zram). Device-mapper and
-MD devices that sit on a single shown disk, such as LUKS or LVM volumes on one
-disk, are part of that disk's block: its mounts and fill level include them and
-its rates already contain their I/O. F2 Device › Show stacked devices shows
-them as their own blocks. MD RAID or LVM spanning several disks always gets its
-own block.
+Fill level uses the filesystems mounted from a disk, its partitions and
+stacked devices such as LUKS, LVM or MD, counted once. `not mounted`,
+`swap only` and `-` distinguish disks with no filesystem, swap and unavailable
+measurements. Partitions, loop, ram and zram are hidden by default; F2 Device
+controls visibility. Stacked devices backed by one shown disk are folded into
+it unless explicitly enabled; multi-disk stacked devices retain their blocks.
 
-The overview adapts to the terminal: wide terminals arrange the blocks in two to
-four columns with the graph beside the meters; narrow ones put it below. When
-space runs short, graphs get shorter, then blocks show meters only, then each
-disk takes a single row. If even that does not fit, a `+N more` row says how many
-disks are hidden and Tab scrolls the focus to them; no disk is hidden silently.
-
-The **focused** disk (F5, Tab, `--device`, Auto = the disk of the home path) is
-shown in reverse video; the row below the title lists its IOPS, await, queue
-depth and totals. Without focus, that row summarizes all physical disks. The
-process strip below the disks shows 5 rows by default (F2 Table, 0–20; 0 hides
-it) and takes any rows the disks leave free. Filesystems and Home use the lower
-half of the screen when selected.
+Wide terminals arrange disk blocks in columns. Small terminals reduce graph
+height and then collapse blocks; `+N more` marks hidden disks and Tab scrolls
+the focus. F5/Tab/`--device` select the focused disk; automatic focus follows
+the configured home path.
 
 ### Make it yours with F2
 
@@ -232,13 +224,13 @@ help, errors, `--once` and `--json` stay English.
 <summary><strong>Settings file and command-line overrides</strong></summary>
 
 Settings are saved atomically with private permissions to
-`$XDG_CONFIG_HOME/disktop/config.json` or `~/.config/disktop/config.json`.
+`$XDG_CONFIG_HOME/spctop/config.json` or `~/.config/spctop/config.json`.
 Command-line options and `NO_COLOR` apply to that run only; F12 keeps the saved
 values and adds only what you changed in Setup or with keys. Malformed settings
 produce a warning, defaults are used and the file is preserved; unknown keys are
 kept; settings files from older versions get defaults for newer options. A
 saved device that no longer exists falls back to automatic selection for that
-run. As root, disktop refuses to save into another user's settings
+run. As root, spctop refuses to save into another user's settings
 directory.
 
 </details>
@@ -281,7 +273,8 @@ ZFS rows also carry a `zfs` object with pool `name`, `total_bytes`, `used_bytes`
 `available_bytes` and an optional `error`, separate from dataset values. A snapshot
 lists kernel files that exceeded the 16 MiB read limit in `truncated`. The document version
 stays 1 because fields are only added. `--once` lists every disk of the
-overview with rates, utilization, await and fill level.
+overview with used/free space and fill level; `--view io --once` adds the
+I/O-focused report.
 `block_devices` remains a list of real block-device names; `accounting_keys`
 deduplicates ordinary filesystems by device and ZFS pools by `zfs:<pool>`.
 Update UI and helper together to get the new ZFS accounting; older clients
@@ -343,8 +336,8 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --release --locked
 shellcheck scripts/*.sh
-python3 tests/terminal.py target/release/disktop
-python3 tests/setup.py target/release/disktop
+python3 tests/terminal.py target/release/spctop
+python3 tests/setup.py target/release/spctop
 ```
 
 <details>
@@ -354,17 +347,17 @@ These run as root inside a disposable container with a read-only repository
 mount and no network:
 
 ```bash
-docker build -t disktop-test tests
-docker run --rm --network none -v "$PWD:/work:ro" disktop-test \
-  python3 tests/live_io.py --isolated target/release/disktop
+docker build -t spctop-test tests
+docker run --rm --network none -v "$PWD:/work:ro" spctop-test \
+  python3 tests/live_io.py --isolated target/release/spctop
 docker run --rm --network none --cap-add DAC_READ_SEARCH --cap-add SYS_PTRACE \
-  -v "$PWD:/work:ro" disktop-test python3 tests/helper.py --isolated \
-  target/release/disktop target/release/disktop-collector
+  -v "$PWD:/work:ro" spctop-test python3 tests/helper.py --isolated \
+  target/release/spctop target/release/spctop-collector
 ```
 
 `tests/live_io.py` has separate unprivileged writer and reader processes write
 and fsync a file on the container's disk-backed layer and read it back after
-dropping its cached pages; disktop must attribute the bytes to the right PIDs
+dropping its cached pages; spctop must attribute the bytes to the right PIDs
 and the physical disks must show the writes. `tests/helper.py` checks the
 installer, per-thread capabilities, the cleared helper environment, root
 processes visible only through the helper, a private home directory scanned
@@ -392,10 +385,10 @@ Its terminal images and recording use explicit DEMO mode with synthetic data.
 
 Copyright (C) 2026 itmitalles
 
-disktop is free software: you can redistribute it and/or modify it under the
+spctop is free software: you can redistribute it and/or modify it under the
 terms of the GNU General Public License as published by the Free Software
 Foundation, either version 3 of the License, or (at your option) any later
-version (SPDX: `GPL-3.0-or-later`). disktop is distributed in the hope that it
+version (SPDX: `GPL-3.0-or-later`). spctop is distributed in the hope that it
 will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE) for
 the full license text.
@@ -406,3 +399,21 @@ License; see [`site/assets/fonts/`](site/assets/fonts/).
 ---
 
 [GPL-3.0-or-later](LICENSE) · Inspired by htop, nvtop and iotop.
+
+### Upgrading from disktop
+
+Run both installation scripts to install `spctop` and `spctop-collector`.
+Legacy `disktop/config.json` preferences are read when no spctop configuration
+exists; saving writes to `spctop/config.json` and preserves the old file.
+The old process-first view migrates to the Space overview.
+
+The privileged scanner uses `/etc/spctop/scan-roots`; when absent, an existing
+`/etc/disktop/scan-roots` remains authoritative. Only when both are absent does
+the `/home` default apply. An invalid policy fails closed.
+
+The installers leave any legacy executable untouched. After validating spctop,
+remove `~/.local/bin/disktop` and `~/.local/bin/.disktop-install.sha256`.
+An administrator can retire `/usr/local/libexec/disktop-collector` and
+`/usr/local/libexec/.disktop-collector.sha256`; removing only the new helper
+does not revoke the old helper's access. Keep old settings until migration
+is verified. The website remains at https://disktop.wutz.io.

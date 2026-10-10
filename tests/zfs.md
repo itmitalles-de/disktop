@@ -13,16 +13,16 @@ provisioning commands on the host or substitute an existing data disk**. The
 separate 2 GiB qcow2 data disks exposed as `/dev/vdb` and `/dev/vdc`:
 
 ```sh
-sudo zpool create -m /home/tester/zfs-work/pool disktoptest mirror /dev/vdb /dev/vdc
-sudo zfs create disktoptest/child
+sudo zpool create -m /home/tester/zfs-work/pool spctoptest mirror /dev/vdb /dev/vdc
+sudo zfs create spctoptest/child
 sudo dd if=/dev/urandom of=/home/tester/zfs-work/pool/child/data bs=1M count=8 status=none
-sudo zfs set quota=32M disktoptest/child
-sudo zpool sync disktoptest
-python3 tests/zfs.py --binary ./target/release/disktop --pool disktoptest --members vdb1 vdc1
-sudo python3 tests/zfs.py --binary ./target/release/disktop --pool disktoptest --members vdb1 vdc1
+sudo zfs set quota=32M spctoptest/child
+sudo zpool sync spctoptest
+python3 tests/zfs.py --binary ./target/release/spctop --pool spctoptest --members vdb1 vdc1
+sudo python3 tests/zfs.py --binary ./target/release/spctop --pool spctoptest --members vdb1 vdc1
 ```
 
-Both ordinary `disktoptest` and `disktoptest/child` mount sources must name
+Both ordinary `spctoptest` and `spctoptest/child` mount sources must name
 `vdb1,vdc1` as members. Both whole disks must list the mount points and account
 for **one** pool, with identical physical pool size/allocated/free. Dataset
 statvfs numbers remain separate (the quota makes their capacities different).
@@ -38,7 +38,7 @@ namespace in that disposable VM:
 
 ```sh
 sudo unshare --mount --propagation private sh -c \
-  'mount --bind /bin/false /usr/sbin/zpool && ./target/release/disktop --json --no-helper'
+  'mount --bind /bin/false /usr/sbin/zpool && ./target/release/spctop --json --no-helper'
 ```
 
 The ZFS rows must retain dataset statvfs values, have `zfs.error`, and leave pool
@@ -51,7 +51,7 @@ timeout, bounded output, cleared environment, empty child capability sets and
 Cleanup only the fixture created in the disposable VM:
 
 ```sh
-sudo zpool destroy disktoptest
+sudo zpool destroy spctoptest
 ```
 
 ## Sources and interpretation

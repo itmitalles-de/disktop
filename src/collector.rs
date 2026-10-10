@@ -100,7 +100,10 @@ impl Collector {
         let privileged = helper || unsafe { libc::geteuid() } == 0;
         // Only the helper is restricted: root can read everything anyway.
         let (policy, problem) = if helper {
-            scanner::load_scan_roots(Path::new(scanner::SCAN_ROOTS_PATH))
+            scanner::load_scan_roots_with_legacy(
+                Path::new(scanner::SCAN_ROOTS_PATH),
+                Path::new(scanner::LEGACY_SCAN_ROOTS_PATH),
+            )
         } else {
             (RootPolicy::Follow, None)
         };
@@ -947,7 +950,7 @@ mod tests {
 
     #[test]
     fn long_pseudo_files_are_cut_at_a_complete_line() {
-        let path = std::env::temp_dir().join(format!("disktop-pseudo-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("spctop-pseudo-{}", std::process::id()));
         let line = "8 0 sda 1 2 3 4 5 6 7 8 9 10 11\n";
         let count = MAX_PSEUDO_FILE / line.len() + 10;
         fs::write(&path, line.repeat(count)).unwrap();
@@ -995,7 +998,7 @@ mod tests {
 
     #[test]
     fn requested_scan_delivers_a_tree_once_per_generation() {
-        let root = std::env::temp_dir().join(format!("disktop-collector-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("spctop-collector-{}", std::process::id()));
         fs::create_dir_all(root.join("a")).unwrap();
         fs::write(root.join("a/file"), vec![1u8; 8192]).unwrap();
         let mut collector = Collector::new(false).unwrap();

@@ -3,10 +3,10 @@
 
 Run only in an isolated container as root, for example:
 
-  docker run --rm --network none -v "$PWD:/work:ro" disktop-test \
-      python3 tests/live_io.py --isolated target/release/disktop
+  docker run --rm --network none -v "$PWD:/work:ro" spctop-test \
+      python3 tests/live_io.py --isolated target/release/spctop
 
-Timing is not part of the assertions: disktop is run once before any I/O
+Timing is not part of the assertions: spctop is run once before any I/O
 starts and once after the writer and reader have finished (while both are still
 alive, so their rows exist), and the cumulative kernel counters are compared.
 A rate over one fixed interval would depend on how slow the CI disk is.
@@ -14,7 +14,7 @@ A rate over one fixed interval would depend on how slow the CI disk is.
 A writer process (unprivileged, separate PID) writes a file on the
 container's disk-backed overlay filesystem and fsyncs it; a reader process
 drops the file's clean pages with posix_fadvise and reads it back from
-storage. disktop runs as the same unprivileged user without the helper and
+storage. spctop runs as the same unprivileged user without the helper and
 must attribute both to the right PIDs, and the physical disks must show at
 least the written bytes. tmpfs is never used: it is memory, not disk.
 """
@@ -56,7 +56,7 @@ def writer(account, path, ready, go, done, finish):
         stream.flush()
         os.fsync(stream.fileno())
     done.set()
-    # Stay alive so disktop can read this process's counters at its sample.
+    # Stay alive so spctop can read this process's counters at its sample.
     finish.wait(120)
 
 
@@ -91,7 +91,7 @@ def main():
     binary = args.binary.resolve(strict=True)
     account = pwd.getpwnam("nobody")
     # /var/tmp lives on the container's writable layer, which is disk-backed.
-    work = Path(tempfile.mkdtemp(prefix="disktop-live-", dir="/var/tmp"))
+    work = Path(tempfile.mkdtemp(prefix="spctop-live-", dir="/var/tmp"))
     try:
         os.chown(work, account.pw_uid, account.pw_gid)
         path = work / "payload.bin"
@@ -118,7 +118,7 @@ def main():
                 group=account.pw_gid,
                 extra_groups=[],
             )
-            assert result.returncode == 0, f"disktop failed: {result.stderr}"
+            assert result.returncode == 0, f"spctop failed: {result.stderr}"
             return json.loads(result.stdout)
 
         # Both processes must have dropped privileges (and be dumpable) so
