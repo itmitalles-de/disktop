@@ -1,98 +1,67 @@
 # Verified state
 
-- Repository `itmitalles-de/disktop` (GitHub, `main` @ 3d72ddf). Rust 1.88+,
-  Linux only. License GPL-3.0-or-later: the owner relicensed from MIT on
-  2026-10-10; the change is part of `feat/site` until it is merged. Built on the nettop codebase (config, i18n, shutdown,
-  helper protocol, privilege, installer and PTY test patterns).
-- Branch `feat/all-disks-overview` (worktree `../disktop-worktrees/all-disks`,
-  uncommitted at hand-off): the main screen shows every disk at once, htop
-  style. Per disk a block with RD/WR/IO/US (fill level) meters and a graph of
-  IO utilization and fill level on one 0-100% scale; layout from `disk_layout()`
-  degrades graphs -> meters -> one row per disk -> "+N more" with focus
-  scrolling; compact process strip (Setup Table: 0-20 rows, default 5). New
-  settings `process_rows`, `show_io_series`, `show_usage_series`,
-  `usage_color` (older files get defaults). `Device.usage` added to JSON and
-  the helper reply (additive, versions unchanged); `--once` lists all disks.
-  F5/Tab/`--device` now set the focus. dm/md devices on a single shown disk
-  (LUKS, single-disk LVM) are folded into that disk (`Device.backing_disks`;
-  Setup Device › Show stacked devices, `show_stacked`, default off). A closed
-  terminal (PTY hangup without or with SIGHUP, or as controlling terminal) now
-  exits cleanly with code 0 instead of spinning in crossterm's read loop.
-  An older installed helper (rig has the 3d72ddf helper installed) keeps
-  working: the UI fills fill levels and backing disks itself and shows a
-  one-time notice to rerun scripts/setup-helper.sh (verified on rig).
-  Review: `../disktop-review/all-disks/`.
-- Views: processes (default), filesystems, home sizes below the disk overview.
-  F1 Help, F2 Setup (General, Device, Chart, Table, Home incl. editable home
-  path), F3 search, F4/1/2/3 views, F5 focus, F6 sort, F9 pause, F10/q quit,
-  F12 save. English/German with locale default, Setup toggle and persistence.
-- 2026-10-10 checks, all passing: `cargo fmt --check`, Clippy `-D warnings`,
-  51 Rust tests on stable and on Rust 1.88.0, release build, ShellCheck,
-  `cargo audit` (108 crates, no advisories), `tests/terminal.py`,
-  `tests/setup.py`, and in the pinned Ubuntu 24.04 container `tests/live_io.py`
-  (separate writer/reader PIDs measured at exactly 48.0 MiB each) and
-  `tests/helper.py` (installer, per-thread caps 0x80004 / scanner 0x4,
-  NO_NEW_PRIVS, environment LANG=C only, root processes and private home
-  directories visible only through the helper, protocol bounds, SIGTERM,
-  10-second timeout fallback, EOF exit after UI SIGKILL).
-- Real host runs (`--once`, `--json`, `--scan-home`) work without the helper;
-  a scan of /home/tim/github (2.17 M files, 543 GiB) matched `du` sizes. The
-  helper was not installed system-wide; `scripts/setup-helper.sh` was tested
-  only inside the container.
-- Review captures (PTY + pyte, EN/DE, 36x16 to 120x36, DEMO and live) are kept
-  outside Git in `../disktop-review/` (`index.html`).
+- Public repository `itmitalles-de/disktop`, branch `main`, Linux/Rust 1.88+,
+  GPL-3.0-or-later. Overview and website PRs #1/#2 are merged. Review round 1
+  merged as [PR #3](https://github.com/itmitalles-de/disktop/pull/3) on
+  2026-10-10 (`7a5fc33`, including `cff30b9` and test fix `1f63fe3`). The
+  review worktree and local/remote `fix/review-round-1` branch were removed.
+- The main screen shows every physical disk with RD/WR/IO/US meters and
+  per-disk utilization/fill graphs. RD and WR share the highest rate across
+  all displayed disks within visible history; IO and US share a 0-100% scale.
+  Layout degrades graphs -> meters -> one row per disk -> "+N more" with
+  focus scrolling. F5/Tab/`--device` select focus; `--once` lists all disks.
+  Single-disk dm/md devices are folded into their physical disk unless
+  `show_stacked` is enabled. Multi-device btrfs membership is resolved.
+- Views: processes, filesystems and home sizes. F1 Help, F2 Setup, F3 search,
+  F4/1/2/3 views, F5 focus, F6 sort, F9 pause, F10/q quit, F12 save.
+  English/German with locale default and persisted Setup language. Process
+  rows, chart series, usage color and home path are configurable. Closed PTYs
+  exit cleanly, including without SIGHUP.
+- Review fixes include isolated mount probing with bounded waits, per-thread
+  process I/O deltas, 32-bit tick wraps, refreshed sysfs facts, hidden mounts,
+  bounded pseudo-file reads, width-aware text, translated backend errors,
+  helper hidepid handling and `--once`/`--json` fallback. CI includes weekly
+  dependency auditing and website link checks.
+- The optional root-owned helper uses DAC_READ_SEARCH and SYS_PTRACE; the UI
+  stays unprivileged. Helper scans are limited to root-owned
+  `/etc/disktop/scan-roots` (absent file: `/home` only), opened component by
+  component with O_NOFOLLOW. Refused roots fall back to an unprivileged UI
+  scan. Setup refuses shared primary groups and unapproved group reassignment.
+  Update UI and helper together: the new JSON device kind `stacked` is not
+  decodable by an older UI, which falls back to unprivileged collection.
+- Host installation verified on 2026-10-10 with `scripts/install.sh` and
+  `scripts/setup-helper.sh`: installed UI/helper SHA-256 hashes match builds
+  from `7a5fc33`; helper is root:tim 0750 with the expected capabilities.
+  `/etc/disktop/scan-roots` is absent, so the default applies. Live `--once`
+  and `--json` show both NVMe disks, correctly mark `/home`, report all 1,229
+  sampled processes readable and no nonresponding mounts. Brief live/demo
+  PTY sessions quit cleanly; demo meters show the common RD/WR scale.
+- Validation on 2026-10-10: local fmt, Clippy with warnings denied, all 71
+  Rust tests, release install builds and `tests/terminal.py` passed. The
+  shared-scale regression test passes. PR CI was green before merge; merge
+  CI also passed (stable/MSRV, audit, terminal/setup, isolated live I/O/helper
+  tests and ShellCheck). Hung NFS and real hidepid mounts remain unverified.
+- `site/` is the public dependency-free website with local licensed fonts,
+  explicit DEMO media, EN/DE and persisted system-aware light/dark controls.
+  Pages uses GitHub Actions, `disktop.wutz.io`, and enforced HTTPS; the merge
+  Pages deployment passed. Review evidence stays outside Git in
+  `../disktop-review/`; round-1 before/after terminal text captures are in
+  `../disktop-review/round-1/`.
 
-- 2026-10-10 all-disks checks (branch above), all passing: fmt, Clippy
-  `-D warnings`, 57 Rust tests on stable and Rust 1.88.0 (layout matrix 36x16
-  to 200x60 x 1/2/4/8/16 disks x EN/DE x three views), release build,
-  ShellCheck, `tests/terminal.py`, `tests/setup.py` (new overview case), and in
-  the container `tests/live_io.py` (incl. usage) and `tests/helper.py`. Real
-  `--once`/`--json` on this host: nvme0n1 (LUKS dm-0), nvme1n1 match `df`.
+## Open work and limits
 
-- Branch `feat/site` (worktree `../disktop-worktrees/site`, based on
-  `feat/all-disks-overview` 424dd63, uncommitted at hand-off): branded README
-  (banner, self-hosted badges, explicit DEMO image, website link, license
-  section) and `site/`, the dependency-free project website modeled on
-  nettop's: strict CSP without inline code, local Chivo/IBM Plex Mono with OFL
-  notices, system-aware light/dark theme and EN/DE, both with persisted
-  toggles (`disktop-theme`, `disktop-lang`), accessible tabs, skip link, live
-  region and reduced motion. Assets are actual `--demo` captures at 120x36
-  (PTY + pyte render, see `site/assets/README.md`) and an MP4 recording.
-  `.github/workflows/pages.yml` deploys only `site/` from `main` (same pinned
-  actions as nettop), checks `site/CNAME` = `disktop.wutz.io` and probes the
-  public HTTPS page after deploy. Review: `../disktop-review/site/`.
-
-- Branch `fix/review-round-1` (worktree `../disktop-worktrees/review-round-1`,
-  based on `main` a074399, uncommitted at hand-off): fixes the 23 findings of
-  review round 1 (hung-mount probing, per-thread process rates, 32-bit tick
-  wraps, refreshed sysfs facts, btrfs members, hidden mounts, 16 MiB pseudo
-  reads, one RD/WR scale for all disks, helper scan-root allowlist
-  /etc/disktop/scan-roots with O_NOFOLLOW walk and unprivileged fallback,
-  hidepid in the helper, shared-group/owner-change checks and safer ordering in
-  setup-helper.sh, width-aware truncation, translated backend errors and
-  LANGUAGE, --once/--json helper fallback, weekly audit, site link check).
-  Renders in `../disktop-review/round-1/`. The new JSON enum value `stacked`
-  makes an older UI fail to decode a newer helper's reply (it then falls back
-  to unprivileged collection); update both. Site screenshots still show the old
-  per-disk RD/WR scaling.
-
-## Open / not yet done
-
-- Commit/PR for `feat/all-disks-overview` after owner review; then CI run.
-  Track further work as GitHub issues in `itmitalles-de/disktop`.
-- Website: GitHub Pages is planned with custom domain `disktop.wutz.io`, not
-  configured yet; DNS is still to be set up. After merge: enable Pages (source
-  GitHub Actions) with that domain, add a DNS-only Cloudflare CNAME `disktop` ->
-  `itmitalles-de.github.io` (like nettop) and enforce HTTPS once the certificate
-  is issued. The repository is private (2026-10-10); nettop's Pages site is
-  served from a public repository, so visibility or the org plan must allow it.
-  The first deploy's HTTPS probe fails until DNS and the certificate work.
-- Overview: multi-device ZFS fill level counts only on the disk named by the
-  mount source (btrfs members fixed on `fix/review-round-1`); swap detection only tested via unit data, not a real swap
-  partition. nettop has the same terminal-hangup spin (fixed separately there).
-- Not verified on real hardware: md RAID, zram, removable hot-plug during a
-  session, HDDs; a desktop install via `scripts/setup-helper.sh`.
-- Known limits: network/FUSE filesystems are not listed (statvfs can hang);
-  bind mounts of the same filesystem inside the home tree are scanned twice
-  (like `du -x`); processes exiting between refreshes are not listed; growth is
-  per session and only for retained directories; 64-bit Linux targets only.
+- [#4](https://github.com/itmitalles-de/disktop/issues/4): refresh website,
+  README and social/demo media for the shared RD/WR scale.
+- [#5](https://github.com/itmitalles-de/disktop/issues/5): ZFS pool membership
+  and usage attribution across disks; pool/dataset sources may currently
+  have no disk attribution.
+- [#6](https://github.com/itmitalles-de/disktop/issues/6): fairness between
+  home subtrees under global scanner eviction; aggregate totals are retained.
+- [#7](https://github.com/itmitalles-de/disktop/issues/7): real isolated NFS
+  outage and /proc hidepid validation (currently unit coverage only).
+- Hardware coverage still excludes real md RAID, zram, hot-plug, HDDs and a
+  real swap partition. Network/generic FUSE mounts are filtered; fuseblk is
+  eligible and protected by bounded probing. Same-filesystem bind mounts in
+  a home tree can be scanned twice (like `du -x`); processes exiting between
+  samples are absent. Growth is per session and retained directory, with
+  incomplete scans excluded as baselines. Only 64-bit Linux is supported.
