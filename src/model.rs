@@ -378,6 +378,11 @@ pub struct Folded {
 pub struct DirNode {
     /// Sanitized display name; the root node has the sanitized root path.
     pub name: String,
+    /// Stable identity of this component, independent of display truncation.
+    /// New scans use the raw filename bytes as lowercase hex (at most 510
+    /// ASCII characters on Linux). Missing in reports from older helpers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     pub children: Vec<u32>,
     /// Allocated bytes (st_blocks * 512) of the whole subtree.
     pub allocated: u64,
@@ -400,6 +405,10 @@ pub struct DirNode {
 }
 
 impl DirNode {
+    pub fn identity(&self) -> &str {
+        self.key.as_deref().unwrap_or(&self.name)
+    }
+
     pub fn partial(&self) -> bool {
         self.unreadable > 0 || self.truncated
     }
@@ -432,19 +441,18 @@ impl HomeReport {
         self.nodes.get(index as usize)
     }
 
-    /// Follow sanitized names from the root; stops at the deepest existing node.
+    /// Follow component identities from the root; stops at the deepest existing
+    /// node. Reports from older helpers use their sanitized names as identities.
     pub fn resolve(&self, path: &[String]) -> (u32, usize) {
         let mut current = 0u32;
         for (depth, name) in path.iter().enumerate() {
             let Some(node) = self.node(current) else {
                 return (0, 0);
             };
-            match node
-                .children
-                .iter()
-                .copied()
-                .find(|child| self.node(*child).is_some_and(|child| &child.name == name))
-            {
+            match node.children.iter().copied().find(|child| {
+                self.node(*child)
+                    .is_some_and(|child| child.identity() == name)
+            }) {
                 Some(child) => current = child,
                 None => return (current, depth),
             }
@@ -502,6 +510,41 @@ mod tests {
             available_bytes: total.map(|total| total - used),
             ..Filesystem::default()
         }
+    }
+
+    #[test]
+    fn home_identities_survive_json_and_legacy_reports_use_names() {
+        let report = HomeReport {
+            nodes: vec![
+                DirNode {
+                    name: "/home".into(),
+                    children: vec![1, 2, 3],
+                    ..DirNode::default()
+                },
+                DirNode {
+                    name: "same~".into(),
+                    key: Some("61".into()),
+                    ..DirNode::default()
+                },
+                DirNode {
+                    name: "same~".into(),
+                    key: Some("62".into()),
+                    ..DirNode::default()
+                },
+                DirNode {
+                    name: "legacy".into(),
+                    ..DirNode::default()
+                },
+            ],
+            ..HomeReport::default()
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json["nodes"][3].get("key").is_none());
+        let decoded: HomeReport = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.resolve(&["61".into()]), (1, 1));
+        assert_eq!(decoded.resolve(&["62".into()]), (2, 1));
+        assert_eq!(decoded.resolve(&["legacy".into()]), (3, 1));
+        assert_eq!(decoded.node(3).unwrap().identity(), "legacy");
     }
 
     #[test]

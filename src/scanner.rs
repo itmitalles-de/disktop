@@ -40,6 +40,7 @@ pub const SCAN_ROOTS_PATH: &str = "/etc/spctop/scan-roots";
 pub const LEGACY_SCAN_ROOTS_PATH: &str = "/etc/disktop/scan-roots";
 pub const DEFAULT_SCAN_ROOTS: &[&str] = &["/home"];
 const MAX_SCAN_ROOTS: usize = 64;
+const MAX_POLICY_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Limits {
@@ -338,21 +339,36 @@ pub fn load_scan_roots(path: &Path) -> (RootPolicy, Option<String>) {
         Err(problem) => return (RootPolicy::Allowed(Vec::new()), Some(problem)),
         Ok(true) => {}
     }
-    let mut bytes = Vec::new();
-    let read = std::fs::File::open(path)
-        .and_then(|file| io::Read::read_to_end(&mut io::Read::take(file, 64 * 1024), &mut bytes));
-    if let Err(error) = read {
-        return (
+    match read_scan_roots(path) {
+        Ok(entries) => (parse_roots(entries), None),
+        Err(error) => (
             RootPolicy::Allowed(Vec::new()),
             Some(format!("{}: {error}", path.display())),
-        );
+        ),
     }
-    let entries = String::from_utf8_lossy(&bytes)
+}
+
+fn read_scan_roots(path: &Path) -> io::Result<Vec<String>> {
+    let mut bytes = Vec::new();
+    let file = std::fs::File::open(path)?;
+    io::Read::read_to_end(
+        &mut io::Read::take(file, MAX_POLICY_BYTES as u64 + 1),
+        &mut bytes,
+    )?;
+    // A partial final path can broaden an allowlist (/srv/private -> /).
+    // Reject the entire policy, including legacy policies, rather than
+    // parsing any prefix of an overlong file.
+    if bytes.len() > MAX_POLICY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "scan-roots exceeds 64 KiB; no helper scans are allowed",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&bytes)
         .lines()
         .map(|line| line.split('#').next().unwrap_or("").trim().to_owned())
         .filter(|line| !line.is_empty())
-        .collect();
-    (parse_roots(entries), None)
+        .collect())
 }
 
 /// Sanitize a directory name for display and bound its length in
@@ -365,6 +381,16 @@ fn display_name(name: &[u8]) -> String {
     let mut out: String = name.chars().take(MAX_NAME_CHARS - 1).collect();
     out.push('~');
     out
+}
+
+fn name_key(name: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut key = String::with_capacity(name.len() * 2);
+    for byte in name {
+        key.push(char::from(HEX[usize::from(byte >> 4)]));
+        key.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    key
 }
 
 #[derive(Default, Clone, Copy)]
@@ -745,6 +771,7 @@ impl Walker<'_> {
                 self.tree.alloc(
                     DirNode {
                         name: display_name(name.to_bytes()),
+                        key: Some(name_key(name.to_bytes())),
                         ..DirNode::default()
                     },
                     node,
@@ -942,7 +969,7 @@ fn path_sizes(report: &HomeReport) -> HashMap<String, u64> {
         sizes.insert(path.clone(), node.allocated);
         for child in &node.children {
             if let Some(child_node) = report.node(*child) {
-                stack.push((*child, format!("{path}/{}", child_node.name)));
+                stack.push((*child, format!("{path}/{}", child_node.identity())));
             }
         }
     }
@@ -970,7 +997,7 @@ fn annotate(
         let children: Vec<u32> = node.children.clone();
         for child in children {
             if let Some(child_node) = report.nodes.get(child as usize) {
-                stack.push((child, format!("{path}/{}", child_node.name)));
+                stack.push((child, format!("{path}/{}", child_node.identity())));
             }
         }
     }
@@ -1204,11 +1231,14 @@ fn run(shared: Arc<Shared>, limits: Limits, prepare: fn() -> Result<()>) {
                 if history.as_ref().is_none_or(|(path, _, _)| *path != root) {
                     history = None;
                 }
-                // A scan stopped by its entry or time budget (or cancelled)
-                // misses directories: its sizes would show as shrinking and
-                // then growing again. It is shown as it is, but neither
-                // annotated nor used as a baseline.
-                if report.stopped.is_none() {
+                // Missing or approximate sizes would show as shrinking and
+                // then growing again when a later scan is complete. Retention
+                // folding preserves exact totals and remains eligible; entry,
+                // time, depth, access and hardlink limits do not.
+                if report.stopped.is_none()
+                    && report.root_node().is_some_and(|node| !node.partial())
+                    && !report.hardlink_limit_reached
+                {
                     annotate(
                         &mut report,
                         history.as_ref().map(|(_, previous, _)| previous),
@@ -1246,7 +1276,10 @@ mod tests {
     use super::*;
     use std::{
         fs,
-        os::unix::fs::{PermissionsExt, symlink},
+        os::unix::{
+            ffi::OsStringExt,
+            fs::{PermissionsExt, symlink},
+        },
     };
 
     struct TempTree(PathBuf);
@@ -1277,6 +1310,17 @@ mod tests {
 
     fn run_scan(root: &Path, limits: &Limits) -> HomeReport {
         scan(root, limits, &AtomicBool::new(false), &AtomicU64::new(0)).unwrap()
+    }
+
+    fn wait_report(service: &HomeService, known: u64) -> HomeReport {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(report) = service.report_if_newer(known) {
+                return report;
+            }
+            assert!(Instant::now() < deadline, "scan did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn child<'a>(report: &'a HomeReport, parent: u32, name: &str) -> &'a DirNode {
@@ -1323,7 +1367,7 @@ mod tests {
         assert_eq!(report.stopped, None);
         let alice = child(&report, 0, "alice");
         let bob = child(&report, 0, "bob");
-        let docs = child(&report, report.resolve(&["alice".into()]).0, "docs");
+        let docs = child(&report, report.resolve(&[name_key(b"alice")]).0, "docs");
         assert!(docs.allocated >= 96 * 1024, "{}", docs.allocated);
         assert_eq!(
             docs.apparent,
@@ -1351,19 +1395,22 @@ mod tests {
             "non-UTF-8 name"
         );
         if !running_as_root() {
-            let private = child(&report, report.resolve(&["alice".into()]).0, "private");
+            let private = child(&report, report.resolve(&[name_key(b"alice")]).0, "private");
             assert_eq!(private.unreadable, 1);
             assert!(private.partial() && alice.partial() && top.partial());
             assert!(!bob.partial());
         }
-        // The tree is navigable by sanitized names.
+        // Display names and stable navigation identities are separate.
         assert_eq!(
             report
-                .resolve(&["alice".into(), "docs".into(), "deep".into()])
+                .resolve(&[name_key(b"alice"), name_key(b"docs"), name_key(b"deep")])
                 .1,
             3
         );
-        assert_eq!(report.resolve(&["alice".into(), "gone".into()]).1, 1);
+        assert_eq!(
+            report.resolve(&[name_key(b"alice"), name_key(b"gone")]).1,
+            1
+        );
     }
 
     #[test]
@@ -1402,7 +1449,12 @@ mod tests {
         assert!(kept + top.other.allocated <= top.allocated);
         assert!(top.truncated, "max_depth must mark the subtree truncated");
         assert!(report.nodes.len() <= 5 + 1 + 3, "{}", report.nodes.len());
-        let (_, depth) = report.resolve(&["d29".into(), "l0".into(), "l1".into(), "l2".into()]);
+        let (_, depth) = report.resolve(&[
+            name_key(b"d29"),
+            name_key(b"l0"),
+            name_key(b"l1"),
+            name_key(b"l2"),
+        ]);
         assert_eq!(depth, 3, "keep_depth limits retained nodes");
 
         let report = run_scan(
@@ -1961,6 +2013,185 @@ mod tests {
         service.rescan();
         let again = wait(&service, 1);
         assert_eq!(again.root_node().unwrap().growth_previous, Some(0));
+    }
+
+    #[test]
+    fn policy_limit_rejects_partial_paths_and_accepts_exact_bound() {
+        let tree = TempTree::new("policy-limit");
+        // Both current and legacy policies use this reader. A long comment
+        // puts the limit exactly after the slash of the otherwise narrow root.
+        for filename in ["scan-roots", "legacy-scan-roots"] {
+            let path = tree.0.join(filename);
+            let dangerous = format!("#{}\n/srv/private\n", "x".repeat(MAX_POLICY_BYTES - 3));
+            assert_eq!(&dangerous.as_bytes()[MAX_POLICY_BYTES - 1..][..1], b"/");
+            fs::write(&path, dangerous).unwrap();
+            let error = read_scan_roots(&path).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("no helper scans are allowed"));
+
+            let accepted = format!("#{}\n/home", "x".repeat(MAX_POLICY_BYTES - 7));
+            assert_eq!(accepted.len(), MAX_POLICY_BYTES);
+            fs::write(&path, accepted).unwrap();
+            assert_eq!(read_scan_roots(&path).unwrap(), ["/home"]);
+        }
+    }
+
+    #[test]
+    fn colliding_display_names_keep_navigation_and_growth_distinct() {
+        let tree = TempTree::new("name-identity");
+        let mut names = Vec::new();
+        for prefix in [vec![0xff; 64], b"\\xff".repeat(60)] {
+            for suffix in *b"ab" {
+                let mut name = prefix.clone();
+                name.push(suffix);
+                let path = tree.0.join(std::ffi::OsString::from_vec(name.clone()));
+                fs::create_dir(&path).unwrap();
+                fs::create_dir(path.join(format!("child-{}", char::from(suffix)))).unwrap();
+                fs::write(
+                    path.join("data"),
+                    vec![0u8; if suffix == b'a' { 8192 } else { 65536 }],
+                )
+                .unwrap();
+                names.push(name);
+            }
+        }
+        for pair in names.as_chunks::<2>().0 {
+            assert_eq!(display_name(&pair[0]), display_name(&pair[1]));
+            assert_ne!(name_key(&pair[0]), name_key(&pair[1]));
+        }
+        assert_eq!(name_key(&vec![0xff; 255]).len(), 510);
+        let service = HomeService::start(
+            tree.0.clone(),
+            Duration::from_secs(3600),
+            Limits::default(),
+            false,
+            RootPolicy::Follow,
+            || Ok(()),
+        )
+        .unwrap();
+        let first = wait_report(&service, 0);
+        for name in &names {
+            let key = name_key(name);
+            let (index, depth) = first.resolve(std::slice::from_ref(&key));
+            assert_eq!(depth, 1);
+            let node = first.node(index).unwrap();
+            assert_eq!(node.identity(), key);
+            assert_eq!(node.name, display_name(name));
+            let leaf = format!("child-{}", char::from(*name.last().unwrap()));
+            let (leaf_index, depth) = first.resolve(&[key, name_key(leaf.as_bytes())]);
+            assert_eq!(depth, 2);
+            assert_eq!(first.node(leaf_index).unwrap().name, leaf);
+        }
+        service.rescan();
+        let second = wait_report(&service, first.generation);
+        for node in &second.nodes {
+            assert_eq!(node.growth_previous, Some(0), "{}", node.identity());
+            assert_eq!(node.growth_start, Some(0));
+        }
+    }
+
+    #[test]
+    fn unreadable_scan_does_not_replace_complete_growth_baseline() {
+        if running_as_root() {
+            return; // Root bypasses the permissions needed for this fixture.
+        }
+        let tree = TempTree::new("partial-growth");
+        let private = tree.0.join("alice/private");
+        fs::create_dir_all(&private).unwrap();
+        fs::write(private.join("data"), vec![0u8; 128 * 1024]).unwrap();
+        let service = HomeService::start(
+            tree.0.clone(),
+            Duration::from_secs(3600),
+            Limits::default(),
+            false,
+            RootPolicy::Follow,
+            || Ok(()),
+        )
+        .unwrap();
+        let first = wait_report(&service, 0);
+        assert!(!first.root_node().unwrap().partial());
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o0)).unwrap();
+        service.rescan();
+        let partial = wait_report(&service, first.generation);
+        assert_eq!(partial.stopped, None);
+        assert!(partial.root_node().unwrap().partial());
+        assert!(
+            partial
+                .nodes
+                .iter()
+                .all(|node| node.growth_previous.is_none() && node.growth_start.is_none())
+        );
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
+        service.rescan();
+        let recovered = wait_report(&service, partial.generation);
+        assert!(!recovered.root_node().unwrap().partial());
+        assert_eq!(
+            recovered.root_node().unwrap().allocated,
+            first.root_node().unwrap().allocated
+        );
+        assert_eq!(recovered.root_node().unwrap().growth_previous, Some(0));
+        assert_eq!(recovered.root_node().unwrap().growth_start, Some(0));
+    }
+
+    #[test]
+    fn depth_and_hardlink_limits_exclude_growth_but_retention_folding_does_not() {
+        let tree = TempTree::new("growth-completeness");
+        fs::create_dir_all(tree.0.join("deep/nested")).unwrap();
+        fs::write(tree.0.join("deep/nested/data"), vec![0u8; 8192]).unwrap();
+        fs::hard_link(tree.0.join("deep/nested/data"), tree.0.join("linked")).unwrap();
+        for (limits, incomplete) in [
+            (
+                Limits {
+                    max_depth: 1,
+                    ..Limits::default()
+                },
+                true,
+            ),
+            (
+                Limits {
+                    max_hardlinks: 0,
+                    ..Limits::default()
+                },
+                true,
+            ),
+            (
+                Limits {
+                    max_nodes: 1,
+                    ..Limits::default()
+                },
+                false,
+            ),
+        ] {
+            let service = HomeService::start(
+                tree.0.clone(),
+                Duration::from_secs(3600),
+                limits,
+                false,
+                RootPolicy::Follow,
+                || Ok(()),
+            )
+            .unwrap();
+            let first = wait_report(&service, 0);
+            assert_eq!(first.stopped, None);
+            assert_eq!(
+                first.root_node().unwrap().partial() || first.hardlink_limit_reached,
+                incomplete
+            );
+            service.rescan();
+            let second = wait_report(&service, first.generation);
+            if incomplete {
+                assert!(
+                    second
+                        .nodes
+                        .iter()
+                        .all(|node| node.growth_previous.is_none() && node.growth_start.is_none())
+                );
+            } else {
+                assert!(second.root_node().unwrap().other.dirs > 0);
+                assert_eq!(second.root_node().unwrap().growth_previous, Some(0));
+                assert_eq!(second.root_node().unwrap().growth_start, Some(0));
+            }
+        }
     }
 
     #[test]

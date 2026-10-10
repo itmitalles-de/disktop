@@ -382,6 +382,14 @@ impl App {
             {
                 self.home_cwd.clear();
             }
+            // A rescan can delete or fold the directory currently open. Keep
+            // navigation at the surviving ancestor already shown by the UI.
+            let (_, depth) = tree.resolve(&self.home_cwd);
+            if depth < self.home_cwd.len() {
+                self.home_cwd.truncate(depth);
+                self.filter.clear();
+                self.table.select(Some(0));
+            }
             self.known_generation = tree.generation;
             self.home_tree = Some(tree);
         }
@@ -591,27 +599,31 @@ impl App {
             return;
         };
         if let HomeEntryKind::Directory(index) = entry.kind
-            && self
-                .home_tree
-                .as_ref()
-                .and_then(|tree| tree.node(index))
-                .is_some_and(|node| {
-                    !node.children.is_empty() || node.own_files.files > 0 || node.other.dirs > 0
-                })
+            && let Some(node) = self.home_tree.as_ref().and_then(|tree| tree.node(index))
+            && (!node.children.is_empty() || node.own_files.files > 0 || node.other.dirs > 0)
         {
-            self.home_cwd.push(entry.name.clone());
+            self.home_cwd.push(node.identity().to_owned());
             self.filter.clear();
             self.table.select(Some(0));
         }
     }
 
     fn home_up(&mut self) {
-        if let Some(name) = self.home_cwd.pop() {
+        if let Some(identity) = self.home_cwd.pop() {
             self.filter.clear();
             let entries = self.home_entries();
             let index = entries
                 .iter()
-                .position(|entry| entry.name == name)
+                .position(|entry| {
+                    if let HomeEntryKind::Directory(index) = entry.kind {
+                        self.home_tree
+                            .as_ref()
+                            .and_then(|tree| tree.node(index))
+                            .is_some_and(|node| node.identity() == identity)
+                    } else {
+                        false
+                    }
+                })
                 .unwrap_or(0);
             self.table.select(Some(index));
         }
@@ -984,10 +996,21 @@ impl App {
     }
 
     /// The node shown in the home view and the displayed path below the root.
-    pub fn home_node(&self) -> Option<(&DirNode, &[String])> {
+    pub fn home_node(&self) -> Option<(&DirNode, Vec<&str>)> {
         let tree = self.home_tree.as_ref()?;
-        let (index, depth) = tree.resolve(&self.home_cwd);
-        Some((tree.node(index)?, &self.home_cwd[..depth]))
+        let mut node = tree.root_node()?;
+        let mut names = Vec::with_capacity(self.home_cwd.len());
+        for identity in &self.home_cwd {
+            let Some(child) = node.children.iter().find_map(|index| {
+                tree.node(*index)
+                    .filter(|child| child.identity() == identity)
+            }) else {
+                break;
+            };
+            names.push(child.name.as_str());
+            node = child;
+        }
+        Some((node, names))
     }
 
     pub fn home_entries(&self) -> Vec<HomeEntry> {
@@ -4629,6 +4652,119 @@ mod tests {
         snapshot.home_tree = Some(demo::home_tree("/srv/home", 9));
         app.update(snapshot);
         assert!(app.home_cwd.is_empty());
+    }
+
+    #[test]
+    fn home_rescan_keeps_surviving_prefix_and_enters_siblings() {
+        for folded in [false, true] {
+            let mut app = app();
+            app.handle_key(KeyCode::Char('2').into());
+            let node = |name: &str, children: Vec<u32>| DirNode {
+                name: name.into(),
+                children,
+                allocated: 4096,
+                ..DirNode::default()
+            };
+            app.update(Snapshot {
+                home_tree: Some(HomeReport {
+                    root: "/home".into(),
+                    nodes: vec![
+                        node("/home", vec![1]),
+                        node("parent", vec![2]),
+                        node("gone", vec![3]),
+                        node("old-child", vec![]),
+                    ],
+                    ..HomeReport::default()
+                }),
+                ..Snapshot::default()
+            });
+            app.handle_key(KeyCode::Enter.into());
+            app.handle_key(KeyCode::Enter.into());
+            assert_eq!(app.home_cwd, ["parent", "gone"]);
+            app.filter = "old".into();
+            app.table.select(Some(99));
+            let mut parent = node("parent", vec![2]);
+            if folded {
+                // The missing directory may still exist on disk but have
+                // been folded out of the bounded retained tree.
+                parent.other.dirs = 1;
+            }
+            app.update(Snapshot {
+                home_tree: Some(HomeReport {
+                    root: "/home".into(),
+                    generation: 2,
+                    nodes: vec![
+                        node("/home", vec![1]),
+                        parent,
+                        node("survivor", vec![3]),
+                        node("new-child", vec![]),
+                    ],
+                    ..HomeReport::default()
+                }),
+                ..Snapshot::default()
+            });
+            assert_eq!(app.home_cwd, ["parent"]);
+            assert!(app.filter.is_empty());
+            assert_eq!(app.table.selected(), Some(0));
+            app.handle_key(KeyCode::Enter.into());
+            assert_eq!(app.home_cwd, ["parent", "survivor"]);
+            assert_eq!(app.home_entries()[0].name, "new-child");
+            app.handle_key(KeyCode::Backspace.into());
+            assert_eq!(app.home_cwd, ["parent"]);
+            assert_eq!(app.table.selected(), Some(0));
+        }
+    }
+
+    #[test]
+    fn home_navigation_uses_identity_and_displays_names() {
+        let mut app = app();
+        app.handle_key(KeyCode::Char('2').into());
+        let node = |name: &str, key: &str, children: Vec<u32>, allocated| DirNode {
+            name: name.into(),
+            key: Some(key.into()),
+            children,
+            allocated,
+            ..DirNode::default()
+        };
+        app.update(Snapshot {
+            home_tree: Some(HomeReport {
+                root: "/home".into(),
+                nodes: vec![
+                    node("/home", "", vec![1, 2], 30),
+                    node("same~", "01", vec![3], 20),
+                    node("same~", "02", vec![4], 10),
+                    node("first-child", "03", vec![], 20),
+                    node("second-child", "04", vec![], 10),
+                ],
+                ..HomeReport::default()
+            }),
+            ..Snapshot::default()
+        });
+        app.table.select(Some(1));
+        app.handle_key(KeyCode::Enter.into());
+        assert_eq!(app.home_cwd, ["02"]);
+        assert_eq!(app.home_entries()[0].name, "second-child");
+        assert_eq!(app.home_node().unwrap().1, ["same~"]);
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("/home/same~"), "{text}");
+        assert!(!text.contains("/home/02"), "{text}");
+        // Retained indices and display order may change between scans, but
+        // the open directory and its parent selection keep their identity.
+        let mut tree = app.home_tree.clone().unwrap();
+        tree.generation += 1;
+        tree.nodes[0].children.reverse();
+        tree.nodes[1].allocated = 5;
+        tree.nodes.swap(1, 2);
+        app.update(Snapshot {
+            home_tree: Some(tree),
+            ..Snapshot::default()
+        });
+        assert_eq!(app.home_entries()[0].name, "second-child");
+        app.handle_key(KeyCode::Backspace.into());
+        assert!(app.home_cwd.is_empty());
+        assert_eq!(app.table.selected(), Some(0));
     }
 
     #[test]

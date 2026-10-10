@@ -1,5 +1,28 @@
 # Verified state
 
+## Full review fixes (2026-10-10)
+
+- #11: current and legacy scan-root policies exceeding 64 KiB fail closed in
+  their entirety; exact-limit valid policies remain accepted.
+- #12: unreadable/depth/hard-link-incomplete scans cannot annotate growth or
+  replace complete baselines; retention folding with exact totals still can.
+- #13/#16: bounded display names are separate from raw filename identities.
+  Navigation/growth survive display collisions and changed node indices;
+  rescans truncate deleted/folded navigation to the deepest surviving prefix.
+  Identity is an additive protocol-v1 field with legacy name fallback.
+- #14: capacity mapping follows partitions and holders at every stacked
+  level, including partitions of md/dm, with bounded breadth-first traversal.
+- #15: mount probes share a 500 ms budget per sample, preserve late results
+  and never duplicate an outstanding path. Launches rotate; at most eight
+  calls within their deadline and 64 outstanding overall.
+- Verified: 98 Rust tests, formatting, Clippy, release build, terminal/Setup
+  tests and isolated live I/O/helper tests. Real root-owned policy tests cover
+  oversized current/legacy files and refusal to fall back from an invalid new
+  policy. The maximum retained tree plus filename identities fits the unchanged
+  32 MiB response bound. Permission-loss/recovery tests ran unprivileged.
+- Evidence: `../disktop-review/full-code-review-20261010/`. Installation
+  hashes below identify historical builds, not the current installation.
+
 ## spctop space-first transition (2026-10-10)
 
 - Repository renamed to public `itmitalles-de/spctop`, GPL-3.0-or-later.
@@ -106,7 +129,8 @@
 
 ## Open work and limits
 
-- No open GitHub issues remain after PR #8.
+- GitHub Issues are the canonical source of remaining work; #11–#16 are
+  addressed by the full review fixes above. Earlier #4–#7 closed with PR #8.
 - ZFS file-backed/unresolved members have no inferred disk mapping. Scanner
   limits can still summarize root children themselves, and already evicted
   descendant names cannot be recovered within that scan. Real kernel tests

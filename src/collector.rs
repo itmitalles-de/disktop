@@ -263,13 +263,10 @@ impl Collector {
                 .get(&line.name)
                 .filter(|old| old.major == line.major && old.minor == line.minor)
                 .and_then(|old| diskstats::rates(&old.counters, &line.counters, seconds));
-            let own_partitions = partitions
-                .get(line.name.as_str())
-                .map_or(&[][..], Vec::as_slice);
             let mut device_mounts = BTreeSet::new();
-            let descendants =
-                self.sysfs
-                    .descendants_cached(&line.name, own_partitions, &mut holders);
+            let descendants = self
+                .sysfs
+                .descendants_cached(&line.name, &partitions, &mut holders);
             for name in &descendants {
                 if let Some(points) = mounts_by_device.get(name) {
                     device_mounts.extend(points.iter().cloned());
@@ -619,12 +616,7 @@ pub fn complete_storage(sysfs: &Sysfs, snapshot: &mut Snapshot) -> bool {
         let mut holders = HashMap::new();
         let members: Vec<BTreeSet<String>> = devices
             .iter()
-            .map(|device| {
-                let own = partitions
-                    .get(device.name.as_str())
-                    .map_or(&[][..], Vec::as_slice);
-                sysfs.descendants_cached(&device.name, own, &mut holders)
-            })
+            .map(|device| sysfs.descendants_cached(&device.name, &partitions, &mut holders))
             .collect();
         apply_usage(&mut snapshot.devices, &members, &snapshot.filesystems);
     }
@@ -726,6 +718,7 @@ pub fn default_device(home_root: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::DeviceKind;
 
     #[test]
     fn live_sample_has_devices_filesystems_and_own_process() {
@@ -962,6 +955,66 @@ mod tests {
         let short = read_pseudo_file(path.to_str().unwrap()).unwrap();
         assert!(!short.truncated && short.bytes == line.as_bytes());
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn older_helper_capacity_follows_partitions_of_every_holder() {
+        let root =
+            std::env::temp_dir().join(format!("spctop-helper-stacks-{}", std::process::id()));
+        let block = root.join("class/block");
+        for name in [
+            "sda", "sda1", "sdb", "sdb1", "md0", "md0p1", "dm-0", "dm-0p1",
+        ] {
+            fs::create_dir_all(block.join(name).join("holders")).unwrap();
+        }
+        for (below, above) in [("sda1", "md0"), ("sdb1", "md0"), ("md0p1", "dm-0")] {
+            fs::create_dir_all(block.join(below).join("holders").join(above)).unwrap();
+            fs::create_dir_all(block.join(above).join("slaves").join(below)).unwrap();
+        }
+        let mut snapshot = Snapshot {
+            devices: [
+                ("sda", DeviceKind::Hdd, None),
+                ("sda1", DeviceKind::Hdd, Some("sda")),
+                ("sdb", DeviceKind::Hdd, None),
+                ("sdb1", DeviceKind::Hdd, Some("sdb")),
+                ("md0", DeviceKind::Md, None),
+                ("md0p1", DeviceKind::Md, Some("md0")),
+                ("dm-0", DeviceKind::Dm, None),
+                ("dm-0p1", DeviceKind::Dm, Some("dm-0")),
+            ]
+            .into_iter()
+            .map(|(name, kind, parent)| Device {
+                name: name.into(),
+                kind,
+                partition: parent.is_some(),
+                parent: parent.map(str::to_owned),
+                ..Default::default()
+            })
+            .collect(),
+            filesystems: ["md0p1", "dm-0p1"]
+                .map(|name| Filesystem {
+                    block_device: Some(name.into()),
+                    total_bytes: Some(100),
+                    used_bytes: Some(50),
+                    available_bytes: Some(50),
+                    ..Default::default()
+                })
+                .into(),
+            ..Default::default()
+        };
+        assert!(complete_storage(&Sysfs::at(&root), &mut snapshot));
+        for disk in snapshot
+            .devices
+            .iter()
+            .filter(|device| !device.partition && !device.kind.is_stacked())
+        {
+            let usage = disk.usage.as_ref().unwrap();
+            assert_eq!((usage.filesystems, usage.used_bytes), (2, 100));
+            assert_eq!(usage.accounting_keys, ["md0p1", "dm-0p1"]);
+        }
+        assert_eq!(snapshot.devices[4].backing_disks, ["sda", "sdb"]);
+        assert_eq!(snapshot.devices[6].backing_disks, ["sda", "sdb"]);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
