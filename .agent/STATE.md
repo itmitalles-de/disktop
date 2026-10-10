@@ -5,6 +5,9 @@
   merged as [PR #3](https://github.com/itmitalles-de/disktop/pull/3) on
   2026-10-10 (`7a5fc33`, including `cff30b9` and test fix `1f63fe3`). The
   review worktree and local/remote `fix/review-round-1` branch were removed.
+  Follow-up [PR #8](https://github.com/itmitalles-de/disktop/pull/8) merged as
+  `0d6e02e` (implementation `86da3ad`), closing issues #4–#7. Local `main`
+  is synchronized; local/remote `fix/followup-issues` branches were removed.
 - The main screen shows every physical disk with RD/WR/IO/US meters and
   per-disk utilization/fill graphs. RD and WR share the highest rate across
   all displayed disks within visible history; IO and US share a 0-100% scale.
@@ -31,16 +34,12 @@
   decodable by an older UI, which falls back to unprivileged collection.
 - Host installation verified on 2026-10-10 with `scripts/install.sh` and
   `scripts/setup-helper.sh`: installed UI/helper SHA-256 hashes match builds
-  from `7a5fc33`; helper is root:tim 0750 with the expected capabilities.
+  from `0d6e02e`; helper is root:tim 0750 with the expected capabilities.
   `/etc/disktop/scan-roots` is absent, so the default applies. Live `--once`
-  and `--json` show both NVMe disks, correctly mark `/home`, report all 1,229
+  and `--json` show both NVMe disks, correctly mark `/home`, report all 1,207
   sampled processes readable and no nonresponding mounts. Brief live/demo
-  PTY sessions quit cleanly; demo meters show the common RD/WR scale.
-- Validation on 2026-10-10: local fmt, Clippy with warnings denied, all 71
-  Rust tests, release install builds and `tests/terminal.py` passed. The
-  shared-scale regression test passes. PR CI was green before merge; merge
-  CI also passed (stable/MSRV, audit, terminal/setup, isolated live I/O/helper
-  tests and ShellCheck). Hung NFS and real hidepid mounts remain unverified.
+  PTY sessions quit cleanly and restore the terminal; demo meters show the
+  common RD/WR scale.
 - `site/` is the public dependency-free website with local licensed fonts,
   explicit DEMO media, EN/DE and persisted system-aware light/dark controls.
   Pages uses GitHub Actions, `disktop.wutz.io`, and enforced HTTPS; the merge
@@ -48,11 +47,8 @@
   `../disktop-review/`; round-1 before/after terminal text captures are in
   `../disktop-review/round-1/`.
 
-## Follow-up implementation (2026-10-10)
+## Follow-up completion (2026-10-10)
 
-- Branch `fix/followup-issues` implements issues #4–#7; commits/merge require
-  the owner's explicit chat checkpoint. The host installation above is still
-  the previous release until these changes are approved and installed.
 - #4: refreshed all three DEMO PNGs, the 17.4 s MP4 and social card for the
   common RD/WR scale, preserving viewport, palette, style and synthetic data.
 - #5: ZFS pool membership maps to all known backing disks. Pool allocation is
@@ -72,16 +68,14 @@
   disks/multiple datasets/quota passed as user and root; failed-query behavior
   also passed. Reproduction: `tests/kernel.md`, `tests/zfs.md`.
 - Review: `../disktop-review/followup-issues/index.html`; real-kernel evidence
-  is in `../disktop-review/followup-kernel-20261010/`. New branch CI is pending
-  its first approved push. The previous main CI results above are historical.
+  is in `../disktop-review/followup-kernel-20261010/`. PR #8 CI, MSRV, audit,
+  CodeQL and Pages build passed. Merge `0d6e02e` CI (stable/MSRV, audit,
+  terminal/setup, isolated I/O/helper, ShellCheck), CodeQL and Pages deployment
+  passed; published media hashes match the repository assets.
 
 ## Open work and limits
 
-- [#4](https://github.com/itmitalles-de/disktop/issues/4),
-  [#5](https://github.com/itmitalles-de/disktop/issues/5),
-  [#6](https://github.com/itmitalles-de/disktop/issues/6) and
-  [#7](https://github.com/itmitalles-de/disktop/issues/7) remain open until the
-  follow-up branch is reviewed and merged.
+- No open GitHub issues remain after PR #8.
 - ZFS file-backed/unresolved members have no inferred disk mapping. Scanner
   limits can still summarize root children themselves, and already evicted
   descendant names cannot be recovered within that scan. Real kernel tests
