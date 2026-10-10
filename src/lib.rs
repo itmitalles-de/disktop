@@ -13,3 +13,4 @@ pub mod scanner;
 pub mod shutdown;
 pub mod text;
 pub mod ui;
+pub mod zfs;

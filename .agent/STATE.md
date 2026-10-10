@@ -48,17 +48,44 @@
   `../disktop-review/`; round-1 before/after terminal text captures are in
   `../disktop-review/round-1/`.
 
+## Follow-up implementation (2026-10-10)
+
+- Branch `fix/followup-issues` implements issues #4–#7; commits/merge require
+  the owner's explicit chat checkpoint. The host installation above is still
+  the previous release until these changes are approved and installed.
+- #4: refreshed all three DEMO PNGs, the 17.4 s MP4 and social card for the
+  common RD/WR scale, preserving viewport, palette, style and synthetic data.
+- #5: ZFS pool membership maps to all known backing disks. Pool allocation is
+  counted once across datasets/disks, separate from dataset statvfs. Optional
+  `zpool` discovery is bounded and unprivileged; failures remain visible.
+  `accounting_keys` is additive; `block_devices` retains actual device names.
+- #6: scanner retention shares the node budget among root-child subtrees;
+  evicted detail remains folded into exact totals. Adversarial tests cover
+  equal-depth floods, traversal orders, deep active ancestors and tiny budgets.
+- #7: real isolated KVM tests passed for hard NFS outage/recovery, hidepid 1/2,
+  direct/helper collection and primary/supplementary gid exemptions. They found
+  and fixed missing direct-collection warnings: stat EACCES is counted, and
+  hidden enumeration reports an unknown total. The TUI warns in both cases.
+- Verified: fmt, Clippy with warnings denied, 81 Rust tests on stable and
+  Rust 1.88.0, release build, terminal/setup, isolated live I/O/helper tests,
+  ShellCheck, Cargo Audit and site references. Real ZFS mirror with two
+  disks/multiple datasets/quota passed as user and root; failed-query behavior
+  also passed. Reproduction: `tests/kernel.md`, `tests/zfs.md`.
+- Review: `../disktop-review/followup-issues/index.html`; real-kernel evidence
+  is in `../disktop-review/followup-kernel-20261010/`. New branch CI is pending
+  its first approved push. The previous main CI results above are historical.
+
 ## Open work and limits
 
-- [#4](https://github.com/itmitalles-de/disktop/issues/4): refresh website,
-  README and social/demo media for the shared RD/WR scale.
-- [#5](https://github.com/itmitalles-de/disktop/issues/5): ZFS pool membership
-  and usage attribution across disks; pool/dataset sources may currently
-  have no disk attribution.
-- [#6](https://github.com/itmitalles-de/disktop/issues/6): fairness between
-  home subtrees under global scanner eviction; aggregate totals are retained.
-- [#7](https://github.com/itmitalles-de/disktop/issues/7): real isolated NFS
-  outage and /proc hidepid validation (currently unit coverage only).
+- [#4](https://github.com/itmitalles-de/disktop/issues/4),
+  [#5](https://github.com/itmitalles-de/disktop/issues/5),
+  [#6](https://github.com/itmitalles-de/disktop/issues/6) and
+  [#7](https://github.com/itmitalles-de/disktop/issues/7) remain open until the
+  follow-up branch is reviewed and merged.
+- ZFS file-backed/unresolved members have no inferred disk mapping. Scanner
+  limits can still summarize root children themselves, and already evicted
+  descendant names cannot be recovered within that scan. Real kernel tests
+  cover NFSv4.2/hidepid 1/2, not every NFS variant or hidepid 4.
 - Hardware coverage still excludes real md RAID, zram, hot-plug, HDDs and a
   real swap partition. Network/generic FUSE mounts are filtered; fuseblk is
   eligible and protected by bounded probing. Same-filesystem bind mounts in

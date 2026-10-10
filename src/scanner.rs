@@ -452,31 +452,80 @@ impl Tree {
         }
     }
 
-    /// Keep at most `target` nodes. Unfinished ancestors on the walk stack
-    /// always stay; among finished ones, shallower and then larger directories
-    /// win, so siblings visited late still compete with earlier deep trees.
-    /// The kept set is a prefix of that order, so it is closed under parents.
+    /// Divide retained nodes equally between root-child subtrees, lending
+    /// unused shares to subtrees that still have candidates. Active ancestors
+    /// are mandatory and count against their own subtree's share. Within a
+    /// subtree, retain shallow nodes first, then larger directories; this
+    /// keeps every selected node's ancestors. A same-depth flood in one home
+    /// therefore cannot consume the other homes' shares.
     fn evict_to(&mut self, target: usize) {
-        let mut candidates: Vec<usize> = self
-            .slots
-            .iter()
-            .enumerate()
-            .filter_map(|(index, slot)| {
-                slot.as_ref()
-                    .filter(|slot| slot.finished && slot.parent.is_some())
-                    .map(|_| index)
-            })
-            .collect();
-        let unfinished = self.live - candidates.len();
-        let keep = target.saturating_sub(unfinished);
-        if candidates.len() <= keep {
+        if self.live <= target {
             return;
         }
-        candidates.sort_by_key(|index| {
-            let slot = self.slot(*index);
-            (slot.depth, std::cmp::Reverse(slot.node.allocated), *index)
+        let mut branches: HashMap<usize, (usize, Vec<usize>)> = HashMap::new();
+        let mut unfinished = 0;
+        for (index, slot) in self.slots.iter().enumerate() {
+            let Some(slot) = slot else { continue };
+            if !slot.finished || slot.parent.is_none() {
+                unfinished += 1;
+            }
+            if slot.parent.is_none() {
+                continue;
+            }
+            let mut branch = index;
+            while let Some(parent) = self.slot(branch).parent {
+                if self.slot(parent).parent.is_none() {
+                    break;
+                }
+                branch = parent;
+            }
+            let (mandatory, candidates) = branches.entry(branch).or_default();
+            if slot.finished {
+                candidates.push(index);
+            } else {
+                *mandatory += 1;
+            }
+        }
+        let mut branches: Vec<_> = branches.into_iter().collect();
+        // When there is not even room for all root children, prefer larger
+        // finished ones, with names as a stable tie break instead of visit order.
+        branches.sort_by(|(left, _), (right, _)| {
+            let left = &self.slot(*left).node;
+            let right = &self.slot(*right).node;
+            right
+                .allocated
+                .cmp(&left.allocated)
+                .then(left.name.cmp(&right.name))
         });
-        let evicted = candidates.split_off(keep);
+        let mut available = std::collections::BinaryHeap::new();
+        for (rank, (_, (mandatory, candidates))) in branches.iter_mut().enumerate() {
+            candidates.sort_by(|left, right| {
+                let left = self.slot(*left);
+                let right = self.slot(*right);
+                left.depth
+                    .cmp(&right.depth)
+                    .then(right.node.allocated.cmp(&left.node.allocated))
+                    .then(left.node.name.cmp(&right.node.name))
+            });
+            candidates.reverse();
+            if !candidates.is_empty() {
+                available.push(std::cmp::Reverse((*mandatory, rank)));
+            }
+        }
+        for _ in 0..target.saturating_sub(unfinished) {
+            let Some(std::cmp::Reverse((count, rank))) = available.pop() else {
+                break;
+            };
+            let candidates = &mut branches[rank].1.1;
+            candidates.pop();
+            if !candidates.is_empty() {
+                available.push(std::cmp::Reverse((count + 1, rank)));
+            }
+        }
+        let evicted: Vec<_> = branches
+            .into_iter()
+            .flat_map(|(_, (_, candidates))| candidates)
+            .collect();
         let mut gone = vec![false; self.slots.len()];
         for index in &evicted {
             gone[*index] = true;
@@ -744,7 +793,11 @@ impl Walker<'_> {
     fn reserve(&mut self) -> bool {
         let cap = self.limits.max_nodes.saturating_mul(2) + self.limits.keep_depth + 1;
         if self.tree.live >= cap {
-            self.tree.evict_to(self.limits.max_nodes);
+            // The active descent has a separate bounded allowance: it must
+            // not force a completed neighbour to lose its fair share merely
+            // because another subtree currently has many open ancestors.
+            self.tree
+                .evict_to(self.limits.max_nodes.saturating_add(self.limits.keep_depth));
         }
         self.tree.live < cap
     }
@@ -1406,6 +1459,267 @@ mod tests {
         assert_eq!(deep_node.dirs, 40);
         let kept: u64 = report.nodes.iter().skip(1).map(|node| node.files).sum();
         assert!(kept <= report.root_node().unwrap().files);
+    }
+
+    #[test]
+    fn sibling_homes_keep_details_despite_same_depth_flood_in_either_order() {
+        // Drive the slab in an explicit DFS order: filesystem readdir order
+        // cannot reliably be controlled by creating directories in order.
+        let mut results = Vec::new();
+        for order in [["alice", "bob", "carol"], ["carol", "bob", "alice"]] {
+            let limits = Limits {
+                max_nodes: 13,
+                keep_depth: 8,
+                ..Limits::default()
+            };
+            let mut tree = Tree::default();
+            tree.alloc(DirNode::default(), None, 0);
+            let cap = limits.max_nodes * 2 + limits.keep_depth + 1;
+            let mut total = 0;
+            let mut files = 0;
+            for name in order {
+                let home = tree.alloc(
+                    DirNode {
+                        name: name.into(),
+                        ..DirNode::default()
+                    },
+                    Some(0),
+                    1,
+                );
+                let count = if name == "alice" { 1000 } else { 3 };
+                let mut home_total = 0;
+                for number in 1..=count {
+                    if tree.live >= cap {
+                        tree.evict_to(limits.max_nodes + limits.keep_depth);
+                    }
+                    let bytes = if name == "alice" {
+                        number * 1000
+                    } else {
+                        number
+                    };
+                    let child = tree.alloc(
+                        DirNode {
+                            name: format!("d{number:04}"),
+                            allocated: bytes,
+                            apparent: bytes,
+                            files: 1,
+                            own_files: Folded {
+                                allocated: bytes,
+                                apparent: bytes,
+                                files: 1,
+                                dirs: 0,
+                            },
+                            ..DirNode::default()
+                        },
+                        Some(home),
+                        2,
+                    );
+                    tree.slots[child].as_mut().unwrap().finished = true;
+                    tree.node(home).children.push(child as u32);
+                    home_total += bytes;
+                    assert!(tree.live <= cap);
+                    assert!(tree.slots.len() <= cap);
+                }
+                let slot = tree.slots[home].as_mut().unwrap();
+                slot.finished = true;
+                slot.node.allocated = home_total;
+                slot.node.apparent = home_total;
+                slot.node.files = count;
+                slot.node.dirs = count;
+                tree.node(0).children.push(home as u32);
+                total += home_total;
+                files += count;
+            }
+            tree.node(0).allocated = total;
+            tree.node(0).files = files;
+            tree.evict_to(limits.max_nodes);
+            assert_eq!(tree.live, limits.max_nodes);
+            let nodes = tree.into_nodes();
+            assert_eq!(
+                nodes.len(),
+                limits.max_nodes,
+                "all retained nodes must be reachable"
+            );
+            assert_eq!(nodes[0].allocated, total);
+            assert_eq!(nodes[0].files, files);
+            let mut retained = Vec::new();
+            for index in &nodes[0].children {
+                let home = &nodes[*index as usize];
+                assert_eq!(home.children.len(), 3, "{} lost its fair share", home.name);
+                let children: Vec<_> = home
+                    .children
+                    .iter()
+                    .map(|index| &nodes[*index as usize])
+                    .collect();
+                assert_eq!(
+                    home.allocated,
+                    home.other.allocated + children.iter().map(|node| node.allocated).sum::<u64>()
+                );
+                assert_eq!(
+                    home.apparent,
+                    home.other.apparent + children.iter().map(|node| node.apparent).sum::<u64>()
+                );
+                assert_eq!(
+                    home.files,
+                    home.other.files + children.iter().map(|node| node.files).sum::<u64>()
+                );
+                assert_eq!(home.dirs, home.other.dirs + children.len() as u64);
+                if home.name == "alice" {
+                    assert_eq!(home.other.dirs, 997, "omitted detail must remain visible");
+                } else {
+                    assert_eq!(home.other.dirs, 0);
+                }
+                retained.extend(
+                    children
+                        .iter()
+                        .map(|node| format!("{}/{}", home.name, node.name)),
+                );
+            }
+            retained.sort();
+            results.push(retained);
+        }
+        assert_eq!(results[0], results[1]);
+    }
+
+    #[test]
+    fn active_deep_descent_cannot_spend_finished_neighbours_shares() {
+        let mut tree = Tree::default();
+        tree.alloc(DirNode::default(), None, 0);
+        for name in ["bob", "carol"] {
+            let home = tree.alloc(
+                DirNode {
+                    name: name.into(),
+                    ..DirNode::default()
+                },
+                Some(0),
+                1,
+            );
+            let detail = tree.alloc(
+                DirNode {
+                    name: "detail".into(),
+                    ..DirNode::default()
+                },
+                Some(home),
+                2,
+            );
+            tree.node(home).children.push(detail as u32);
+            tree.node(0).children.push(home as u32);
+            tree.slots[detail].as_mut().unwrap().finished = true;
+            tree.slots[home].as_mut().unwrap().finished = true;
+        }
+        let mut ancestors = Vec::new();
+        let mut parent = 0;
+        for depth in 1..=7 {
+            let index = tree.alloc(
+                DirNode {
+                    name: format!("active{depth}"),
+                    ..DirNode::default()
+                },
+                Some(parent),
+                depth,
+            );
+            // Active nodes are attached only after finishing, as in Walker.
+            ancestors.push(index);
+            parent = index;
+        }
+        for number in 0..50 {
+            if tree.live > 7 * 2 + 8 {
+                tree.evict_to(7 + 8);
+                assert_eq!(tree.slot(1).node.children.len(), 1);
+                assert_eq!(tree.slot(3).node.children.len(), 1);
+            }
+            let index = tree.alloc(
+                DirNode {
+                    name: format!("leaf{number}"),
+                    ..DirNode::default()
+                },
+                Some(parent),
+                8,
+            );
+            tree.node(parent).children.push(index as u32);
+            tree.slots[index].as_mut().unwrap().finished = true;
+        }
+        for index in ancestors.into_iter().rev() {
+            let parent = tree.slot(index).parent.unwrap();
+            tree.slots[index].as_mut().unwrap().finished = true;
+            tree.node(parent).children.push(index as u32);
+        }
+        tree.evict_to(7);
+        assert_eq!(tree.live, 7);
+        let nodes = tree.into_nodes();
+        assert_eq!(nodes.len(), 7);
+        for home in nodes[0]
+            .children
+            .iter()
+            .map(|index| &nodes[*index as usize])
+        {
+            assert_eq!(home.children.len(), 1, "{} lost its detail", home.name);
+        }
+    }
+
+    #[test]
+    fn fair_eviction_preserves_ancestors_and_full_scan_totals() {
+        let tree = TempTree::new("fair-budget");
+        for (user, count, size) in [("alice", 80, 8192), ("bob", 3, 1), ("carol", 3, 1)] {
+            for index in 0..count {
+                let directory = tree.0.join(format!("{user}/d{index:03}/nested/deep"));
+                fs::create_dir_all(&directory).unwrap();
+                fs::write(directory.join("data"), vec![1u8; size]).unwrap();
+            }
+        }
+        let full = run_scan(&tree.0, &Limits::default());
+        for top_children in [3, 200] {
+            for max_nodes in [1, 3, 16] {
+                let bounded = run_scan(
+                    &tree.0,
+                    &Limits {
+                        max_nodes,
+                        top_children,
+                        ..Limits::default()
+                    },
+                );
+                assert_eq!(bounded.stopped, None);
+                assert_eq!(bounded.nodes.len(), max_nodes);
+                if max_nodes == 16 {
+                    for user in ["alice", "bob", "carol"] {
+                        assert!(
+                            !child(&bounded, 0, user).children.is_empty(),
+                            "{user} lost all details"
+                        );
+                    }
+                }
+                let mut queue = vec![(0, 0)];
+                let mut seen = HashSet::new();
+                while let Some((small_index, full_index)) = queue.pop() {
+                    assert!(seen.insert(small_index));
+                    let small = bounded.node(small_index).unwrap();
+                    let original = full.node(full_index).unwrap();
+                    assert_eq!(small.allocated, original.allocated);
+                    assert_eq!(small.apparent, original.apparent);
+                    assert_eq!(small.files, original.files);
+                    assert_eq!(small.dirs, original.dirs);
+                    assert_eq!(small.truncated, original.truncated);
+                    let mut omitted = Folded::default();
+                    for original_child in &original.children {
+                        let original_node = full.node(*original_child).unwrap();
+                        match small
+                            .children
+                            .iter()
+                            .find(|index| bounded.node(**index).unwrap().name == original_node.name)
+                        {
+                            Some(index) => queue.push((*index, *original_child)),
+                            None => fold(&mut omitted, &Totals::of(original_node)),
+                        }
+                    }
+                    assert_eq!(small.other.allocated, omitted.allocated);
+                    assert_eq!(small.other.apparent, omitted.apparent);
+                    assert_eq!(small.other.files, omitted.files);
+                    assert_eq!(small.other.dirs, omitted.dirs);
+                }
+                assert_eq!(seen.len(), bounded.nodes.len(), "ancestor closure");
+                assert!(bounded.nodes.iter().any(|node| node.other.dirs > 0));
+            }
+        }
     }
 
     #[test]

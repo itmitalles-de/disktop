@@ -1332,7 +1332,7 @@ fn physical_disks(app: &App) -> impl Iterator<Item = &Device> {
 }
 
 /// Used and total bytes of the physical disks' filesystems. A filesystem on
-/// several disks (LVM, MD, btrfs RAID) counts once; replies from older
+/// several disks (LVM, MD, btrfs RAID, ZFS pools) counts once; replies from older
 /// helpers without the filesystem list are summed per disk.
 fn combined_usage(app: &App) -> (u64, u64) {
     let mut seen = BTreeSet::new();
@@ -1342,11 +1342,16 @@ fn combined_usage(app: &App) -> (u64, u64) {
         total = total.saturating_add(filesystem_used.saturating_add(available));
     };
     for usage in physical_disks(app).filter_map(|device| device.usage.as_ref()) {
-        if usage.block_devices.is_empty() {
+        let keys = if usage.accounting_keys.is_empty() {
+            &usage.block_devices
+        } else {
+            &usage.accounting_keys
+        };
+        if keys.is_empty() {
             add(usage.used_bytes, usage.available_bytes);
             continue;
         }
-        for name in &usage.block_devices {
+        for name in keys {
             if !seen.insert(name.as_str()) {
                 continue;
             }
@@ -1354,8 +1359,12 @@ fn combined_usage(app: &App) -> (u64, u64) {
                 .snapshot
                 .filesystems
                 .iter()
-                .filter(|filesystem| filesystem.block_device.as_ref() == Some(name))
-                .find_map(|filesystem| Some((filesystem.used_bytes?, filesystem.available_bytes?)))
+                .filter(|filesystem| filesystem.accounting_key().as_ref() == Some(name))
+                .find_map(|filesystem| {
+                    filesystem
+                        .accounting_usage()
+                        .map(|(_, used, available)| (used, available))
+                })
             {
                 add(filesystem_used, available);
             }
@@ -2118,10 +2127,38 @@ fn status_line(app: &App) -> Option<(String, Color)> {
     if !app.snapshot.truncated.is_empty() {
         return Some((lang.truncated(&app.snapshot.truncated), Color::Yellow));
     }
+    let unavailable_pools: BTreeSet<_> = app
+        .snapshot
+        .filesystems
+        .iter()
+        .filter_map(|filesystem| filesystem.zfs.as_ref())
+        .filter(|pool| pool.error.is_some())
+        .map(|pool| crate::text::sanitize(&pool.name))
+        .collect();
+    if !unavailable_pools.is_empty() {
+        return Some((
+            format!(
+                "{}: {}",
+                lang.pick("ZFS pool data unavailable", "ZFS-Pooldaten nicht verfügbar"),
+                unavailable_pools.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+            Color::Yellow,
+        ));
+    }
     if app.demo || app.settings.view != View::Processes {
         return None; // DEMO is labeled in the title; other views show their own state.
     }
     let access = &app.snapshot.process_access;
+    if access.message.contains("/proc hidepid") {
+        return Some((
+            lang.pick(
+                "hidepid: process details restricted (F1)",
+                "hidepid: Prozessdetails beschränkt (F1)",
+            )
+            .to_owned(),
+            Color::Yellow,
+        ));
+    }
     if !access.privileged && access.unreadable > 0 {
         return Some((
             match lang {
@@ -3728,6 +3765,99 @@ mod tests {
             .find(|y| buffer[(0, *y)].symbol() == "s" && buffer[(2, *y)].symbol() == "p")
             .unwrap();
         assert!(buffer[(0, row)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn hidepid_warning_does_not_require_a_hidden_process_count() {
+        let mut app = App::new(None, Settings::default(), false);
+        for privileged in [false, true] {
+            app.snapshot.process_access.privileged = privileged;
+            app.snapshot.process_access.unreadable = 0;
+            app.snapshot.process_access.message = if privileged {
+                "Process I/O readable; other users' command lines hidden by /proc hidepid"
+            } else {
+                "Other users' processes hidden by /proc hidepid; total hidden count unavailable"
+            }
+            .into();
+            app.settings.language = Language::En;
+            assert_eq!(
+                status_line(&app),
+                Some((
+                    "hidepid: process details restricted (F1)".into(),
+                    Color::Yellow
+                ))
+            );
+            app.settings.language = Language::De;
+            assert_eq!(
+                status_line(&app).unwrap().0,
+                "hidepid: Prozessdetails beschränkt (F1)"
+            );
+        }
+        app.snapshot.process_access.message = "All processes readable (helper or root)".into();
+        assert!(status_line(&app).is_none());
+    }
+
+    #[test]
+    fn zfs_summary_counts_one_pool_across_datasets_and_disks() {
+        use crate::model::{DeviceUsage, ZfsPool};
+
+        let pool = ZfsPool {
+            name: "tank".into(),
+            total_bytes: Some(1000),
+            used_bytes: Some(300),
+            available_bytes: Some(700),
+            error: None,
+        };
+        let filesystems: Vec<_> = ["tank", "tank/home", "tank/data"]
+            .into_iter()
+            .map(|source| Filesystem {
+                source: source.into(),
+                fs_type: "zfs".into(),
+                // Dataset statvfs values deliberately differ from pool use.
+                total_bytes: Some(800),
+                used_bytes: Some(100),
+                available_bytes: Some(700),
+                member_devices: vec!["sda".into(), "sdb".into()],
+                zfs: Some(pool.clone()),
+                ..Default::default()
+            })
+            .collect();
+        let devices = ["sda", "sdb"]
+            .into_iter()
+            .map(|name| Device {
+                name: name.into(),
+                usage: Some(DeviceUsage::from_filesystems(
+                    &filesystems,
+                    &BTreeSet::from([name.into()]),
+                    false,
+                )),
+                ..Default::default()
+            })
+            .collect();
+        let mut app = App::new(None, Settings::default(), false);
+        app.update(Snapshot {
+            devices,
+            filesystems,
+            ..Default::default()
+        });
+        assert_eq!(combined_usage(&app), (300, 1000));
+        assert!(status_line(&app).is_none());
+
+        for filesystem in &mut app.snapshot.filesystems {
+            let pool = filesystem.zfs.as_mut().unwrap();
+            pool.used_bytes = None;
+            pool.error = Some("membership unavailable".into());
+        }
+        // Do not substitute or sum the still-readable dataset values.
+        assert_eq!(combined_usage(&app), (0, 0));
+        let (warning, color) = status_line(&app).unwrap();
+        assert_eq!(warning, "ZFS pool data unavailable: tank");
+        assert_eq!(color, Color::Yellow);
+        app.settings.language = Language::De;
+        assert_eq!(
+            status_line(&app).unwrap().0,
+            "ZFS-Pooldaten nicht verfügbar: tank"
+        );
     }
 
     #[test]

@@ -114,6 +114,9 @@ file capabilities are only `CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`.
   `hidepid=1`/`noaccess` sends only their task name, never the command line;
   `hidepid=2`/`invisible`/`ptraceable` omits them and counts them as hidden.
   Members of the `gid=` group of the mount see everything, as without the helper.
+  Direct collection also warns about hidepid; mode 2 hides enumeration, so the
+  total hidden count is explicitly unknown. The TUI shows the restriction even
+  when the kernel makes counting impossible.
  The sampling thread keeps both to read other users'
 `/proc/PID/io`; the home scanner thread keeps only `CAP_DAC_READ_SEARCH`. Both
 set `NO_NEW_PRIVS`; core dumps are disabled and the inherited environment is
@@ -257,19 +260,32 @@ Filesystems view, mapped to disks through partitions and holders in sysfs.
 Like `df`'s Use%, it is used / (used + available), so blocks reserved for root
 count as full and the shown total is used + available. A multi-device btrfs
 filesystem counts on each of its member disks; the all-disks total counts a
-filesystem spanning several disks (btrfs, LVM, MD) once. ZFS pools count on the
-disk their mount source names. Swap
+filesystem spanning several disks (btrfs, LVM, MD) once. ZFS pools count on all
+known member disks, using pool-wide size/allocated/free from `zpool list`;
+the all-disks total counts each pool once across disks and mounted datasets.
+The Filesystems view keeps each dataset's own quota-dependent `statvfs`
+values. ZFS discovery needs the optional OpenZFS `zpool` tool; queries are
+bounded and run without helper capabilities. Missing tools, unresolved vdevs
+and failed queries are reported instead of inferring pool capacity from
+datasets. File-backed vdevs have no inferred disk attribution. Swap
 partitions come from `/proc/swaps` and are not part of the fill level.
 
 `--json` adds a `usage` object to every device (`filesystems`, `unmeasured`,
-`total_bytes`, `used_bytes`, `available_bytes`, `swap`, `block_devices`; `null`
+`total_bytes`, `used_bytes`, `available_bytes`, `swap`, `block_devices`,
+`accounting_keys`; `null`
 when not measured, for example by a helper from an older release) and
 `backing_disks`, the whole disks below a dm, md or other stacked device (bcache,
 DRBD, ZFS volumes and nbd are kind `stacked`, shown as `VIRT`). Filesystems
-carry `not_responding` and, for multi-device btrfs, `member_devices`; a snapshot
+carry `not_responding` and, for multi-device btrfs or ZFS, `member_devices`.
+ZFS rows also carry a `zfs` object with pool `name`, `total_bytes`, `used_bytes`,
+`available_bytes` and an optional `error`, separate from dataset values. A snapshot
 lists kernel files that exceeded the 16 MiB read limit in `truncated`. The document version
 stays 1 because fields are only added. `--once` lists every disk of the
 overview with rates, utilization, await and fill level.
+`block_devices` remains a list of real block-device names; `accounting_keys`
+deduplicates ordinary filesystems by device and ZFS pools by `zfs:<pool>`.
+Update UI and helper together to get the new ZFS accounting; older clients
+do not understand pool-wide totals.
 
 Process rates come from the per-thread counters in
 **/proc/PID/task/TID/io**: `read_bytes` and `write_bytes` are bytes a thread
@@ -304,8 +320,13 @@ between two refreshes are not listed; their I/O remains in the device rates.
   its parent with `O_NOFOLLOW`), counts hard-linked files once, and never reads
   file contents. Sizes are allocated blocks (`du`) or apparent sizes (`du -b`).
 - Scans are bounded: 20 million entries, 15 minutes, 128 directory levels. The
-  retained tree keeps 20,000 directories, preferring shallower and then larger
-  ones, and at most 200 subdirectories per directory; the rest is summarized as
+  retained tree keeps 20,000 directories, sharing retention between top-level
+  subtrees and lending unused shares to others. Within each subtree it prefers
+  shallower and then larger directories, with at most 200 subdirectories per
+  directory. One home full of large directories cannot monopolize all retained
+  detail. If the root children themselves exceed a limit, some must still be
+  summarized; discarded details cannot be recovered during that scan.
+  The rest is summarized as
   "smaller dirs" and still counted in every total. Directories that could not be
   read are marked partial (`!`).
 - Growth columns compare each retained directory with the previous scan and the
@@ -353,6 +374,11 @@ bounds, and shutdown or fallback with a stopped or killed helper.
 [CI](.github/workflows/ci.yml) runs formatting, linting, tests on stable and
 Rust 1.88.0, the release build, the terminal and Setup checks, both container
 tests, ShellCheck and a dependency audit.
+
+Real hard-NFS outages and `/proc hidepid` policies are covered by the separate
+[disposable-VM tests](tests/kernel.md); [ZFS validation](tests/zfs.md) uses a
+disposable mirror with multiple datasets and a quota. These kernel scenarios
+were exercised on Ubuntu 24.04/KVM; they are not run in ordinary CI containers.
 
 </details>
 

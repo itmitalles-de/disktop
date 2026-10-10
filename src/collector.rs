@@ -25,6 +25,7 @@ use crate::{
     procio::ProcessTable,
     scanner::{self, HomeService, Limits, RootPolicy},
     text::sanitize,
+    zfs,
 };
 
 /// Large enough for mountinfo of container hosts with tens of thousands of
@@ -83,6 +84,7 @@ pub struct Collector {
     home: HomeScan,
     prober: MountProber,
     resolver: Resolver,
+    zfs: zfs::Pools,
 }
 
 impl Collector {
@@ -118,6 +120,7 @@ impl Collector {
             home: HomeScan::new(limits, privileged, policy, problem),
             prober: MountProber::default(),
             resolver: Resolver::default(),
+            zfs: zfs::Pools::default(),
         };
         // Establish baselines so the first visible sample has rates.
         collector
@@ -170,6 +173,9 @@ impl Collector {
             .iter()
             .map(|line| ((line.major, line.minor), line.name.as_str()))
             .collect();
+        if mount_list.iter().any(|mount| mount.fs_type == "zfs") {
+            self.zfs.refresh();
+        }
         let infos = &self.infos;
         let mount_device = |mount: &Mount| -> Option<String> {
             if mount.major != 0 {
@@ -207,6 +213,21 @@ impl Collector {
         };
         let mut mounts_by_device: HashMap<String, BTreeSet<String>> = HashMap::new();
         for mount in &mount_list {
+            if mount.fs_type == "zfs" {
+                let pool = self.zfs.get(&mount.source.to_string_lossy());
+                let point = mounts::display(&mount.mount_point);
+                for member in pool
+                    .members
+                    .into_iter()
+                    .filter(|name| infos.contains_key(name))
+                {
+                    mounts_by_device
+                        .entry(member)
+                        .or_default()
+                        .insert(point.clone());
+                }
+                continue;
+            }
             if let Some(device) = mount_device(mount) {
                 let point = mounts::display(&mount.mount_point);
                 for member in members_of(&device) {
@@ -304,7 +325,7 @@ impl Collector {
         // mount matching itself is lexical.
         let home_path =
             (!request.root.is_empty()).then(|| self.resolver.resolve(Path::new(&request.root)));
-        let filesystems = filesystems(
+        let mut filesystems = filesystems(
             &mount_list,
             &devices,
             home_path.as_deref(),
@@ -312,6 +333,26 @@ impl Collector {
             &members_of,
             &mut self.prober,
         );
+        for filesystem in &mut filesystems {
+            if filesystem.fs_type == "zfs" {
+                let mut pool = self.zfs.get(&filesystem.source);
+                let known: Vec<_> = pool
+                    .members
+                    .iter()
+                    .filter(|name| infos.contains_key(*name))
+                    .cloned()
+                    .collect();
+                if known.len() != pool.members.len() {
+                    pool.usage.error = Some("ZFS pool has members absent from diskstats".into());
+                }
+                filesystem.block_device = known.first().cloned();
+                filesystem.member_devices = known;
+                filesystem.zfs = Some(pool.usage);
+                // Process/device I/O cannot be attributed to a dataset.
+                filesystem.read_rate = None;
+                filesystem.write_rate = None;
+            }
+        }
         apply_usage(&mut devices, &members, &filesystems);
         let (processes, process_access) = self.processes.sample(self.privileged);
         let (home, home_tree) = self.home.sample(request);
@@ -515,6 +556,7 @@ fn filesystems(
             dev: format!("{}:{}", first.major, first.minor),
             block_device,
             member_devices,
+            zfs: None,
             read_only: first.read_only,
             total_bytes: usage.map(|usage| usage.total),
             used_bytes: usage.map(|usage| usage.used),
@@ -643,6 +685,11 @@ pub fn default_device(home_root: &str) -> Option<String> {
     // Home on NFS, tmpfs, overlay or FUSE has no disk to focus.
     let mount = mounts::containing(mounts::visible(&mount_list), &home)
         .filter(|mount| mounts::is_storage(mount))?;
+    // A pool/dataset source is not a local path. Pool discovery happens
+    // asynchronously during sampling; use the all-disks overview initially.
+    if mount.fs_type == "zfs" {
+        return None;
+    }
     let sysfs = Sysfs::default();
     let name = if mount.major != 0 {
         let link = fs::read_link(format!("/sys/dev/block/{}:{}", mount.major, mount.minor)).ok()?;
@@ -734,7 +781,7 @@ mod tests {
                 continue;
             };
             let device = snapshot.devices.iter().find(|device| &device.name == name);
-            if let (Some(device), Some(_)) = (device, filesystem.total_bytes) {
+            if let (Some(device), Some(_)) = (device, filesystem.accounting_usage()) {
                 assert!(device.usage.as_ref().unwrap().filesystems >= 1, "{name}");
             }
         }

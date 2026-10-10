@@ -212,15 +212,24 @@ impl ProcessTable {
     pub fn new(proc_root: impl Into<PathBuf>, resolve_users: bool) -> Self {
         // SAFETY: sysconf has no preconditions.
         let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        let proc_root = proc_root.into();
+        // Root is exempt from kernel hidepid; a direct unprivileged reader must
+        // still disclose restrictions even when hidepid=2 hides enumeration.
+        // SAFETY: getuid has no preconditions.
+        let own_uid = unsafe { libc::getuid() };
+        let hidepid = if own_uid == 0 {
+            Hidepid::Off
+        } else {
+            proc_hidepid(&proc_root)
+        };
         Self {
-            proc_root: proc_root.into(),
+            proc_root,
             previous: HashMap::new(),
             last: None,
             clock_ticks: if ticks > 0 { ticks as f64 } else { 100.0 },
             users: resolve_users.then(UserCache::default),
-            hidepid: Hidepid::Off,
-            // SAFETY: getuid has no preconditions.
-            own_uid: unsafe { libc::getuid() },
+            hidepid,
+            own_uid,
         }
     }
 
@@ -337,8 +346,16 @@ impl ProcessTable {
                 continue;
             };
             let directory = entry.path();
-            let Some(stat) = read_bytes(&directory.join("stat")) else {
-                continue; // Exited meanwhile.
+            let stat = match read_bytes_result(&directory.join("stat")) {
+                Ok(stat) => stat,
+                // hidepid=1 denies stat before the I/O read. Do not mistake
+                // such a process for one that exited between enumeration and
+                // sampling: its missing counters must remain visible.
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    unreadable += 1;
+                    continue;
+                }
+                Err(_) => continue,
             };
             let Some((name, start)) = parse_stat(&stat) else {
                 continue;
@@ -439,6 +456,16 @@ impl ProcessTable {
         let unreadable = unreadable + hidden_by_hidepid;
         let message = if hidden_by_hidepid > 0 {
             format!("{hidden_by_hidepid} processes of other users hidden by /proc hidepid")
+        } else if self.hidepid == Hidepid::Invisible && !privileged {
+            "Other users' processes hidden by /proc hidepid; total hidden count unavailable"
+                .to_owned()
+        } else if self.hidepid == Hidepid::NoAccess {
+            if privileged {
+                "Process I/O readable; other users' command lines hidden by /proc hidepid"
+                    .to_owned()
+            } else {
+                format!("{unreadable} processes unreadable under /proc hidepid")
+            }
         } else if privileged {
             "All processes readable (helper or root)".to_owned()
         } else if unreadable > 0 {
@@ -479,13 +506,15 @@ fn read_command(directory: &Path, name: &str) -> String {
 }
 
 fn read_bytes(path: &Path) -> Option<Vec<u8>> {
+    read_bytes_result(path).ok()
+}
+
+fn read_bytes_result(path: &Path) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    fs::File::open(path)
-        .ok()?
+    fs::File::open(path)?
         .take(MAX_PROC_READ)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    Some(bytes)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn read_text(path: &Path) -> io::Result<String> {
