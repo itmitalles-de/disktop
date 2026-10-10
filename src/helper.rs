@@ -23,8 +23,37 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// A request carries at most a 4 KiB home path plus small fields.
 pub const MAX_REQUEST: usize = 8 * 1024;
 /// Snapshots with a full home tree stay far below this bound.
-const MAX_RESPONSE: usize = 32 * 1024 * 1024;
+pub const MAX_RESPONSE: usize = 32 * 1024 * 1024;
 const REPLY_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Failures of the helper connection that the UI explains in its language.
+/// `Display` is the stable English text for stderr.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelperError {
+    NotInstalled,
+    TimedOut,
+    Exited,
+    Interrupted,
+    ResponseTooLarge,
+    ProtocolMismatch,
+}
+
+impl std::fmt::Display for HelperError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::NotInstalled => "helper is not installed",
+            Self::TimedOut => "helper timed out",
+            Self::Exited => "helper exited; rerun scripts/setup-helper.sh after updating",
+            Self::Interrupted => "helper interrupted",
+            Self::ResponseTooLarge => "helper response exceeds limit",
+            Self::ProtocolMismatch => {
+                "helper protocol mismatch; rerun scripts/setup-helper.sh after updating disktop"
+            }
+        })
+    }
+}
+
+impl std::error::Error for HelperError {}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -36,7 +65,7 @@ pub struct Request {
 impl Request {
     pub fn validate(&self) -> Result<()> {
         if self.version != PROTOCOL_VERSION {
-            bail!("helper protocol mismatch; rerun scripts/setup-helper.sh after updating disktop");
+            bail!(HelperError::ProtocolMismatch);
         }
         if !self.home.root.is_empty() {
             scanner::validate_root(&self.home.root)?;
@@ -80,7 +109,7 @@ pub fn read_frame(reader: &mut impl BufRead, max: usize) -> Result<Option<Vec<u8
 pub fn write_reply(writer: &mut impl Write, reply: &Reply) -> Result<()> {
     let bytes = serde_json::to_vec(reply)?;
     if bytes.len() >= MAX_RESPONSE {
-        bail!("helper response exceeds limit");
+        bail!(HelperError::ResponseTooLarge);
     }
     writer.write_all(&bytes)?;
     writer.write_all(b"\n")?;
@@ -121,7 +150,7 @@ pub struct Client {
 impl Client {
     pub fn start() -> Result<Self> {
         if !trusted_helper()? {
-            bail!("helper is not installed");
+            bail!(HelperError::NotInstalled);
         }
         let mut child = Command::new(HELPER_PATH)
             .arg("--stdio")
@@ -168,7 +197,7 @@ impl Client {
                 Ok(snapshot)
             }
             Reply::Error { version, message } if version == PROTOCOL_VERSION => bail!("{message}"),
-            _ => bail!("helper protocol mismatch; rerun scripts/setup-helper.sh"),
+            _ => bail!(HelperError::ProtocolMismatch),
         }
     }
 
@@ -177,10 +206,10 @@ impl Client {
         let mut bytes = Vec::new();
         loop {
             if interrupted() {
-                bail!("helper interrupted");
+                bail!(HelperError::Interrupted);
             }
             if Instant::now() >= deadline {
-                bail!("helper timed out");
+                bail!(HelperError::TimedOut);
             }
             let mut descriptor = libc::pollfd {
                 fd: self.output.as_raw_fd(),
@@ -203,11 +232,11 @@ impl Client {
             let mut chunk = [0u8; 65536];
             let count = self.output.read(&mut chunk)?;
             if count == 0 {
-                bail!("helper exited; rerun scripts/setup-helper.sh after updating");
+                bail!(HelperError::Exited);
             }
             bytes.extend_from_slice(&chunk[..count]);
             if bytes.len() > MAX_RESPONSE {
-                bail!("helper response exceeds limit");
+                bail!(HelperError::ResponseTooLarge);
             }
             if let Some(end) = chunk[..count].iter().position(|&byte| byte == b'\n') {
                 if end + 1 != count {
@@ -285,5 +314,59 @@ mod tests {
         };
         assert!(maximal.validate().is_ok());
         assert!(serde_json::to_vec(&maximal).unwrap().len() < MAX_REQUEST);
+    }
+
+    #[test]
+    fn largest_home_tree_reply_stays_well_below_the_response_limit() {
+        use crate::model::{DirNode, Folded, HomeReport};
+        // Worst case per node: a name of invalid bytes at the name cap, every
+        // number at its maximum, and the default node budget.
+        let limits = scanner::Limits::default();
+        let name = "\\xff".repeat(scanner::MAX_NAME_CHARS / 4);
+        let folded = Folded {
+            dirs: u64::MAX,
+            allocated: u64::MAX,
+            apparent: u64::MAX,
+            files: u64::MAX,
+        };
+        let count = limits.max_nodes;
+        let nodes: Vec<DirNode> = (0..count)
+            .map(|index| DirNode {
+                name: name.clone(),
+                children: if index == 0 {
+                    (1..count as u32).collect()
+                } else {
+                    Vec::new()
+                },
+                allocated: u64::MAX,
+                apparent: u64::MAX,
+                files: u64::MAX,
+                dirs: u64::MAX,
+                own_files: folded.clone(),
+                other: folded.clone(),
+                unreadable: u64::MAX,
+                truncated: true,
+                growth_previous: Some(i64::MIN),
+                growth_start: Some(i64::MIN),
+            })
+            .collect();
+        let snapshot = Snapshot {
+            home_tree: Some(HomeReport {
+                root: format!("/{}", "a".repeat(scanner::MAX_ROOT_BYTES - 1)),
+                nodes,
+                ..HomeReport::default()
+            }),
+            ..Snapshot::default()
+        };
+        let reply = Reply::Snapshot {
+            version: PROTOCOL_VERSION,
+            snapshot: Box::new(snapshot),
+        };
+        // About 17 MB with every number at its maximum; uncapped names of
+        // 1020 escape characters would need about 44 MB.
+        let size = serde_json::to_vec(&reply).unwrap().len();
+        assert!(size < MAX_RESPONSE * 3 / 5, "{size} bytes");
+        let mut out = Vec::new();
+        write_reply(&mut out, &reply).unwrap();
     }
 }

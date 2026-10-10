@@ -14,7 +14,8 @@ RD/WR/IO/US meters and a graph of 4-16 rows), then `Meters`, `Pair`, `Row`, then
 a scrolled `Row` grid with a "+N more" row; scrolling follows the focus. History
 is kept per device name (`App::history`), so focus changes keep every graph;
 the per-disk graph plots utilization and fill level on one 0-100% scale
-(stepped or Braille). RD/WR meters scale to each device's history peak. The
+(stepped or Braille). RD/WR meters of all disks share one scale, the highest
+rate of any overview device in the visible history (`rate_scale`). The
 process strip reserves `process_rows` (0-20; at most 3 below 20 body rows) and
 gets the rows the disks leave free; filesystems and home reserve half the body.
 It never derives or invents measurements. `demo.rs` holds the explicit
@@ -34,9 +35,19 @@ hangup slips into that window, and the dead terminal is not written to on exit; 
 
 `collector.rs` samples everything for one snapshot: `diskstats.rs` parses
 /proc/diskstats (14/18/20 fields, odd lines skipped), computes rates from
-checked deltas (any decrease = reset, rates `None`), reads static device facts
-from sysfs once per device name (hot-plug aware) and resolves partitions,
-holders and slaves to map mounts to devices and the home path to a whole disk.
+deltas (32-bit tick fields wrap; a decrease beyond a plausible wrap = reset,
+rates `None`), caches sysfs facts per device name and major:minor but re-reads
+size and dm/md label every sample, and resolves partitions (one map per
+sample), holders (cached per sample) and slaves to map mounts to devices and
+the home path to a whole disk. Devices with slaves and bcache/drbd/zd/nbd are
+kind `Stacked` (virtual). Multi-device btrfs maps to every member from
+/sys/fs/btrfs/<uuid>/devices; `DeviceUsage.block_devices` lets the all-disks
+total count such filesystems once. Pseudo-files are read up to 16 MiB, cut at
+the last complete line and listed in `Snapshot.truncated`. `probe.rs` keeps
+blocking calls off the sampling thread: lstat/statvfs of storage mounts run in a
+worker with a 0.5 s timeout (hung mounts become `not_responding` and are
+skipped until their one outstanding call returns, at most 64), and the home
+path is canonicalized off-thread and cached; mount matching is lexical.
 "All" aggregates non-virtual whole disks only. Each device's `usage`
 (`model::DeviceUsage::from_filesystems`) sums the statvfs values of the
 filesystems whose block device is the device, a partition or a holder, each
@@ -46,11 +57,16 @@ protocol and JSON stay at version 1. `collector::complete_storage` fills
 missing `usage`/`backing_disks` in a helper reply without privileges (the
 reply's own statvfs values, sysfs, /proc/swaps); `main.rs` then shows a
 one-time "helper is older" notice. `mounts.rs` parses mountinfo
-(octal escapes decoded), filters to storage filesystems (no pseudo, network or
+(octal escapes decoded, IDs and superblock options kept), drops over-mounted
+mounts (`visible`), filters to storage filesystems (no pseudo, network or
 FUSE mounts, no file bind mounts), dedupes bind mounts by (dev, root) and calls
-statvfs. `procio.rs` reads /proc/PID/stat, io and cmdline with bounded reads,
-keys baselines by (pid, start time), counts EACCES as hidden, and resolves user
-names only outside the helper.
+statvfs. The home filesystem is the longest visible mount prefix of any type,
+marked only if it is storage. `procio.rs` reads /proc/PID/stat, io and cmdline
+with bounded reads, keys baselines by (pid, start time), computes rates from
+per-thread /proc/PID/task/TID/io deltas keyed by (tid, start time) (read only
+when the process total changed; >10,000 threads fall back to the total), counts
+EACCES as hidden, resolves user names only outside the helper, and in the
+helper applies /proc's hidepid to other users (1: comm only, 2: omitted).
 
 `scanner.rs` runs the home scan in a `disktop-scan` thread (idle I/O priority,
 nice 10, only DAC_READ_SEARCH). It walks with fdopendir/readdir, fstatat
@@ -61,7 +77,15 @@ in a slab: per directory an exact streaming top-K, and globally an eviction
 that keeps shallower, then larger finished directories, so visit order does not
 decide what is shown; everything evicted is folded into the parent's summary.
 `HomeService` rescans periodically or on request, numbers reports by
-generation (only newer trees are sent), and annotates growth per retained path.
+generation (only newer trees are sent), and annotates growth per retained path
+(only for complete scans; budget-stopped scans are neither annotated nor a
+baseline). Names are capped at 256 characters. `RootPolicy` decides how roots
+open: `Follow` (UI, like du) or `Allowed` (helper: roots from the root-owned
+/etc/disktop/scan-roots, default /home, opened component by component with
+O_NOFOLLOW). `collector::HomeScan` drives the service from requests; a root the
+helper refuses (`HomeErrorKind::NotAllowed`) is scanned by the UI's own
+unprivileged `HomeScan` (`Source::Helper`), marked `helper_refused`. Home and
+helper errors carry kinds that `i18n.rs` translates.
 
 `helper.rs` and `bin/disktop-collector.rs` implement the optional root-owned
 helper: fixed path and ownership checks, cleared environment, `--stdio` only,
@@ -70,7 +94,10 @@ bounds, unknown fields rejected, a 10-second reply deadline with cancellation,
 and kill+reap on drop. `privilege.rs` keeps DAC_READ_SEARCH+SYS_PTRACE in the
 sampling thread and only DAC_READ_SEARCH in scanner threads, all with
 NO_NEW_PRIVS. `scripts/setup-helper.sh` builds unprivileged and installs with
-`cap_dac_read_search,cap_sys_ptrace=ep` after digest and ownership checks.
+`cap_dac_read_search,cap_sys_ptrace=ep`: root copies the build root-only, checks
+its digest, then sets group, mode and capabilities; it refuses shared primary
+groups (`--allow-shared-group`) and moving access to another group
+(`--allow-owner-change`). The administrator must trust the user's checkout.
 `text.rs` sanitizes every kernel- or user-controlled string for the terminal and
 formats units.
 

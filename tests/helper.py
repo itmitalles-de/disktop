@@ -37,6 +37,7 @@ READ_CAPS = (1 << 2) | (1 << 19)
 SCAN_CAPS = 1 << 2
 FILE_CAPS = "cap_dac_read_search,cap_sys_ptrace=ep"
 HOME = Path("/srv/disktop-home")
+SCAN_ROOTS = Path("/etc/disktop/scan-roots")
 SECRET_NAME = "secret-file-name-never-reported"
 MIB = 1024 * 1024
 
@@ -215,6 +216,71 @@ def check_home_scan(binary, account):
           "only directory names and sizes are returned")
 
 
+def write_scan_roots(text, mode=0o644):
+    SCAN_ROOTS.parent.mkdir(mode=0o755, exist_ok=True)
+    SCAN_ROOTS.write_text(text)
+    os.chown(SCAN_ROOTS, 0, 0)
+    SCAN_ROOTS.chmod(mode)
+
+
+def run_scan(binary, account, root, scan=True):
+    """Run --json for a home root; returns (exit code, snapshot or None, stderr)."""
+    arguments = ["--home-path", str(root), "--interval", "0.1"] + (["--scan-home"] if scan else [])
+    result = subprocess.run(
+        [str(binary), "--json", *arguments],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        **unprivileged(account),
+    )
+    snapshot = json.loads(result.stdout) if result.returncode == 0 else None
+    return result.returncode, snapshot, result.stderr
+
+
+def check_scan_roots(binary, account):
+    """The helper scans only roots in the root-owned allowlist (default
+    /home); other roots are scanned without privileges, and a symlink below
+    an allowed root cannot widen the helper's reach."""
+    escape = HOME / "bob" / "escape-to-root"
+    escape.symlink_to("/root")
+    Path("/root/disktop-test-private").mkdir(exist_ok=True)
+    try:
+        # Allowed below the listed root: privileged.
+        code, snapshot, errors = run_scan(binary, account, HOME / "bob")
+        assert code == 0 and snapshot["home_tree"]["privileged"], errors
+        assert not snapshot["home"].get("helper_refused"), snapshot["home"]
+        # /root is not listed: the helper refuses and the UI scans it itself,
+        # where nobody cannot read it.
+        code, snapshot, errors = run_scan(binary, account, "/root", scan=False)
+        assert code == 0, errors
+        home = snapshot["home"]
+        assert home["helper_refused"] and not home["privileged"], home
+        code, snapshot, errors = run_scan(binary, account, "/root")
+        assert code != 0 and "Permission denied" in errors, (code, errors)
+        assert "disktop-test-private" not in errors
+        # A symlink below an allowed root is not followed by the helper.
+        code, snapshot, errors = run_scan(binary, account, escape)
+        assert code != 0 and "Permission denied" in errors, (code, errors)
+        # Without the file only /home is allowed.
+        SCAN_ROOTS.unlink()
+        code, snapshot, errors = run_scan(binary, account, "/home")
+        assert code == 0 and snapshot["home_tree"]["privileged"], errors
+        code, snapshot, errors = run_scan(binary, account, HOME, scan=False)
+        assert code == 0 and snapshot["home"]["helper_refused"], snapshot["home"]
+        # A file others can write is ignored: nothing is scanned privileged.
+        write_scan_roots(f"{HOME}\n/home\n", mode=0o666)
+        for root in (HOME, "/home"):
+            code, snapshot, errors = run_scan(binary, account, root, scan=False)
+            assert code == 0 and snapshot["home"]["helper_refused"], snapshot["home"]
+    finally:
+        escape.unlink()
+        Path("/root/disktop-test-private").rmdir()
+        write_scan_roots(f"# test root\n{HOME}\n")
+    print("PASS scan roots: helper scans only allowlisted roots (default /home); /root, a symlink "
+          "escape and an unsafe allowlist fall back to unprivileged scans")
+
+
 def check_no_helper(binary, account):
     with tempfile.TemporaryFile(mode="w+") as output, tempfile.TemporaryFile(mode="w+") as errors:
         monitor = subprocess.Popen(
@@ -390,29 +456,75 @@ def check_abrupt_exit(binary, account):
         assert libc.prctl(36, previous_subreaper.value, 0, 0, 0) == 0
 
 
+INSTALLER_USERS = ("disktop-solo", "disktop-peer", "disktop-member")
+
+
+def add_installer_accounts():
+    """disktop-solo has a user-private primary group; the other two accounts
+    are added to that group later to make it shared."""
+    remove_installer_accounts()
+    subprocess.run(["groupadd", "disktop-solo"], check=True)
+    for name in INSTALLER_USERS:
+        subprocess.run(["useradd", "--no-create-home", "--shell", "/usr/sbin/nologin",
+                        "--gid", "disktop-solo" if name == "disktop-solo" else "nogroup", name], check=True)
+    return pwd.getpwnam("disktop-solo")
+
+
+def remove_installer_accounts():
+    for name in INSTALLER_USERS:
+        subprocess.run(["userdel", name], check=False, capture_output=True)
+    subprocess.run(["groupdel", "disktop-solo"], check=False, capture_output=True)
+
+
 def check_installer(script, build, account):
     digest = hashlib.sha256(build.read_bytes()).hexdigest()
-    command = ["bash", str(script), "--install", str(build), str(account.pw_uid), str(account.pw_gid), digest]
 
-    def install(success):
-        result = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False)
-        assert (result.returncode == 0) == success, f"Unexpected installer result: {result.stdout}{result.stderr}"
+    def install(success, *flags, owner=account, source=build, expect=None):
+        command = ["bash", str(script), "--install", str(source), str(owner.pw_uid), str(owner.pw_gid), digest, *flags]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+        output = result.stdout + result.stderr
+        assert (result.returncode == 0) == success, f"Unexpected installer result for {flags}: {output}"
+        assert expect is None or expect in output, f"Missing {expect!r} in installer output: {output}"
 
-    install(True)
-    installed = HELPER.stat()
-    assert installed.st_uid == 0 and installed.st_gid == account.pw_gid
-    assert installed.st_mode & 0o7777 == 0o750
-    assert RECEIPT.read_text().strip() == digest
-    subprocess.run(["setcap", "-v", FILE_CAPS, str(HELPER)], check=True, stdout=subprocess.DEVNULL)
-    getcap = subprocess.run(["getcap", str(HELPER)], capture_output=True, text=True, check=True).stdout
-    assert "net_raw" not in getcap and "dac_override" not in getcap, getcap
-    install(True)
+    def assert_installed(owner):
+        installed = HELPER.stat()
+        assert installed.st_uid == 0 and installed.st_gid == owner.pw_gid, (installed.st_uid, installed.st_gid)
+        assert installed.st_mode & 0o7777 == 0o750, oct(installed.st_mode)
+        assert RECEIPT.read_text().strip() == digest
+        subprocess.run(["setcap", "-v", FILE_CAPS, str(HELPER)], check=True, stdout=subprocess.DEVNULL)
+        getcap = subprocess.run(["getcap", str(HELPER)], capture_output=True, text=True, check=True).stdout
+        assert "net_raw" not in getcap and "dac_override" not in getcap, getcap
+
+    # nogroup is shared (sync, _apt) and not named after nobody, so the test
+    # account needs the explicit opt-in.
+    install(False, expect="Every member of this group could run the helper")
+    assert not os.path.lexists(HELPER), "Installer used a shared group without --allow-shared-group"
+    install(False, "--allow-owner-change", "--allow-shared-group")
+    install(False, "--allow-shared-group", "--allow-shared-group")
+    install(False, "--allow-any")
+    shared = "--allow-shared-group"
+    install(True, shared, expect="may be shared")
+    assert_installed(account)
+    install(True, shared)
     assert hashlib.sha256(HELPER.read_bytes()).hexdigest() == digest, "Clean update changed the binary"
+
+    # A symlinked source is refused, in the last component or in a parent.
+    link = build.with_name(build.name + ".link")
+    parent_link = build.parent / "parent-link"
+    link.symlink_to(build)
+    parent_link.symlink_to(build.parent)
+    try:
+        install(False, shared, source=link)
+        install(False, shared, source=parent_link / build.name, expect="free of symlinks")
+    finally:
+        link.unlink()
+        parent_link.unlink()
+    assert_installed(account)
 
     saved_receipt = RECEIPT.with_name(RECEIPT.name + ".test-backup")
     RECEIPT.rename(saved_receipt)
     try:
-        install(False)
+        install(False, shared)
     finally:
         saved_receipt.rename(RECEIPT)
 
@@ -420,25 +532,55 @@ def check_installer(script, build, account):
     HELPER.rename(saved_helper)
     try:
         HELPER.symlink_to(build)
-        install(False)
+        install(False, shared)
         assert HELPER.is_symlink(), "Installer replaced an untracked symlink"
     finally:
         HELPER.unlink()
         saved_helper.rename(HELPER)
 
+    # Moving access to another group needs --allow-owner-change; a private
+    # group needs no --allow-shared-group, but becomes shared by members.
+    solo_build = build.with_name(build.name + ".solo")
+    try:
+        solo = add_installer_accounts()
+        shutil.copy2(build, solo_build)
+        os.chown(solo_build, solo.pw_uid, solo.pw_gid)
+        install(False, owner=solo, source=solo_build, expect="--allow-owner-change")
+        assert_installed(account)
+        install(True, "--allow-owner-change", owner=solo, source=solo_build, expect="moving helper access")
+        assert_installed(solo)
+        install(True, owner=solo, source=solo_build)
+        # Supplementary membership and another account's primary group.
+        for change, undo, member in ((["--append", "--groups", "disktop-solo"], ["--groups", ""], "disktop-member"),
+                                     (["--gid", "disktop-solo"], ["--gid", "nogroup"], "disktop-peer")):
+            subprocess.run(["usermod", *change, member], check=True)
+            install(False, owner=solo, source=solo_build, expect=member)
+            install(True, shared, owner=solo, source=solo_build)
+            assert_installed(solo)
+            subprocess.run(["usermod", *undo, member], check=True)
+        install(True, owner=solo, source=solo_build)
+        install(False, shared, expect="--allow-owner-change")
+        assert_installed(solo)
+        install(True, shared, "--allow-owner-change")
+        assert_installed(account)
+    finally:
+        solo_build.unlink(missing_ok=True)
+        remove_installer_accounts()
+
     # A replacement must not silently erase a locally changed installed binary.
     with HELPER.open("ab") as stream:
         stream.write(b"changed-by-test")
     try:
-        install(False)
+        install(False, shared)
         assert HELPER.read_bytes().endswith(b"changed-by-test")
     finally:
         # Restore only this test-owned installation, then verify the normal path.
         HELPER.unlink()
         RECEIPT.unlink()
-        install(True)
-    print("PASS installer: root ownership, only DAC_READ_SEARCH+SYS_PTRACE, clean update and "
-          "changed/untracked/symlink refusal")
+        install(True, shared)
+    assert_installed(account)
+    print("PASS installer: root ownership, only DAC_READ_SEARCH+SYS_PTRACE, clean update, "
+          "changed/untracked/symlink refusal, shared-group and owner-change opt-ins")
 
 
 def check_terminal_hangup(binary, account):
@@ -478,6 +620,7 @@ def main():
     assert effective & required == required, "Container needs DAC_READ_SEARCH, SYS_PTRACE and SETFCAP"
     assert not os.path.lexists(HELPER) and not os.path.lexists(RECEIPT), "Refusing a pre-existing helper installation"
     assert not os.path.lexists(HOME), f"Refusing a pre-existing {HOME}"
+    assert not os.path.lexists(SCAN_ROOTS.parent), f"Refusing a pre-existing {SCAN_ROOTS.parent}"
     binary = args.binary.resolve(strict=True)
     helper_binary = args.helper_binary.resolve(strict=True)
     script = Path(__file__).resolve().parents[1] / "scripts/setup-helper.sh"
@@ -485,6 +628,8 @@ def main():
     assert account.pw_uid != 0 and account.pw_gid != 0
     try:
         make_home(account)
+        # The helper may scan the test tree only because it is listed here.
+        write_scan_roots(f"# test root\n{HOME}\n")
         with tempfile.TemporaryDirectory(prefix="disktop-helper-test-") as directory:
             # Source ownership is checked by the real installer; allow nobody to
             # traverse the test staging directory without making it writable.
@@ -503,6 +648,7 @@ def main():
                 check_threads(binary, account)
                 check_other_users(binary, account)
                 check_home_scan(binary, account)
+                check_scan_roots(binary, account)
                 check_no_helper(binary, account)
                 check_protocol(account)
                 check_stopped_helper(binary, account)
@@ -515,6 +661,7 @@ def main():
             if os.path.lexists(path):
                 path.unlink()
         shutil.rmtree(HOME, ignore_errors=True)
+        shutil.rmtree(SCAN_ROOTS.parent, ignore_errors=True)
     print("All capability helper checks passed.")
 
 

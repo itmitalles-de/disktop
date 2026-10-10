@@ -11,15 +11,15 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use crossterm::event::{self, Event, KeyEventKind};
 use disktop::{
-    collector::{Collector, complete_storage, default_device},
+    collector::{Collector, HomeScan, complete_storage, default_device},
     config::{ConfigFile, RootWithForeignSettings, Settings, SortKey, View},
     demo, diskstats,
-    helper::Client,
+    helper::{Client, HelperError},
     i18n::Lang,
-    model::{HomeReport, HomeRequest, ScanState, Snapshot},
+    model::{HomeErrorKind, HomeReport, HomeRequest, ScanState, Snapshot},
     scanner,
     shutdown::SignalGuard,
-    text::{format_bytes, format_count, format_rate, truncate},
+    text::{format_bytes, format_count, format_rate, pad, truncate},
     ui::{self, Action, App},
 };
 
@@ -117,10 +117,15 @@ fn parse_home_path(value: &str) -> Result<String, String> {
 enum Source {
     Live(Box<Collector>),
     /// `outdated` is set once a reply lacked fields that newer helpers send.
+    /// Home roots the helper may not scan are scanned by `local_home`
+    /// without privileges, as without the helper; `local` is true while it
+    /// does.
     Helper {
         client: Client,
         sysfs: diskstats::Sysfs,
         outdated: bool,
+        local_home: Box<HomeScan>,
+        local: bool,
     },
     Demo {
         tick: u64,
@@ -140,10 +145,44 @@ impl Source {
                 client,
                 sysfs,
                 outdated,
+                local_home,
+                local,
             } => {
                 let mut snapshot = client.sample(request, || shutdown.requested())?;
                 // An older helper sends no fill levels; they need no privilege.
                 *outdated |= complete_storage(sysfs, &mut snapshot);
+                let refused = snapshot
+                    .home
+                    .as_ref()
+                    .is_some_and(|status| status.error_kind == Some(HomeErrorKind::NotAllowed));
+                if refused {
+                    // Each scanner numbers its trees itself; a switch starts
+                    // from zero so the current tree is delivered.
+                    let mut own = request.clone();
+                    if !*local {
+                        own.known_generation = 0;
+                    }
+                    let (status, tree) = local_home.sample(&own);
+                    snapshot.home = status.map(|mut status| {
+                        status.helper_refused = true;
+                        status
+                    });
+                    snapshot.home_tree = tree;
+                    *local = true;
+                } else if *local {
+                    *local = false;
+                    **local_home = HomeScan::unprivileged();
+                    if request.scan && snapshot.home_tree.is_none() {
+                        let again = HomeRequest {
+                            known_generation: 0,
+                            rescan: false,
+                            ..request.clone()
+                        };
+                        let retry = client.sample(&again, || shutdown.requested())?;
+                        snapshot.home = retry.home;
+                        snapshot.home_tree = retry.home_tree;
+                    }
+                }
                 Ok(snapshot)
             }
             Self::Demo { tick, start } => {
@@ -289,6 +328,8 @@ fn main() -> Result<()> {
                 client,
                 sysfs: diskstats::Sysfs::default(),
                 outdated: false,
+                local_home: Box::new(HomeScan::unprivileged()),
+                local: false,
             },
             Err(error) => {
                 helper_error = Some(error);
@@ -324,7 +365,7 @@ fn main() -> Result<()> {
         Err(error) => return Err(error),
     };
     if let Some(error) = &helper_error
-        && !format!("{error:#}").contains("not installed")
+        && error.downcast_ref::<HelperError>() != Some(&HelperError::NotInstalled)
     {
         eprintln!("Helper: {error:#}. Run scripts/setup-helper.sh once; see README.");
     }
@@ -527,20 +568,25 @@ fn print_once(
             if !wait(Duration::from_millis(250), shutdown) {
                 return Ok(());
             }
-            let snapshot = match source.sample(&app.take_home_request(), shutdown) {
+            let snapshot = match sample_once(source, app, shutdown) {
                 Err(_) if shutdown.requested() => return Ok(()),
-                result => result?,
+                result => result?.0,
             };
             tree = snapshot.home_tree;
             last_status = snapshot.home;
         }
     }
-    if !wait(Duration::from_millis(app.settings.interval_ms), shutdown) {
-        return Ok(());
-    }
-    let mut snapshot = match source.sample(&app.take_home_request(), shutdown) {
-        Err(_) if shutdown.requested() => return Ok(()),
-        result => result?,
+    let mut snapshot = loop {
+        if !wait(Duration::from_millis(app.settings.interval_ms), shutdown) {
+            return Ok(());
+        }
+        match sample_once(source, app, shutdown) {
+            Err(_) if shutdown.requested() => return Ok(()),
+            // The replacement collector's rates would cover only the moment
+            // since it started; measure a whole interval again.
+            Ok((_, true)) => continue,
+            result => break result?.0,
+        }
     };
     if snapshot.home_tree.is_none() {
         snapshot.home_tree = tree;
@@ -555,6 +601,26 @@ fn print_once(
     };
     ignore_closed_output(written.and_then(|()| stdout.flush()))?;
     Ok(())
+}
+
+/// One sample for --once/--json. A failing helper is replaced by direct,
+/// unprivileged collection as in the interactive monitor; the flag is true
+/// when that happened.
+fn sample_once(
+    source: &mut Source,
+    app: &mut App,
+    shutdown: &SignalGuard,
+) -> Result<(Snapshot, bool)> {
+    match source.sample(&app.take_home_request(), shutdown) {
+        Ok(snapshot) => Ok((snapshot, false)),
+        Err(error) if !shutdown.requested() && source.is_helper() => {
+            eprintln!("{}", Lang::En.helper_failed(&format!("{error:#}")));
+            *source = direct_collector()?;
+            app.home_source_changed();
+            Ok((source.sample(&app.take_home_request(), shutdown)?, true))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// A reader that exits early, as in `disktop --json | head`, is not an error.
@@ -583,7 +649,7 @@ fn refresh(
     };
     let lang = app.lang();
     if !source.is_helper() {
-        app.show_error(lang.sample_failed(&format!("{error:#}")));
+        app.show_error(lang.sample_failed(&lang.error_text(&error)));
         return;
     }
     match fallback() {
@@ -595,15 +661,15 @@ fn refresh(
                 Ok(snapshot) => app.update(snapshot),
                 Err(_) if shutdown.requested() => return,
                 Err(retry) => {
-                    app.show_error(lang.sample_failed(&format!("{retry:#}")));
+                    app.show_error(lang.sample_failed(&lang.error_text(&retry)));
                     return;
                 }
             }
-            app.show_error(lang.helper_failed(&format!("{error:#}")));
+            app.show_error(lang.helper_failed(&lang.error_text(&error)));
         }
-        Err(fallback_error) => {
-            app.show_error(lang.sample_failed(&format!("{error:#}; {fallback_error:#}")))
-        }
+        Err(fallback_error) => app.show_error(
+            lang.sample_failed(&format!("{}; {fallback_error:#}", lang.error_text(&error))),
+        ),
     }
 }
 
@@ -712,6 +778,9 @@ fn print_snapshot(out: &mut impl Write, app: &App, snapshot: &Snapshot) -> io::R
         "disktop{}  {title}",
         if snapshot.demo { " DEMO" } else { "" }
     )?;
+    if !snapshot.truncated.is_empty() {
+        writeln!(out, "WARNING {}", Lang::En.truncated(&snapshot.truncated))?;
+    }
     match app.selected_rates() {
         Some(rates) => writeln!(
             out,
@@ -794,9 +863,9 @@ fn print_snapshot(out: &mut impl Write, app: &App, snapshot: &Snapshot) -> io::R
     for row in app.process_rows().into_iter().take(15) {
         writeln!(
             out,
-            "{:>8}  {:<12.12}  {:>12}  {:>12}  {}",
+            "{:>8}  {}  {:>12}  {:>12}  {}",
             row.pid,
-            row.user,
+            pad(&row.user, 12),
             optional_rate(row.read_rate),
             optional_rate(row.write_rate),
             truncate(&row.command, 60)
@@ -811,9 +880,9 @@ fn print_snapshot(out: &mut impl Write, app: &App, snapshot: &Snapshot) -> io::R
     for fs in app.filesystem_rows() {
         writeln!(
             out,
-            "{}{:<23}  {:<8.8}  {:>5}  {:>10}  {:>10}  {}",
+            "{}{}  {:<8.8}  {:>5}  {:>10}  {:>10}  {}{}",
             if fs.contains_home { "*" } else { " " },
-            truncate(&fs.mount_point, 23),
+            pad(&fs.mount_point, 23),
             fs.fs_type,
             fs.use_percent()
                 .map_or_else(|| "-".to_owned(), |value| format!("{value:.0}%")),
@@ -821,7 +890,12 @@ fn print_snapshot(out: &mut impl Write, app: &App, snapshot: &Snapshot) -> io::R
                 .map_or_else(|| "-".to_owned(), |value| format_bytes(value as f64)),
             fs.available_bytes
                 .map_or_else(|| "-".to_owned(), |value| format_bytes(value as f64)),
-            fs.block_device.as_deref().unwrap_or(&fs.source)
+            fs.block_device.as_deref().unwrap_or(&fs.source),
+            if fs.not_responding {
+                "  NOT RESPONDING"
+            } else {
+                ""
+            }
         )?;
     }
     if let Some(tree) = &snapshot.home_tree
@@ -990,5 +1064,14 @@ mod tests {
         let mut source = Source::Failing { helper: true };
         refresh(&mut source, &mut app, &shutdown, || bail!("no counters"));
         assert!(app.notice.as_deref().unwrap().contains("no counters"));
+
+        // --once/--json replace a failed helper the same way.
+        let mut app = App::new(None, Settings::default(), false);
+        let mut source = Source::Failing { helper: true };
+        let (snapshot, replaced) = sample_once(&mut source, &mut app, &shutdown).unwrap();
+        assert!(replaced && !snapshot.demo);
+        assert!(matches!(source, Source::Live(_)));
+        let mut source = Source::Failing { helper: false };
+        assert!(sample_once(&mut source, &mut app, &shutdown).is_err());
     }
 }

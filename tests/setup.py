@@ -37,7 +37,7 @@ def environment(config_home, **overrides):
     # Exercise the color setting independently of a CI runner's color policy.
     env.pop("NO_COLOR", None)
     # Keep the terminal text English regardless of the runner's locale.
-    for name in ("LC_ALL", "LC_MESSAGES", "LANG"):
+    for name in ("LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"):
         env.pop(name, None)
     env["LC_ALL"] = "C.UTF-8"
     for name, value in overrides.items():
@@ -306,7 +306,15 @@ def german_interface(binary, config_home):
         assert read_saved(path)["language"] == "en", read_saved(path)
         terminal.send(F10)
         terminal.quit()
-    print("PASS language: German from LANG, Setup switches to English and F12 saves it")
+    # gettext's LANGUAGE priority list wins over LANG, except in the C locale.
+    with Terminal(binary, config_home / "language", ready="Fokus".encode(), LC_ALL=None,
+                  LANG="en_US.UTF-8", LANGUAGE="de_DE:en") as terminal:
+        terminal.quit()
+    with Terminal(binary, config_home / "c-locale", ready=b"Focus", LC_ALL="C.UTF-8",
+                  LANGUAGE="de_DE") as terminal:
+        terminal.quit()
+    print("PASS language: German from LANG and from LANGUAGE (not in the C locale), "
+          "Setup switches to English and F12 saves it")
 
 
 def disk_overview(binary, config_home):

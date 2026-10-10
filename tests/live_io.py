@@ -6,6 +6,11 @@ Run only in an isolated container as root, for example:
   docker run --rm --network none -v "$PWD:/work:ro" disktop-test \
       python3 tests/live_io.py --isolated target/release/disktop
 
+Timing is not part of the assertions: disktop is run once before any I/O
+starts and once after the writer and reader have finished (while both are still
+alive, so their rows exist), and the cumulative kernel counters are compared.
+A rate over one fixed interval would depend on how slow the CI disk is.
+
 A writer process (unprivileged, separate PID) writes a file on the
 container's disk-backed overlay filesystem and fsyncs it; a reader process
 drops the file's clean pages with posix_fadvise and reads it back from
@@ -40,9 +45,10 @@ def become(account):
     assert libc.prctl(4, 1, 0, 0, 0) == 0  # PR_SET_DUMPABLE
 
 
-def writer(account, path, go, done, finish):
+def writer(account, path, ready, go, done, finish):
     become(account)
-    go.wait(10)
+    ready.set()
+    go.wait(60)
     chunk = os.urandom(MIB)
     with open(path, "wb") as stream:
         for _ in range(SIZE // MIB):
@@ -51,12 +57,13 @@ def writer(account, path, go, done, finish):
         os.fsync(stream.fileno())
     done.set()
     # Stay alive so disktop can read this process's counters at its sample.
-    finish.wait(20)
+    finish.wait(120)
 
 
-def reader(account, path, go, done, finish):
+def reader(account, path, ready, go, done, finish):
     become(account)
-    go.wait(10)
+    ready.set()
+    go.wait(60)
     descriptor = os.open(path, os.O_RDONLY)
     try:
         # Clean pages are dropped without privilege; reads then hit storage.
@@ -71,7 +78,7 @@ def reader(account, path, go, done, finish):
     finally:
         os.close(descriptor)
     done.set()
-    finish.wait(20)
+    finish.wait(120)
 
 
 def main():
@@ -88,53 +95,65 @@ def main():
     try:
         os.chown(work, account.pw_uid, account.pw_gid)
         path = work / "payload.bin"
-        write_go, write_done, read_go, read_done, finish = (mp.Event() for _ in range(5))
-        writing = mp.Process(target=writer, args=(account, path, write_go, write_done, finish))
-        reading = mp.Process(target=reader, args=(account, path, read_go, read_done, finish))
+        write_ready, write_go, write_done, read_ready, read_go, read_done, finish = (
+            mp.Event() for _ in range(7))
+        writing = mp.Process(target=writer, args=(account, path, write_ready, write_go, write_done, finish))
+        reading = mp.Process(target=reader, args=(account, path, read_ready, read_go, read_done, finish))
         writing.start()
         reading.start()
         config = work / "config"
         config.mkdir()
         os.chown(config, account.pw_uid, account.pw_gid)
-        monitor = subprocess.Popen(
-            [str(binary), "--json", "--no-helper", "--interval", "4", "--all-devices"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env={"PATH": "/usr/bin:/bin", "XDG_CONFIG_HOME": str(config), "LANG": "C"},
-            user=account.pw_uid,
-            group=account.pw_gid,
-            extra_groups=[],
-        )
-        # disktop takes its baseline sample immediately at startup.
-        time.sleep(1.0)
+
+        def sample():
+            # A short interval only bounds how long one run takes; the
+            # assertions use cumulative counters, never this interval.
+            result = subprocess.run(
+                [str(binary), "--json", "--no-helper", "--interval", "0.5", "--all-devices"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env={"PATH": "/usr/bin:/bin", "XDG_CONFIG_HOME": str(config), "LANG": "C"},
+                user=account.pw_uid,
+                group=account.pw_gid,
+                extra_groups=[],
+            )
+            assert result.returncode == 0, f"disktop failed: {result.stderr}"
+            return json.loads(result.stdout)
+
+        # Both processes must have dropped privileges (and be dumpable) so
+        # their /proc/PID/io is readable before the baseline is taken.
+        assert write_ready.wait(10) and read_ready.wait(10), "I/O processes did not start"
+        before = sample()
         write_go.set()
-        assert write_done.wait(10), "writer did not finish"
+        assert write_done.wait(60), "writer did not finish"
         read_go.set()
-        assert read_done.wait(10), "reader did not finish"
-        output, errors = monitor.communicate(timeout=15)
+        assert read_done.wait(60), "reader did not finish"
+        # The writer fsynced, so its data and the device counters are final.
+        snapshot = sample()
         finish.set()
-        assert monitor.returncode == 0, f"disktop failed: {errors}"
-        snapshot = json.loads(output)
-        interval = snapshot["interval"]
         rows = {row["pid"]: row for row in snapshot["processes"]}
+        old = {row["pid"]: row for row in before["processes"]}
         assert writing.pid in rows, f"writer PID {writing.pid} missing; access: {snapshot['process_access']}"
         assert reading.pid in rows, f"reader PID {reading.pid} missing"
-        written = rows[writing.pid]["write_rate"] * interval
+        assert writing.pid in old and reading.pid in old, "baseline rows missing"
+        written = rows[writing.pid]["write_bytes"] - old[writing.pid]["write_bytes"]
         assert SIZE * 0.95 <= written <= SIZE * 1.3, f"writer measured {written / MIB:.1f} MiB"
-        assert rows[writing.pid]["write_bytes"] >= SIZE
         assert rows[writing.pid]["user"] == "nobody", rows[writing.pid]
-        read = rows[reading.pid]["read_rate"] * interval
+        read = rows[reading.pid]["read_bytes"] - old[reading.pid]["read_bytes"]
         assert SIZE * 0.9 <= read <= SIZE * 1.3, f"reader measured {read / MIB:.1f} MiB from storage"
-        assert rows[reading.pid]["write_rate"] < MIB, "reader was charged with writes"
+        reader_written = rows[reading.pid]["write_bytes"] - old[reading.pid]["write_bytes"]
+        assert reader_written < MIB, "reader was charged with writes"
         print(f"PASS processes: writer {written / MIB:.1f} MiB written, reader {read / MIB:.1f} MiB read "
-              f"(expected {SIZE // MIB} MiB each) over {interval:.2f}s")
+              f"(expected {SIZE // MIB} MiB each)")
         disks = [d for d in snapshot["devices"]
                  if not d["partition"] and d["kind"] not in ("dm", "md", "loop", "zram", "ram")]
         assert disks, "no physical disks visible"
-        device_written = sum((d["rates"] or {}).get("write_rate", 0) for d in disks) * interval
+        old_disks = {d["name"]: d for d in before["devices"]}
+        device_written = sum(d["write_bytes"] - old_disks[d["name"]]["write_bytes"]
+                             for d in disks if d["name"] in old_disks)
         assert device_written >= SIZE * 0.9, f"physical disks wrote only {device_written / MIB:.1f} MiB"
-        print(f"PASS devices: physical disks wrote {device_written / MIB:.1f} MiB during the interval")
+        print(f"PASS devices: physical disks wrote {device_written / MIB:.1f} MiB during the test")
         # Capacity use is measured for every device; null would mean "not measured".
         assert all(d["usage"] is not None for d in snapshot["devices"]), "device usage missing"
         mounted = [d for d in snapshot["devices"] if d["usage"]["filesystems"] > 0]
