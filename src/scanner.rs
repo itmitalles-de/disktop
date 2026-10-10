@@ -1454,7 +1454,8 @@ mod tests {
         let allowed = tree.0.join("home");
         fs::create_dir_all(allowed.join("alice/docs")).unwrap();
         let outside = TempTree::new("policy-outside");
-        fs::write(outside.0.join("secret.bin"), vec![1u8; 8192]).unwrap();
+        // Large enough to stand out from directory blocks on any filesystem.
+        fs::write(outside.0.join("secret.bin"), vec![1u8; 1 << 20]).unwrap();
         symlink(&outside.0, allowed.join("alice/link")).unwrap();
         // A symlinked allowed root (/home -> /var/home) is resolved once.
         symlink(&allowed, tree.0.join("home-link")).unwrap();
@@ -1478,7 +1479,7 @@ mod tests {
             &AtomicU64::new(0),
         )
         .unwrap();
-        assert!(report.root_node().unwrap().allocated < 8192);
+        assert!(report.root_node().unwrap().allocated < 1 << 19);
         // Outside the list, and a symlink below an allowed root.
         assert!(!policy.allows(&outside.0));
         assert!(!policy.allows(&tree.0.join("home2")));
