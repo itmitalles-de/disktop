@@ -105,8 +105,9 @@ file capabilities are only `CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`.
   when absent, the legacy `/etc/disktop/scan-roots` is used if present.
   Only when both files are absent is `/home` the default. The file and its directories must be
   root-owned and not writable by group or others, otherwise nothing is scanned
-  with privileges. Below an allowed root the path is opened component by
-  component without following symlinks, so a link such as `/home/alice/x ->
+  with privileges. A policy larger than 64 KiB is rejected in its entirety;
+  its prefix is never interpreted as an allowlist. Below an allowed root the
+  path is opened component by component without following symlinks, so a link such as `/home/alice/x ->
   /root` is refused. For any other path the interface scans without the helper,
   as if it were not installed, and says so. An administrator adds roots with,
   for example, `echo /srv/home | sudo tee -a /etc/spctop/scan-roots` (create
@@ -303,11 +304,13 @@ between two refreshes are not listed; their I/O remains in the device rates.
   path; none is marked when the home path is on a network, memory or FUSE
   filesystem.
 - `stat`/`statvfs` of block-backed mounts (including FUSE block devices such as
-  ntfs-3g) run in a worker thread with a 0.5-second timeout. A mount that does
-  not answer, for example a stuck FUSE daemon or a failing disk, is shown as
+  ntfs-3g) run in worker threads sharing a 0.5-second budget per sample. A mount
+  that does not answer, for example a stuck FUSE daemon or a failing disk, is shown as
   `not responding` and skipped until its call returns; the monitor keeps running
   and `--once`/`--json` finish. The home path's symlinks are resolved off the
-  sampling thread, too.
+  sampling thread, too. Late results are retained for the next sample, with
+  one outstanding call per path, eight calls within their deadline and at most
+  64 outstanding calls overall. Rotating launches give later mounts a turn.
 - The home scan runs in a background thread with idle I/O priority. It stays on
   one filesystem, never follows symlinks (each directory is opened relative to
   its parent with `O_NOFOLLOW`), counts hard-linked files once, and never reads
@@ -323,7 +326,12 @@ between two refreshes are not listed; their I/O remains in the device rates.
   "smaller dirs" and still counted in every total. Directories that could not be
   read are marked partial (`!`).
 - Growth columns compare each retained directory with the previous scan and the
-  first scan of this session. Names are shown with control characters,
+  first scan of this session. Incomplete scans, including unreadable directories,
+  depth limits and hard-link tracking exhaustion, show unknown growth and do
+  not replace complete baselines. Folded detail with exact totals remains eligible.
+  Navigation and growth use an identity independent of the shortened display
+  name; a rescan returns navigation to the deepest surviving directory.
+  Names are shown with control characters,
   bidirectional overrides and invalid UTF-8 escaped (`\xNN`, `\u{NNNN}`).
 
 </details>

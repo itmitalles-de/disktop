@@ -36,7 +36,9 @@ deltas (32-bit tick fields wrap; a decrease beyond a plausible wrap = reset,
 rates `None`), caches sysfs facts per device name and major:minor but re-reads
 size and dm/md label every sample, and resolves partitions (one map per
 sample), holders (cached per sample) and slaves to map mounts to devices and
-the home path to a whole disk. Devices with slaves and bcache/drbd/zd/nbd are
+the home path to a whole disk. A bounded breadth-first traversal follows both
+partitions and holders at every level, including partitioned md/dm holders.
+Devices with slaves and bcache/drbd/zd/nbd are
 kind `Stacked` (virtual). Multi-device btrfs maps to every member from
 /sys/fs/btrfs/<uuid>/devices. `zfs.rs` discovers mounted pools asynchronously
 through a trusted root-owned `zpool list -H -p -L -P -v` executable, with a
@@ -52,8 +54,10 @@ device names for compatibility; the UI falls back to it for older helpers.
 Pseudo-files are read up to 16 MiB, cut at
 the last complete line and listed in `Snapshot.truncated`. `probe.rs` keeps
 blocking calls off the sampling thread: lstat/statvfs of storage mounts run in a
-worker with a 0.5 s timeout (hung mounts become `not_responding` and are
-skipped until their one outstanding call returns, at most 64), and the home
+worker with a shared 0.5 s budget per sample. Each path has at most one
+outstanding call; late results survive to the next sample. Launches rotate,
+with eight calls within their deadline and 64 outstanding overall. Hung or
+not-yet-probed mounts become `not_responding`. The home
 path is canonicalized off-thread and cached; mount matching is lexical.
 "All" aggregates non-virtual whole disks only. Each device's `usage`
 (`model::DeviceUsage::from_filesystems`) sums the statvfs values of the
@@ -94,12 +98,18 @@ necessarily summarized. Streaming evictions are irreversible, so surviving
 descendant names can still vary with traversal order.
 `HomeService` rescans periodically or on request, numbers reports by
 generation (only newer trees are sent), and annotates growth per retained path
-(only for complete scans; budget-stopped scans are neither annotated nor a
-baseline). Names are capped at 256 characters. `RootPolicy` decides how roots
+(only for complete scans; budget stops, partial roots and hard-link tracking
+exhaustion neither annotate growth nor replace a baseline). Folding detail
+with exact totals remains eligible. Display names are capped at 256 characters;
+an optional hex-encoded raw filename key (at most 510 ASCII bytes) identifies
+paths for growth/navigation. Legacy helper nodes fall back to their names.
+Breadcrumbs use display names, and new trees truncate navigation to the deepest
+surviving prefix. `RootPolicy` decides how roots
 open: `Follow` (UI, like du) or `Allowed` (helper: roots from the root-owned
 /etc/spctop/scan-roots, falling back to legacy /etc/disktop/scan-roots only
 when absent. /home is the default only if neither file exists; invalid policies
-fail closed. Roots are opened component by component with
+fail closed. Policy reads probe beyond 64 KiB and reject oversized files in
+their entirety. Roots are opened component by component with
 O_NOFOLLOW). `collector::HomeScan` drives the service from requests; a root the
 helper refuses (`HomeErrorKind::NotAllowed`) is scanned by the UI's own
 unprivileged `HomeScan` (`Source::Helper`), marked `helper_refused`. Home and

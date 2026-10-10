@@ -5,7 +5,7 @@
 //! `hw_sector_size` is reported for information only.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -381,8 +381,14 @@ impl Sysfs {
         }
     }
 
-    /// The device itself, its partitions and everything stacked above them.
-    pub fn descendants(&self, name: &str, partitions: &[String]) -> BTreeSet<String> {
+    /// The device itself, its partitions and everything stacked above them,
+    /// including partitions of intermediate holders. `partitions` covers all
+    /// devices in the sample, not just the starting disk.
+    pub fn descendants(
+        &self,
+        name: &str,
+        partitions: &HashMap<&str, Vec<String>>,
+    ) -> BTreeSet<String> {
         self.descendants_cached(name, partitions, &mut HashMap::new())
     }
 
@@ -391,20 +397,30 @@ impl Sysfs {
     pub fn descendants_cached(
         &self,
         name: &str,
-        partitions: &[String],
+        partitions: &HashMap<&str, Vec<String>>,
         holders: &mut HashMap<String, Vec<String>>,
     ) -> BTreeSet<String> {
         let mut found = BTreeSet::new();
-        let mut pending: Vec<(String, usize)> = vec![(name.to_owned(), 0)];
-        pending.extend(partitions.iter().map(|part| (part.clone(), 1)));
-        while let Some((device, depth)) = pending.pop() {
-            if found.len() >= 256 || !found.insert(device.clone()) || depth > MAX_STACK_DEPTH {
+        let mut queued = BTreeSet::from([name.to_owned()]);
+        let mut pending = VecDeque::from([(name.to_owned(), 0)]);
+        while let Some((device, depth)) = pending.pop_front() {
+            found.insert(device.clone());
+            if depth >= MAX_STACK_DEPTH {
                 continue;
             }
             let above = holders
                 .entry(device.clone())
                 .or_insert_with(|| self.holders(&device));
-            pending.extend(above.iter().map(|holder| (holder.clone(), depth + 1)));
+            let parts = partitions
+                .get(device.as_str())
+                .map_or(&[][..], Vec::as_slice);
+            // Breadth first reaches shared devices through their shortest
+            // path; cycles and the pending queue are bounded along with visits.
+            for next in parts.iter().take(256).chain(above.iter().take(256)) {
+                if queued.len() < 256 && queued.insert(next.clone()) {
+                    pending.push_back((next.clone(), depth + 1));
+                }
+            }
         }
         found
     }
@@ -658,7 +674,10 @@ mod tests {
         .into();
         assert_eq!(sysfs.backing_disks("dm-0", &infos), ["nvme0n1"]);
         assert_eq!(sysfs.backing_disks("nvme0n1", &infos), ["nvme0n1"]);
-        let descendants = sysfs.descendants("nvme0n1", &["nvme0n1p2".into()]);
+        let descendants = sysfs.descendants(
+            "nvme0n1",
+            &HashMap::from([("nvme0n1", vec!["nvme0n1p2".into()])]),
+        );
         assert_eq!(
             descendants.into_iter().collect::<Vec<_>>(),
             ["dm-0", "nvme0n1", "nvme0n1p2"]
@@ -743,6 +762,7 @@ mod tests {
         let md = root.join("devices/virtual/block/md0");
         let part = md.join("md0p1");
         let dm = root.join("devices/virtual/block/dm-0");
+        let dm_part = dm.join("dm-0p1");
         let mut disks = Vec::new();
         for name in ["sda", "sdb"] {
             let disk = root.join("devices/pci/ata").join(name);
@@ -752,10 +772,13 @@ mod tests {
         }
         for directory in [
             md.join("slaves"),
+            md.join("holders"),
             md.join("md"),
             part.join("holders"),
             dm.join("slaves"),
+            dm.join("holders"),
             dm.join("dm"),
+            dm_part.join("holders"),
             block.clone(),
             root.join("fs/btrfs/features"),
             root.join("fs/btrfs/1234-uuid/devices"),
@@ -764,13 +787,20 @@ mod tests {
             fs::create_dir_all(directory).unwrap();
         }
         for (name, disk) in ["sda", "sdb"].iter().zip(&disks) {
+            let partition = disk.join(format!("{name}1"));
+            fs::create_dir_all(partition.join("holders")).unwrap();
+            fs::write(partition.join("partition"), "1\n").unwrap();
             std::os::unix::fs::symlink(disk, block.join(name)).unwrap();
-            std::os::unix::fs::symlink(disk, md.join("slaves").join(name)).unwrap();
+            std::os::unix::fs::symlink(&partition, block.join(format!("{name}1"))).unwrap();
+            std::os::unix::fs::symlink(&partition, md.join("slaves").join(format!("{name}1")))
+                .unwrap();
+            std::os::unix::fs::symlink(&md, partition.join("holders/md0")).unwrap();
             std::os::unix::fs::symlink(disk, root.join("fs/btrfs/1234-uuid/devices").join(name))
                 .unwrap();
         }
         std::os::unix::fs::symlink(&disks[0], root.join("fs/btrfs/5678-uuid/devices/sda")).unwrap();
         fs::write(part.join("partition"), "1\n").unwrap();
+        fs::write(dm_part.join("partition"), "1\n").unwrap();
         fs::write(md.join("md/level"), "raid1\n").unwrap();
         fs::write(md.join("size"), "100\n").unwrap();
         fs::write(dm.join("dm/name"), "vg-home\n").unwrap();
@@ -778,17 +808,61 @@ mod tests {
         std::os::unix::fs::symlink(&md, block.join("md0")).unwrap();
         std::os::unix::fs::symlink(&part, block.join("md0p1")).unwrap();
         std::os::unix::fs::symlink(&dm, block.join("dm-0")).unwrap();
+        std::os::unix::fs::symlink(&dm_part, block.join("dm-0p1")).unwrap();
         std::os::unix::fs::symlink(&part, dm.join("slaves/md0p1")).unwrap();
+        std::os::unix::fs::symlink(&dm, part.join("holders/dm-0")).unwrap();
         let sysfs = Sysfs::at(&root);
-        let infos: HashMap<String, Info> = ["sda", "sdb", "md0", "md0p1", "dm-0"]
-            .into_iter()
-            .map(|name| (name.to_owned(), sysfs.info(name)))
-            .collect();
+        let infos: HashMap<String, Info> = [
+            "sda", "sda1", "sdb", "sdb1", "md0", "md0p1", "dm-0", "dm-0p1",
+        ]
+        .into_iter()
+        .map(|name| (name.to_owned(), sysfs.info(name)))
+        .collect();
         assert_eq!(infos["md0p1"].parent.as_deref(), Some("md0"));
         assert_eq!(infos["md0"].kind, DeviceKind::Md);
         // LVM on md0p1 is backed by the array's disks, not by md0.
         assert_eq!(sysfs.backing_disks("dm-0", &infos), ["sda", "sdb"]);
         assert_eq!(sysfs.backing_disks("md0p1", &infos), ["sda", "sdb"]);
+        assert_eq!(sysfs.backing_disks("dm-0p1", &infos), ["sda", "sdb"]);
+        let partitions = HashMap::from([
+            ("sda", vec!["sda1".into()]),
+            ("sdb", vec!["sdb1".into()]),
+            ("md0", vec!["md0p1".into()]),
+            ("dm-0", vec!["dm-0p1".into()]),
+        ]);
+        let mut holders = HashMap::new();
+        for (disk, partition) in [("sda", "sda1"), ("sdb", "sdb1")] {
+            let descendants = sysfs.descendants_cached(disk, &partitions, &mut holders);
+            assert_eq!(
+                descendants,
+                [disk, partition, "md0", "md0p1", "dm-0", "dm-0p1"]
+                    .map(str::to_owned)
+                    .into()
+            );
+            let usage = crate::model::DeviceUsage::from_filesystems(
+                &[
+                    crate::model::Filesystem {
+                        block_device: Some("md0p1".into()),
+                        total_bytes: Some(100),
+                        used_bytes: Some(50),
+                        available_bytes: Some(50),
+                        ..Default::default()
+                    },
+                    crate::model::Filesystem {
+                        block_device: Some("dm-0p1".into()),
+                        total_bytes: Some(40),
+                        used_bytes: Some(10),
+                        available_bytes: Some(30),
+                        ..Default::default()
+                    },
+                ],
+                &descendants,
+                false,
+            );
+            assert_eq!((usage.filesystems, usage.used_bytes), (2, 60));
+            assert_eq!(usage.block_devices, ["md0p1", "dm-0p1"]);
+            assert_eq!(usage.accounting_keys, ["md0p1", "dm-0p1"]);
+        }
         // Size and dm name follow resizes and renames without a new device.
         let mut mapper = infos["dm-0"].clone();
         assert_eq!(
@@ -807,5 +881,42 @@ mod tests {
         assert_eq!(members.len(), 2);
         assert_eq!(members["sdb"], ["sda", "sdb"]);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn descendant_traversal_bounds_cycles_and_uses_shortest_shared_paths() {
+        let sysfs = Sysfs::at(Path::new("/nonexistent-spctop-sysfs"));
+        let mut partitions = HashMap::from([
+            ("root", vec!["shortcut".to_owned()]),
+            ("shortcut", vec!["shared".to_owned()]),
+            ("shared", vec!["tail1".to_owned()]),
+            ("tail1", vec!["tail2".to_owned()]),
+            ("tail2", vec!["tail3".to_owned()]),
+            ("tail3", vec!["tail4".to_owned()]),
+            ("tail4", vec!["tail5".to_owned()]),
+            ("tail5", vec!["tail6".to_owned()]),
+            ("tail6", vec!["too-deep".to_owned()]),
+        ]);
+        let mut holders = HashMap::from([
+            ("root".into(), vec!["deep1".into()]),
+            ("deep1".into(), vec!["deep2".into()]),
+            ("deep2".into(), vec!["deep3".into()]),
+            ("deep3".into(), vec!["deep4".into()]),
+            ("deep4".into(), vec!["deep5".into()]),
+            ("deep5".into(), vec!["deep6".into()]),
+            ("deep6".into(), vec!["deep7".into()]),
+            ("deep7".into(), vec!["shared".into()]),
+            ("shared".into(), vec!["root".into()]),
+        ]);
+        let descendants = sysfs.descendants_cached("root", &partitions, &mut holders);
+        assert_eq!(descendants.len(), 16);
+        assert!(descendants.contains("tail6"));
+        assert!(!descendants.contains("too-deep"));
+        partitions.insert(
+            "root",
+            (0..1000).map(|index| format!("part{index}")).collect(),
+        );
+        let bounded = sysfs.descendants_cached("root", &partitions, &mut holders);
+        assert_eq!(bounded.len(), 256);
     }
 }

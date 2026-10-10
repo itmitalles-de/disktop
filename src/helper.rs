@@ -317,10 +317,11 @@ mod tests {
     }
 
     #[test]
-    fn largest_home_tree_reply_stays_well_below_the_response_limit() {
+    fn largest_home_tree_reply_with_identity_keys_fits_the_response_limit() {
         use crate::model::{DirNode, Folded, HomeReport};
         // Worst case per node: a name of invalid bytes at the name cap, every
-        // number at its maximum, and the default node budget.
+        // number at its maximum, a full 255-byte filename identity, and the
+        // default node budget. Identity does not depend on the display cap.
         let limits = scanner::Limits::default();
         let name = "\\xff".repeat(scanner::MAX_NAME_CHARS / 4);
         let folded = Folded {
@@ -333,6 +334,7 @@ mod tests {
         let nodes: Vec<DirNode> = (0..count)
             .map(|index| DirNode {
                 name: name.clone(),
+                key: Some("ff".repeat(255)),
                 children: if index == 0 {
                     (1..count as u32).collect()
                 } else {
@@ -362,10 +364,10 @@ mod tests {
             version: PROTOCOL_VERSION,
             snapshot: Box::new(snapshot),
         };
-        // About 17 MB with every number at its maximum; uncapped names of
-        // 1020 escape characters would need about 44 MB.
+        // Keep headroom for the rest of the snapshot without raising the
+        // protocol limit. Uncapped display names would exceed that limit.
         let size = serde_json::to_vec(&reply).unwrap().len();
-        assert!(size < MAX_RESPONSE * 3 / 5, "{size} bytes");
+        assert!(size < MAX_RESPONSE * 9 / 10, "{size} bytes");
         let mut out = Vec::new();
         write_reply(&mut out, &reply).unwrap();
     }

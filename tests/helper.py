@@ -302,6 +302,19 @@ def check_policy_migration(binary, account):
         expect("/home", True)
         expect(HOME, False)
 
+        # Truncating an oversized file exactly after '/' must not grant every
+        # directory. Exercise the real root-owned current and legacy policies,
+        # including refusal to fall back to a valid legacy policy.
+        oversized = "#" + "x" * 65533 + "\n/srv/private\n"
+        write_scan_roots(oversized)
+        for root in ("/etc", "/home", HOME):
+            expect(root, False)
+        SCAN_ROOTS.unlink()
+        write_scan_roots(oversized, path=LEGACY_SCAN_ROOTS)
+        for root in ("/etc", "/home", HOME):
+            expect(root, False)
+        write_scan_roots(f"{HOME}\n", path=LEGACY_SCAN_ROOTS)
+
         # Invalid new policy must not fall back to the valid restrictive old one.
         write_scan_roots("/home\n", mode=0o666)
         expect("/home", False)
@@ -349,7 +362,7 @@ def check_policy_migration(binary, account):
                     path.parent.chmod(0o755)
                     path.parent.rmdir()
         write_scan_roots(f"# test root\n{HOME}\n")
-    print("PASS policy migration: legacy restrictions, new precedence, invalid file/ancestor "
+    print("PASS policy migration: legacy restrictions, new precedence, oversized and invalid file/ancestor "
           "fail-closed behavior and safe /home default")
 
 
