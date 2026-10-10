@@ -74,4 +74,4 @@ mv -- "$staged_binary" "$destination"
 staged_binary=''
 mv -- "$staged_receipt" "$receipt"
 staged_receipt=''
-printf 'Installed %s\nStart: %s\nOptional one-time helper setup (all processes and home directories): %s/scripts/setup-helper.sh\n' "$destination" "$destination" "$repo_dir"
+printf 'Installed %s\nStart: %s\nOptional one-time helper setup (I/O of all processes; directory sizes below admin-approved roots, default /home): %s/scripts/setup-helper.sh\n' "$destination" "$destination" "$repo_dir"

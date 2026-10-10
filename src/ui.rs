@@ -27,8 +27,8 @@ use crate::{
     },
     scanner,
     text::{
-        format_bytes, format_bytes_short, format_bytes_tiny, format_count, format_delta,
-        format_duration, format_rate, format_short_count, truncate, truncate_left,
+        Columns, format_bytes, format_bytes_short, format_bytes_tiny, format_count, format_delta,
+        format_duration, format_rate, format_short_count, pad, truncate, truncate_left,
     },
 };
 
@@ -768,7 +768,10 @@ impl App {
                             return Action::HomeChanged;
                         }
                     }
-                    Err(error) => self.show_error(format!("{error:#}")),
+                    Err(error) => {
+                        let message = self.lang().root_error(error);
+                        self.show_error(message);
+                    }
                 }
             }
             KeyCode::Char(c)
@@ -1260,12 +1263,12 @@ fn draw_title(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Style::default().fg(Color::Yellow),
         ));
     }
-    let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+    let used: usize = spans.iter().map(|span| span.content.columns()).sum();
     // View tabs on the right; narrow terminals show only the current view.
     let views = [View::Processes, View::Filesystems, View::Home];
     let tabs_width: usize = views
         .iter()
-        .map(|view| view_label(*view, lang).chars().count() + 3)
+        .map(|view| view_label(*view, lang).columns() + 3)
         .sum();
     let mut right = Vec::new();
     if usize::from(area.width) >= used + tabs_width + 2 {
@@ -1280,14 +1283,11 @@ fn draw_title(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
     } else {
         let label = view_label(app.settings.view, lang);
-        if usize::from(area.width) >= used + label.chars().count() + 2 {
+        if usize::from(area.width) >= used + label.columns() + 2 {
             right.push(Span::styled(label.to_owned(), inverse(KEY)));
         }
     }
-    let right_width: u16 = right
-        .iter()
-        .map(|span| span.content.chars().count() as u16)
-        .sum();
+    let right_width: u16 = right.iter().map(|span| span.content.columns() as u16).sum();
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
     if right_width > 0 && right_width < area.width {
         frame.render_widget(
@@ -1315,7 +1315,7 @@ fn fit_pieces(pieces: Vec<String>, width: u16) -> String {
     for piece in pieces {
         if text.is_empty() {
             text = piece;
-        } else if text.chars().count() + 2 + piece.chars().count() <= usize::from(width) {
+        } else if text.columns() + 2 + piece.columns() <= usize::from(width) {
             text.push_str("  ");
             text.push_str(&piece);
         }
@@ -1329,6 +1329,39 @@ fn physical_disks(app: &App) -> impl Iterator<Item = &Device> {
         .devices
         .iter()
         .filter(|device| !device.partition && !device.kind.is_virtual())
+}
+
+/// Used and total bytes of the physical disks' filesystems. A filesystem on
+/// several disks (LVM, MD, btrfs RAID) counts once; replies from older
+/// helpers without the filesystem list are summed per disk.
+fn combined_usage(app: &App) -> (u64, u64) {
+    let mut seen = BTreeSet::new();
+    let (mut used, mut total) = (0u64, 0u64);
+    let mut add = |filesystem_used: u64, available: u64| {
+        used = used.saturating_add(filesystem_used);
+        total = total.saturating_add(filesystem_used.saturating_add(available));
+    };
+    for usage in physical_disks(app).filter_map(|device| device.usage.as_ref()) {
+        if usage.block_devices.is_empty() {
+            add(usage.used_bytes, usage.available_bytes);
+            continue;
+        }
+        for name in &usage.block_devices {
+            if !seen.insert(name.as_str()) {
+                continue;
+            }
+            if let Some((filesystem_used, available)) = app
+                .snapshot
+                .filesystems
+                .iter()
+                .filter(|filesystem| filesystem.block_device.as_ref() == Some(name))
+                .find_map(|filesystem| Some((filesystem.used_bytes?, filesystem.available_bytes?)))
+            {
+                add(filesystem_used, available);
+            }
+        }
+    }
+    (used, total)
 }
 
 /// The row below the title: details of the focused device, or of all disks.
@@ -1374,14 +1407,7 @@ fn summary_line(app: &App, width: u16) -> String {
                 .to_owned(),
             ),
         }
-        let (used, total) = physical_disks(app)
-            .filter_map(|device| device.usage.as_ref())
-            .fold((0u64, 0u64), |(used, total), usage| {
-                (
-                    used.saturating_add(usage.used_bytes),
-                    total.saturating_add(usage.used_bytes.saturating_add(usage.available_bytes)),
-                )
-            });
+        let (used, total) = combined_usage(app);
         if total > 0 {
             pieces.push(format!(
                 "{} {}/{}",
@@ -1493,23 +1519,19 @@ struct Meter {
 impl Meter {
     fn spans(&self, width: u16, short_label: bool) -> Vec<Span<'static>> {
         let label = if short_label { self.short } else { self.label };
-        let inner = usize::from(width).saturating_sub(label.chars().count() + 2);
+        let inner = usize::from(width).saturating_sub(label.columns() + 2);
         let mut spans = vec![Span::styled(label, Style::default().fg(self.color))];
-        if usize::from(width) < label.chars().count() + 2 {
+        if usize::from(width) < label.columns() + 2 {
             return spans;
         }
         let value = self
             .values
             .iter()
-            .find(|value| value.chars().count() + 2 <= inner)
-            .or_else(|| {
-                self.values
-                    .iter()
-                    .find(|value| value.chars().count() <= inner)
-            })
+            .find(|value| value.columns() + 2 <= inner)
+            .or_else(|| self.values.iter().find(|value| value.columns() <= inner))
             .cloned()
             .unwrap_or_else(|| truncate(self.values.last().map_or("", String::as_str), inner));
-        let text_start = inner - value.chars().count();
+        let text_start = inner - value.columns();
         let fill = ((self.ratio.clamp(0.0, 1.0) * inner as f64).round() as usize).min(text_start);
         spans.push(Span::raw("["));
         spans.push(Span::styled(
@@ -1536,18 +1558,24 @@ fn rate_values(rate: Option<f64>) -> Vec<String> {
     }
 }
 
-/// The RD, WR, IO and US meters of one device. RD and WR share a scale: the
-/// highest rate of this device within the visible history.
-fn disk_meters(app: &App, device: &Device) -> [Meter; 4] {
-    let lang = app.lang();
-    let rates = device.rates.as_ref();
-    let peak = app
-        .device_history(&device.name)
+/// The full scale of every RD and WR meter: the highest read or write rate
+/// of any device in the overview within the visible history, so equal bar
+/// lengths mean equal rates on every disk.
+fn rate_scale(app: &App) -> f64 {
+    app.overview_devices()
         .into_iter()
+        .filter_map(|device| app.device_history(&device.name))
         .flatten()
         .flat_map(|sample| [sample.read, sample.write])
         .flatten()
-        .fold(GRAPH_FLOOR, f64::max);
+        .fold(GRAPH_FLOOR, f64::max)
+}
+
+/// The RD, WR, IO and US meters of one device. RD and WR use `peak`, the
+/// shared scale of all disks from `rate_scale`.
+fn disk_meters(app: &App, device: &Device, peak: f64) -> [Meter; 4] {
+    let lang = app.lang();
+    let rates = device.rates.as_ref();
     let read = rates.map(|rates| rates.read_rate);
     let write = rates.map(|rates| rates.write_rate);
     let util = rates.map(|rates| rates.utilization_percent.clamp(0.0, 100.0));
@@ -1658,8 +1686,8 @@ fn disk_label(app: &App, device: &Device, width: u16, focused: bool) -> Line<'st
     }
     let width = usize::from(width);
     let name = truncate(&device.name, width);
-    let details = truncate(&details, width - name.chars().count());
-    let mut room = width - name.chars().count() - details.chars().count();
+    let details = truncate(&details, width - name.columns());
+    let mut room = width - name.columns() - details.columns();
     // Mounts before the model: they tell what the disk is used for. Mounts
     // that do not fit are counted as "+N".
     let mut mounts = String::new();
@@ -1671,7 +1699,7 @@ fn disk_label(app: &App, device: &Device, width: u16, focused: bool) -> Line<'st
             String::new()
         };
         let separator = if index == 0 { "  " } else { " " };
-        if mounts.chars().count() + separator.len() + mount.chars().count() + more.len() <= room {
+        if mounts.columns() + separator.len() + mount.columns() + more.len() <= room {
             mounts.push_str(separator);
             mounts.push_str(mount);
         } else {
@@ -1680,13 +1708,13 @@ fn disk_label(app: &App, device: &Device, width: u16, focused: bool) -> Line<'st
                 if index == 0 { "  " } else { " " },
                 device.mounts.len() - index
             );
-            if mounts.chars().count() + more.len() <= room {
+            if mounts.columns() + more.len() <= room {
                 mounts.push_str(&more);
             }
             break;
         }
     }
-    room -= mounts.chars().count();
+    room -= mounts.columns();
     let identity = if identity.is_empty() || room < 4 {
         String::new()
     } else {
@@ -1695,7 +1723,7 @@ fn disk_label(app: &App, device: &Device, width: u16, focused: bool) -> Line<'st
     if focused {
         // The focused disk is shown in reverse video across the whole row.
         let text = format!("{name}{details}{mounts}{identity}");
-        let used = text.chars().count();
+        let used = text.columns();
         return Line::from(vec![Span::styled(
             format!("{text}{}", " ".repeat(width - used)),
             inverse(KEY).add_modifier(Modifier::BOLD),
@@ -1730,10 +1758,11 @@ fn draw_disks(frame: &mut Frame<'_>, app: &App, area: Rect, layout: DiskLayout) 
     let height = layout.style.height();
     let first = app.disk_scroll * usize::from(columns);
     let shown = layout.visible_rows * usize::from(columns);
+    let scale = rate_scale(app);
     // Row style: one shared name width keeps the meters aligned.
     let name_width = devices
         .iter()
-        .map(|device| device.name.chars().count())
+        .map(|device| device.name.columns())
         .max()
         .unwrap_or(4)
         .clamp(4, if width < 44 { 7 } else { 12 }) as u16;
@@ -1750,7 +1779,16 @@ fn draw_disks(frame: &mut Frame<'_>, app: &App, area: Rect, layout: DiskLayout) 
             height,
         );
         let focused = app.device.as_deref() == Some(device.name.as_str());
-        draw_disk(frame, app, device, block, layout.style, focused, name_width);
+        draw_disk(
+            frame,
+            app,
+            device,
+            block,
+            layout.style,
+            focused,
+            name_width,
+            scale,
+        );
     }
     if layout.overflow() {
         let hidden = devices.len().saturating_sub(shown);
@@ -1781,6 +1819,7 @@ fn draw_disks(frame: &mut Frame<'_>, app: &App, area: Rect, layout: DiskLayout) 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_disk(
     frame: &mut Frame<'_>,
     app: &App,
@@ -1789,8 +1828,9 @@ fn draw_disk(
     style: BlockStyle,
     focused: bool,
     name_width: u16,
+    scale: f64,
 ) {
-    let meters = disk_meters(app, device);
+    let meters = disk_meters(app, device, scale);
     let line = |y: u16, x: u16, width: u16| Rect::new(x, area.y + y, width, 1);
     if style == BlockStyle::Row {
         let name_width = name_width.min(area.width.saturating_sub(1));
@@ -1801,8 +1841,7 @@ fn draw_disk(
             Style::default().add_modifier(Modifier::BOLD)
         };
         frame.render_widget(
-            Paragraph::new(format!("{name:<width$}", width = usize::from(name_width)))
-                .style(name_style),
+            Paragraph::new(pad(&name, usize::from(name_width))).style(name_style),
             line(0, area.x, name_width),
         );
         let rest = area.width.saturating_sub(name_width + 1);
@@ -2076,6 +2115,9 @@ fn status_line(app: &App) -> Option<(String, Color)> {
             KEY,
         ));
     }
+    if !app.snapshot.truncated.is_empty() {
+        return Some((lang.truncated(&app.snapshot.truncated), Color::Yellow));
+    }
     if app.demo || app.settings.view != View::Processes {
         return None; // DEMO is labeled in the title; other views show their own state.
     }
@@ -2293,13 +2335,20 @@ fn draw_filesystems(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
     let mount = |row: &Filesystem| {
         format!(
-            "{}{}",
+            "{}{}{}",
             if row.contains_home { "*" } else { " " },
-            row.mount_point
+            row.mount_point,
+            if row.not_responding {
+                format!("  {}", lang.not_responding())
+            } else {
+                String::new()
+            }
         )
     };
     let style = |row: &Filesystem| {
-        if row.contains_home {
+        if row.not_responding {
+            Style::default().fg(Color::Yellow)
+        } else if row.contains_home {
             Style::default().add_modifier(Modifier::BOLD)
         } else {
             Style::default()
@@ -2506,12 +2555,13 @@ fn home_header(app: &App, width: u16) -> (String, Color) {
         }
         Some(status) if status.state == ScanState::Failed => {
             text.push_str("  ");
-            text.push_str(
-                status
-                    .error
-                    .as_deref()
-                    .unwrap_or(lang.pick("scan failed", "Scan fehlgeschlagen")),
-            );
+            match (&status.error, status.error_kind) {
+                (Some(error), Some(kind)) => {
+                    text.push_str(&lang.home_error(kind, &status.root, error));
+                }
+                (Some(error), None) => text.push_str(error),
+                (None, _) => text.push_str(lang.pick("scan failed", "Scan fehlgeschlagen")),
+            }
             color = Color::Red;
         }
         Some(status) if status.state == ScanState::Done && width >= 80 => {
@@ -2530,12 +2580,17 @@ fn home_header(app: &App, width: u16) -> (String, Color) {
         }
         _ => {}
     }
+    if status.is_some_and(|status| status.helper_refused) {
+        text.push_str("  ");
+        text.push_str(&lang.helper_refused());
+        if color == Color::Reset {
+            color = Color::Yellow;
+        }
+    }
     if width >= 100 {
         text.push_str(lang.pick("  r rescan", "  r neu scannen"));
     }
-    let path_width = usize::from(width)
-        .saturating_sub(text.chars().count())
-        .max(8);
+    let path_width = usize::from(width).saturating_sub(text.columns()).max(8);
     (format!("{}{text}", truncate_left(&path, path_width)), color)
 }
 
@@ -2771,7 +2826,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn draw_key_bar(frame: &mut Frame<'_>, area: Rect, keys: &[(&str, &str)]) {
     let used: usize = keys
         .iter()
-        .map(|(key, label)| key.chars().count() + label.chars().count())
+        .map(|(key, label)| key.columns() + label.columns())
         .sum();
     let padding = usize::from(area.width).saturating_sub(used);
     let mut spans = Vec::new();
@@ -3053,7 +3108,7 @@ fn draw_setup(frame: &mut Frame<'_>, app: &App, area: Rect) {
     // Room for the longest category and the focus marker " >".
     let category_width = names
         .iter()
-        .map(|name| name.chars().count() as u16 + 2)
+        .map(|name| name.columns() as u16 + 2)
         .max()
         .unwrap_or(0)
         .max(12);
@@ -3093,7 +3148,7 @@ fn draw_setup(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Lang::De => format!("Optionen: {name}"),
     };
     // Narrow terminals show just the category rather than a cut-off header.
-    let header = if header.chars().count() > usize::from(panes[2].width) {
+    let header = if header.columns() > usize::from(panes[2].width) {
         name.to_owned()
     } else {
         header
@@ -3211,8 +3266,9 @@ const HELP_EN: &[&str] = &[
     "q / F10 / Ctrl-C Quit",
     "",
     "Every disk has its own block, like htop's CPU meters:",
-    "RD read and WR write (green / yellow), scaled to the disk's",
-    "highest rate in the visible history; IO utilization;",
+    "RD read and WR write (green / yellow), all disks on one",
+    "scale: the highest rate of any shown disk in the visible",
+    "history, so bars compare across disks; IO utilization;",
     "US fill level of the filesystems mounted from the disk,",
     "its partitions and dm/md devices (red from 90%). Not",
     "mounted disks say so; swap-only disks show swap.",
@@ -3264,8 +3320,9 @@ const HELP_DE: &[&str] = &[
     "q / F10 / Strg-C Beenden",
     "",
     "Jede Disk hat einen eigenen Block wie die CPU-Anzeigen",
-    "von htop: LE Lesen und SC Schreiben (grün / gelb), skaliert",
-    "auf die höchste Rate der Disk im sichtbaren Verlauf;",
+    "von htop: LE Lesen und SC Schreiben (grün / gelb), alle",
+    "Disks auf einer Skala: höchste Rate aller gezeigten Disks",
+    "im sichtbaren Verlauf, Balken sind vergleichbar;",
     "IO Auslastung; BL Füllstand der Dateisysteme der Disk,",
     "ihrer Partitionen und dm/md-Geräte (rot ab 90 %).",
     "Nicht eingehängte Disks sind markiert, reine Swap-Disks",
@@ -3671,6 +3728,65 @@ mod tests {
             .find(|y| buffer[(0, *y)].symbol() == "s" && buffer[(2, *y)].symbol() == "p")
             .unwrap();
         assert!(buffer[(0, row)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn read_and_write_meters_share_one_scale_across_disks() {
+        const MIB: f64 = 1024.0 * 1024.0;
+        let mut app = App::new(None, Settings::default(), true);
+        let mut snapshot = demo::snapshot(0, 0.0, "/home", 0);
+        snapshot
+            .devices
+            .retain(|device| device.name == "sda" || device.name == "sdb");
+        for device in &mut snapshot.devices {
+            let read = if device.name == "sda" {
+                MIB
+            } else {
+                40.0 * MIB
+            };
+            device.rates = Some(DeviceRates {
+                read_rate: read,
+                write_rate: read / 2.0,
+                ..DeviceRates::default()
+            });
+        }
+        for tick in 0..5 {
+            snapshot.elapsed = f64::from(tick);
+            app.update(snapshot.clone());
+        }
+        let scale = rate_scale(&app);
+        assert_eq!(scale, 40.0 * MIB, "the busiest disk sets the scale for all");
+        let sda = app
+            .snapshot
+            .devices
+            .iter()
+            .find(|d| d.name == "sda")
+            .unwrap();
+        let sdb = app
+            .snapshot
+            .devices
+            .iter()
+            .find(|d| d.name == "sdb")
+            .unwrap();
+        let [sda_read, sda_write, ..] = disk_meters(&app, sda, scale);
+        let [sdb_read, sdb_write, ..] = disk_meters(&app, sdb, scale);
+        assert_eq!((sdb_read.ratio, sdb_write.ratio), (1.0, 0.5));
+        assert_eq!((sda_read.ratio, sda_write.ratio), (1.0 / 40.0, 0.5 / 40.0));
+        // Rendered: sdb's read bar is far longer than sda's.
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        let bars: Vec<usize> = text
+            .lines()
+            .flat_map(|line| line.split("RD[").skip(1))
+            .map(|meter| meter.chars().take_while(|c| *c == '|').count())
+            .collect();
+        assert_eq!(bars.len(), 2, "{text}");
+        assert!(bars[0] <= 1 && bars[1] >= 12, "{bars:?}\n{text}");
+        // An idle overview keeps the floor instead of dividing by zero.
+        let mut idle = App::new(None, Settings::default(), true);
+        idle.update(demo::snapshot(0, 0.0, "/home", 0));
+        assert!(rate_scale(&idle) >= GRAPH_FLOOR);
     }
 
     #[test]

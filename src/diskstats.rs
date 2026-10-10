@@ -108,21 +108,41 @@ pub fn valid_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_graphic() && byte != b'/' && byte != b'\\')
 }
 
-/// Rates between two samples, or `None` if any cumulative counter went
-/// backwards (device re-created, driver reset, or 32-bit wrap).
+/// The kernel prints the I/O and sector counters as `unsigned long`: 32 bits
+/// on 32-bit kernels. A 32-bit build most likely runs on one.
+const IO_COUNTERS_WRAP: bool = cfg!(target_pointer_width = "32");
+
+/// Increase of a cumulative counter. The kernel prints the time fields
+/// (read/write/io/weighted ticks) as 32-bit `%u` on every architecture, so
+/// they wrap: weighted_ms about every 1.5 days at queue depth 32. With
+/// `may_wrap`, a decrease from a value that fits in 32 bits counts as a wrap
+/// when the wrapped increase is plausible (below 2^31); otherwise the device
+/// was re-created or reset and `None` is returned.
+fn counter_delta(old: u64, new: u64, may_wrap: bool) -> Option<u64> {
+    if let Some(delta) = new.checked_sub(old) {
+        return Some(delta);
+    }
+    let wrapped = (may_wrap && old <= u64::from(u32::MAX) && new <= u64::from(u32::MAX))
+        .then(|| new + (1u64 << 32) - old)?;
+    (wrapped < 1u64 << 31).then_some(wrapped)
+}
+
+/// Rates between two samples, or `None` if a cumulative counter went
+/// backwards by more than a 32-bit wrap (device re-created, driver reset).
 pub fn rates(previous: &Counters, current: &Counters, seconds: f64) -> Option<DeviceRates> {
     if !(seconds.is_finite() && seconds > 0.0) {
         return None;
     }
-    let delta = |old: u64, new: u64| new.checked_sub(old);
-    let reads = delta(previous.reads, current.reads)?;
-    let writes = delta(previous.writes, current.writes)?;
-    let sectors_read = delta(previous.sectors_read, current.sectors_read)?;
-    let sectors_written = delta(previous.sectors_written, current.sectors_written)?;
-    let read_ms = delta(previous.read_ms, current.read_ms)?;
-    let write_ms = delta(previous.write_ms, current.write_ms)?;
-    let io_ms = delta(previous.io_ms, current.io_ms)?;
-    let weighted_ms = delta(previous.weighted_ms, current.weighted_ms)?;
+    let count = |old, new| counter_delta(old, new, IO_COUNTERS_WRAP);
+    let ticks = |old, new| counter_delta(old, new, true);
+    let reads = count(previous.reads, current.reads)?;
+    let writes = count(previous.writes, current.writes)?;
+    let sectors_read = count(previous.sectors_read, current.sectors_read)?;
+    let sectors_written = count(previous.sectors_written, current.sectors_written)?;
+    let read_ms = ticks(previous.read_ms, current.read_ms)?;
+    let write_ms = ticks(previous.write_ms, current.write_ms)?;
+    let io_ms = ticks(previous.io_ms, current.io_ms)?;
+    let weighted_ms = ticks(previous.weighted_ms, current.weighted_ms)?;
     let milliseconds = seconds * 1000.0;
     let average = |ms: u64, count: u64| (count > 0).then(|| ms as f64 / count as f64);
     Some(DeviceRates {
@@ -174,7 +194,8 @@ pub fn aggregate<'a>(devices: impl IntoIterator<Item = &'a Device>) -> Option<De
     total
 }
 
-/// Static device facts that do not change while a device exists.
+/// Device facts from sysfs. `size_bytes` and `label` are refreshed every
+/// sample; the rest is cached per device number.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Info {
     pub kind: DeviceKind,
@@ -237,31 +258,40 @@ impl Sysfs {
                     "1" => Some(true),
                     _ => None,
                 });
-        let kind = classify(disk, rotational);
-        let label = match kind {
-            DeviceKind::Dm => self.read(name, "dm/name"),
-            DeviceKind::Md => self.read(name, "md/level"),
-            _ => None,
-        };
-        Info {
+        let kind = classify(disk, rotational, !self.slaves(disk).is_empty());
+        let mut info = Info {
             kind,
             partition,
             model: self.read(disk, "device/model"),
             vendor: self
                 .read(disk, "device/vendor")
                 .filter(|vendor| vendor != "ATA"),
-            label,
-            size_bytes: self
-                .read(name, "size")
-                .and_then(|value| value.parse::<u64>().ok())
-                .map(|sectors| sectors.saturating_mul(SECTOR_BYTES)),
+            label: None,
+            size_bytes: None,
             rotational,
             removable: self.read(disk, "removable").as_deref() == Some("1"),
             hw_sector_size: self
                 .read(disk, "queue/hw_sector_size")
                 .and_then(|value| value.parse().ok()),
             parent,
-        }
+        };
+        self.refresh(name, &mut info);
+        info
+    }
+
+    /// Re-read the facts that change while a device exists: media inserted
+    /// into a card reader, lvextend or mdadm --grow, losetup on an existing
+    /// loop device, a renamed dm device. Two small sysfs reads per device.
+    pub fn refresh(&self, name: &str, info: &mut Info) {
+        info.size_bytes = self
+            .read(name, "size")
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|sectors| sectors.saturating_mul(SECTOR_BYTES));
+        info.label = match info.kind {
+            DeviceKind::Dm => self.read(name, "dm/name"),
+            DeviceKind::Md => self.read(name, "md/level"),
+            _ => None,
+        };
     }
 
     /// Devices stacked on top of `name` (device mapper, MD), not including it.
@@ -288,6 +318,35 @@ impl Sysfs {
         names
     }
 
+    /// Members of every multi-device btrfs filesystem, from
+    /// /sys/fs/btrfs/<uuid>/devices: member name -> all members, sorted.
+    /// Single-device filesystems are left out.
+    pub fn btrfs_members(&self) -> HashMap<String, Vec<String>> {
+        let mut members = HashMap::new();
+        let Ok(filesystems) = fs::read_dir(self.root.join("fs/btrfs")) else {
+            return members;
+        };
+        for filesystem in filesystems.filter_map(Result::ok).take(256) {
+            let Ok(devices) = fs::read_dir(filesystem.path().join("devices")) else {
+                continue; // "features" and other non-filesystem entries
+            };
+            let mut names: Vec<String> = devices
+                .filter_map(Result::ok)
+                .take(256)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| valid_name(name))
+                .collect();
+            if names.len() < 2 {
+                continue;
+            }
+            names.sort();
+            for name in &names {
+                members.insert(name.clone(), names.clone());
+            }
+        }
+        members
+    }
+
     /// Physical whole disks below a device: a partition's disk, or the disks
     /// below a dm/md stack. Depth and fan-out are bounded.
     pub fn backing_disks(&self, name: &str, infos: &HashMap<String, Info>) -> Vec<String> {
@@ -307,7 +366,9 @@ impl Sysfs {
             return;
         }
         if let Some(parent) = infos.get(name).and_then(|info| info.parent.as_deref()) {
-            found.insert(parent.to_owned());
+            // A partition of a whole disk, or of an MD array (md0p1), whose
+            // own disks lie further below.
+            self.collect_backing(parent, infos, depth + 1, found);
             return;
         }
         let slaves = self.slaves(name);
@@ -322,6 +383,17 @@ impl Sysfs {
 
     /// The device itself, its partitions and everything stacked above them.
     pub fn descendants(&self, name: &str, partitions: &[String]) -> BTreeSet<String> {
+        self.descendants_cached(name, partitions, &mut HashMap::new())
+    }
+
+    /// `descendants` with a per-sample cache of holders listings, so each
+    /// device's holders directory is read once per sample.
+    pub fn descendants_cached(
+        &self,
+        name: &str,
+        partitions: &[String],
+        holders: &mut HashMap<String, Vec<String>>,
+    ) -> BTreeSet<String> {
         let mut found = BTreeSet::new();
         let mut pending: Vec<(String, usize)> = vec![(name.to_owned(), 0)];
         pending.extend(partitions.iter().map(|part| (part.clone(), 1)));
@@ -329,17 +401,17 @@ impl Sysfs {
             if found.len() >= 256 || !found.insert(device.clone()) || depth > MAX_STACK_DEPTH {
                 continue;
             }
-            pending.extend(
-                self.holders(&device)
-                    .into_iter()
-                    .map(|holder| (holder, depth + 1)),
-            );
+            let above = holders
+                .entry(device.clone())
+                .or_insert_with(|| self.holders(&device));
+            pending.extend(above.iter().map(|holder| (holder.clone(), depth + 1)));
         }
         found
     }
 }
 
-fn classify(name: &str, rotational: Option<bool>) -> DeviceKind {
+/// `has_slaves`: the device is built on other block devices (sysfs slaves/).
+fn classify(name: &str, rotational: Option<bool>, has_slaves: bool) -> DeviceKind {
     let digits_after = |prefix: &str| {
         name.strip_prefix(prefix)
             .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
@@ -356,6 +428,15 @@ fn classify(name: &str, rotational: Option<bool>) -> DeviceKind {
         DeviceKind::Md
     } else if digits_after("sr") {
         DeviceKind::Optical
+    } else if has_slaves
+        || digits_after("zd")
+        || digits_after("bcache")
+        || digits_after("drbd")
+        || digits_after("nbd")
+    {
+        // bcache, DRBD, ZFS volumes and network block devices: their I/O
+        // reappears on the disks below them or is not local disk I/O.
+        DeviceKind::Stacked
     } else if name.starts_with("nvme") {
         DeviceKind::Nvme
     } else {
@@ -585,10 +666,146 @@ mod tests {
         // A missing device yields defaults instead of errors.
         assert_eq!(sysfs.info("sdz").kind, DeviceKind::Other);
         fs::remove_dir_all(&root).unwrap();
-        assert_eq!(classify("md127", None), DeviceKind::Md);
-        assert_eq!(classify("mdx", None), DeviceKind::Other);
-        assert_eq!(classify("ram0", None), DeviceKind::Ram);
-        assert_eq!(classify("zram0", None), DeviceKind::Zram);
-        assert_eq!(classify("sda", Some(true)), DeviceKind::Hdd);
+        assert_eq!(classify("md127", None, true), DeviceKind::Md);
+        assert_eq!(classify("mdx", None, false), DeviceKind::Other);
+        assert_eq!(classify("ram0", None, false), DeviceKind::Ram);
+        assert_eq!(classify("zram0", None, false), DeviceKind::Zram);
+        assert_eq!(classify("sda", Some(true), false), DeviceKind::Hdd);
+        // Stacked devices without a dm/md name are virtual too.
+        for name in ["zd0", "zd16", "bcache0", "drbd1", "nbd0"] {
+            assert_eq!(
+                classify(name, Some(false), false),
+                DeviceKind::Stacked,
+                "{name}"
+            );
+            assert!(DeviceKind::Stacked.is_virtual());
+        }
+        assert_eq!(classify("sdq", Some(false), true), DeviceKind::Stacked);
+        assert_eq!(classify("nbdx", Some(false), false), DeviceKind::Ssd);
+    }
+
+    #[test]
+    fn time_fields_wrap_at_32_bits_without_dropping_throughput() {
+        let near = u64::from(u32::MAX) - 999;
+        let previous = Counters {
+            reads: 10,
+            sectors_read: 100,
+            read_ms: near,
+            io_ms: near,
+            weighted_ms: near,
+            ..Counters::default()
+        };
+        let current = Counters {
+            reads: 20,
+            sectors_read: 300,
+            // Wrapped past 2^32: 1000 to the top, then 500.
+            read_ms: 500,
+            io_ms: 500,
+            weighted_ms: 1500,
+            ..Counters::default()
+        };
+        let rates = rates(&previous, &current, 2.0).expect("a tick wrap is not a reset");
+        assert_eq!(rates.read_rate, 200.0 * 512.0 / 2.0);
+        assert_eq!(rates.read_await_ms, Some(150.0));
+        assert_eq!(rates.utilization_percent, 75.0);
+        assert_eq!(rates.queue_depth, 1.25);
+        // An implausible decrease (more than half the 32-bit range) is a reset.
+        let reset = Counters {
+            weighted_ms: 5,
+            ..previous
+        };
+        assert_eq!(
+            super::rates(
+                &Counters {
+                    weighted_ms: 1_000_000_000,
+                    ..previous
+                },
+                &reset,
+                1.0
+            ),
+            None
+        );
+        assert_eq!(counter_delta(u64::from(u32::MAX), 9, true), Some(10));
+        assert_eq!(counter_delta(u64::from(u32::MAX), 9, false), None);
+        assert_eq!(
+            counter_delta(1 << 40, 9, true),
+            None,
+            "64-bit values never wrap"
+        );
+        assert_eq!(counter_delta(1000, 10, true), None);
+    }
+
+    #[test]
+    fn partitions_of_md_arrays_reach_the_disks_and_btrfs_members_are_listed() {
+        let root = std::env::temp_dir().join(format!("disktop-sysfs-md-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let block = root.join("class/block");
+        let md = root.join("devices/virtual/block/md0");
+        let part = md.join("md0p1");
+        let dm = root.join("devices/virtual/block/dm-0");
+        let mut disks = Vec::new();
+        for name in ["sda", "sdb"] {
+            let disk = root.join("devices/pci/ata").join(name);
+            fs::create_dir_all(disk.join("holders")).unwrap();
+            fs::write(disk.join("size"), "100\n").unwrap();
+            disks.push(disk);
+        }
+        for directory in [
+            md.join("slaves"),
+            md.join("md"),
+            part.join("holders"),
+            dm.join("slaves"),
+            dm.join("dm"),
+            block.clone(),
+            root.join("fs/btrfs/features"),
+            root.join("fs/btrfs/1234-uuid/devices"),
+            root.join("fs/btrfs/5678-uuid/devices"),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        for (name, disk) in ["sda", "sdb"].iter().zip(&disks) {
+            std::os::unix::fs::symlink(disk, block.join(name)).unwrap();
+            std::os::unix::fs::symlink(disk, md.join("slaves").join(name)).unwrap();
+            std::os::unix::fs::symlink(disk, root.join("fs/btrfs/1234-uuid/devices").join(name))
+                .unwrap();
+        }
+        std::os::unix::fs::symlink(&disks[0], root.join("fs/btrfs/5678-uuid/devices/sda")).unwrap();
+        fs::write(part.join("partition"), "1\n").unwrap();
+        fs::write(md.join("md/level"), "raid1\n").unwrap();
+        fs::write(md.join("size"), "100\n").unwrap();
+        fs::write(dm.join("dm/name"), "vg-home\n").unwrap();
+        fs::write(dm.join("size"), "50\n").unwrap();
+        std::os::unix::fs::symlink(&md, block.join("md0")).unwrap();
+        std::os::unix::fs::symlink(&part, block.join("md0p1")).unwrap();
+        std::os::unix::fs::symlink(&dm, block.join("dm-0")).unwrap();
+        std::os::unix::fs::symlink(&part, dm.join("slaves/md0p1")).unwrap();
+        let sysfs = Sysfs::at(&root);
+        let infos: HashMap<String, Info> = ["sda", "sdb", "md0", "md0p1", "dm-0"]
+            .into_iter()
+            .map(|name| (name.to_owned(), sysfs.info(name)))
+            .collect();
+        assert_eq!(infos["md0p1"].parent.as_deref(), Some("md0"));
+        assert_eq!(infos["md0"].kind, DeviceKind::Md);
+        // LVM on md0p1 is backed by the array's disks, not by md0.
+        assert_eq!(sysfs.backing_disks("dm-0", &infos), ["sda", "sdb"]);
+        assert_eq!(sysfs.backing_disks("md0p1", &infos), ["sda", "sdb"]);
+        // Size and dm name follow resizes and renames without a new device.
+        let mut mapper = infos["dm-0"].clone();
+        assert_eq!(
+            (mapper.size_bytes, mapper.label.as_deref()),
+            (Some(50 * 512), Some("vg-home"))
+        );
+        fs::write(dm.join("size"), "80\n").unwrap();
+        fs::write(dm.join("dm/name"), "vg-data\n").unwrap();
+        sysfs.refresh("dm-0", &mut mapper);
+        assert_eq!(
+            (mapper.size_bytes, mapper.label.as_deref()),
+            (Some(80 * 512), Some("vg-data"))
+        );
+        // Only multi-device btrfs filesystems are listed, per member.
+        let members = sysfs.btrfs_members();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members["sdb"], ["sda", "sdb"]);
+        fs::remove_dir_all(&root).unwrap();
     }
 }

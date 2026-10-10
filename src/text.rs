@@ -1,5 +1,7 @@
 //! Terminal-safe text and unit formatting shared by the UI, `--once` and tests.
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 /// Make kernel- or user-controlled bytes (file names, mount points, command
 /// lines, sysfs strings) safe for a terminal while keeping them distinguishable.
 ///
@@ -189,30 +191,77 @@ fn scaled(
     }
 }
 
-/// Truncate to at most `width` characters, marking the cut with "~".
+/// Terminal columns of `text`: CJK and most emoji take two, combining marks
+/// none. Sanitized text has no control characters.
+pub fn width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+/// `width` as a method, for terminal layout code.
+pub trait Columns {
+    fn columns(&self) -> usize;
+}
+
+impl Columns for str {
+    fn columns(&self) -> usize {
+        width(self)
+    }
+}
+
+fn char_width(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// Truncate to at most `width` terminal columns, marking the cut with "~".
 pub fn truncate(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
+    if self::width(text) <= width {
         return text.to_owned();
     }
     if width == 0 {
         return String::new();
     }
-    let mut out: String = text.chars().take(width - 1).collect();
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let columns = char_width(c);
+        if used + columns > width - 1 {
+            break;
+        }
+        out.push(c);
+        used += columns;
+    }
     out.push('~');
     out
 }
 
 /// Keep the end of a path when it does not fit, as shells do in prompts.
 pub fn truncate_left(text: &str, width: usize) -> String {
-    let count = text.chars().count();
-    if count <= width {
+    if self::width(text) <= width {
         return text.to_owned();
     }
     if width == 0 {
         return String::new();
     }
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for c in text.chars().rev() {
+        let columns = char_width(c);
+        if used + columns > width - 1 {
+            break;
+        }
+        kept.push(c);
+        used += columns;
+    }
     let mut out = String::from("~");
-    out.extend(text.chars().skip(count - (width - 1)));
+    out.extend(kept.into_iter().rev());
+    out
+}
+
+/// Pad with spaces to exactly `width` columns, truncating if longer.
+pub fn pad(text: &str, width: usize) -> String {
+    let mut out = truncate(text, width);
+    let used = self::width(&out);
+    out.extend(std::iter::repeat_n(' ', width.saturating_sub(used)));
     out
 }
 
@@ -297,5 +346,14 @@ mod tests {
         assert_eq!(truncate("abcdef", 4), "abc~");
         assert_eq!(truncate("abc", 4), "abc");
         assert_eq!(truncate_left("/home/tim/projects", 8), "~rojects");
+        // Wide characters count as two columns.
+        assert_eq!(width("日本語"), 6);
+        assert_eq!(truncate("日本語ab", 5), "日本~");
+        assert_eq!(width(&truncate("日本語ab", 5)), 5);
+        assert_eq!(truncate("日本語ab", 4), "日~");
+        assert_eq!(truncate_left("ab日本語", 5), "~本語");
+        assert_eq!(pad("日本", 6), "日本  ");
+        assert_eq!(pad("日本語", 5), "日本~");
+        assert_eq!(width(&pad("x😀y", 3)), 3);
     }
 }

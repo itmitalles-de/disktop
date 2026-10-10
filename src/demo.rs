@@ -200,6 +200,7 @@ pub fn snapshot(tick: u64, elapsed: f64, home_root: &str, known_generation: u64)
             write_rate: rates.map(|rates| rates.write_rate),
             bind_mounts: 0,
             contains_home: home,
+            ..Filesystem::default()
         }
     };
     let filesystems = vec![
@@ -295,6 +296,7 @@ pub fn snapshot(tick: u64, elapsed: f64, home_root: &str, known_generation: u64)
             ..HomeStatus::default()
         }),
         home_tree: (generation > known_generation).then(|| home_tree(home_root, generation)),
+        truncated: Vec::new(),
     }
 }
 

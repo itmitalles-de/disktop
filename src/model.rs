@@ -22,6 +22,10 @@ pub enum DeviceKind {
     Zram,
     Ram,
     Optical,
+    /// Other devices stacked on block devices or backed by something else:
+    /// bcache, DRBD, ZFS volumes (zd*), network block devices (nbd), or any
+    /// device with slaves. Older releases do not know this value.
+    Stacked,
     #[default]
     Other,
 }
@@ -29,7 +33,7 @@ pub enum DeviceKind {
 impl DeviceKind {
     /// Device mapper and MD devices are stacked on other block devices.
     pub fn is_stacked(self) -> bool {
-        matches!(self, Self::Dm | Self::Md)
+        matches!(self, Self::Dm | Self::Md | Self::Stacked)
     }
 
     /// Loop, ram and zram devices are hidden unless the user asks for them.
@@ -41,7 +45,7 @@ impl DeviceKind {
     pub fn is_virtual(self) -> bool {
         matches!(
             self,
-            Self::Dm | Self::Md | Self::Loop | Self::Zram | Self::Ram
+            Self::Dm | Self::Md | Self::Stacked | Self::Loop | Self::Zram | Self::Ram
         )
     }
 
@@ -56,6 +60,7 @@ impl DeviceKind {
             Self::Zram => "ZRAM",
             Self::Ram => "RAM",
             Self::Optical => "OPTICAL",
+            Self::Stacked => "VIRT",
             Self::Other => "DISK",
         }
     }
@@ -91,6 +96,11 @@ pub struct DeviceUsage {
     pub available_bytes: u64,
     /// The device, a partition or a stacked device is active swap.
     pub swap: bool,
+    /// Block devices of the filesystems counted above, so totals over several
+    /// disks count a filesystem spanning them (LVM, btrfs RAID) once. Empty
+    /// from older helpers.
+    #[serde(default)]
+    pub block_devices: Vec<String>,
 }
 
 impl DeviceUsage {
@@ -118,9 +128,16 @@ impl DeviceUsage {
             let Some(device) = filesystem.block_device.as_ref() else {
                 continue;
             };
-            if !members.contains(device) || !seen.insert(device.clone()) {
+            // Multi-device btrfs counts on every member disk.
+            let on_member = members.contains(device)
+                || filesystem
+                    .member_devices
+                    .iter()
+                    .any(|member| members.contains(member));
+            if !on_member || !seen.insert(device.clone()) {
                 continue;
             }
+            usage.block_devices.push(device.clone());
             match (
                 filesystem.total_bytes,
                 filesystem.used_bytes,
@@ -212,6 +229,10 @@ pub struct Filesystem {
     pub dev: String,
     /// Block device in /proc/diskstats that backs this filesystem.
     pub block_device: Option<String>,
+    /// All devices of a multi-device btrfs filesystem, including
+    /// `block_device`; empty for single-device filesystems.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_devices: Vec<String>,
     pub read_only: bool,
     pub total_bytes: Option<u64>,
     pub used_bytes: Option<u64>,
@@ -224,6 +245,10 @@ pub struct Filesystem {
     pub bind_mounts: usize,
     /// This filesystem contains the configured home path.
     pub contains_home: bool,
+    /// stat/statvfs did not answer in time (hung NFS-like or FUSE storage,
+    /// failing disk); sizes are unknown until it answers again.
+    #[serde(default)]
+    pub not_responding: bool,
 }
 
 impl Filesystem {
@@ -265,6 +290,34 @@ pub struct HomeStatus {
     pub next_scan_in_seconds: Option<u64>,
     pub privileged: bool,
     pub error: Option<String>,
+    /// Machine-readable kind of `error`, for translation and for falling back
+    /// to an unprivileged scan of roots the helper may not scan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<HomeErrorKind>,
+    /// The helper may not scan this root, so the UI scans it unprivileged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub helper_refused: bool,
+}
+
+/// Why the home view has no scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HomeErrorKind {
+    /// Not 1 to 4096 bytes.
+    Length,
+    Relative,
+    ControlCharacters,
+    /// Trailing or double slashes.
+    NotNormalized,
+    /// "." or ".." components.
+    DotComponents,
+    /// The helper may scan only the roots in /etc/disktop/scan-roots, and
+    /// never through a symlink below them.
+    NotAllowed,
+    /// The scanner thread could not be started or prepared.
+    StartFailed,
+    /// The root could not be opened.
+    ScanFailed,
 }
 
 /// Why a scan stopped before visiting everything.
@@ -380,6 +433,10 @@ pub struct Snapshot {
     /// Present only when a newer scan finished than the requester knows.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub home_tree: Option<HomeReport>,
+    /// Kernel files that exceeded the read limit and were cut at the last
+    /// complete line, for example "/proc/self/mountinfo".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub truncated: Vec<String>,
 }
 
 /// What the UI asks the collector (in-process or helper) for.

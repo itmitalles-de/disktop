@@ -62,6 +62,20 @@
   actions as nettop), checks `site/CNAME` = `disktop.wutz.io` and probes the
   public HTTPS page after deploy. Review: `../disktop-review/site/`.
 
+- Branch `fix/review-round-1` (worktree `../disktop-worktrees/review-round-1`,
+  based on `main` a074399, uncommitted at hand-off): fixes the 23 findings of
+  review round 1 (hung-mount probing, per-thread process rates, 32-bit tick
+  wraps, refreshed sysfs facts, btrfs members, hidden mounts, 16 MiB pseudo
+  reads, one RD/WR scale for all disks, helper scan-root allowlist
+  /etc/disktop/scan-roots with O_NOFOLLOW walk and unprivileged fallback,
+  hidepid in the helper, shared-group/owner-change checks and safer ordering in
+  setup-helper.sh, width-aware truncation, translated backend errors and
+  LANGUAGE, --once/--json helper fallback, weekly audit, site link check).
+  Renders in `../disktop-review/round-1/`. The new JSON enum value `stacked`
+  makes an older UI fail to decode a newer helper's reply (it then falls back
+  to unprivileged collection); update both. Site screenshots still show the old
+  per-disk RD/WR scaling.
+
 ## Open / not yet done
 
 - Commit/PR for `feat/all-disks-overview` after owner review; then CI run.
@@ -73,8 +87,8 @@
   is issued. The repository is private (2026-10-10); nettop's Pages site is
   served from a public repository, so visibility or the org plan must allow it.
   The first deploy's HTTPS probe fails until DNS and the certificate work.
-- Overview: multi-device btrfs/ZFS fill level counts only on the disk named by
-  the mount source; swap detection only tested via unit data, not a real swap
+- Overview: multi-device ZFS fill level counts only on the disk named by the
+  mount source (btrfs members fixed on `fix/review-round-1`); swap detection only tested via unit data, not a real swap
   partition. nettop has the same terminal-hangup spin (fixed separately there).
 - Not verified on real hardware: md RAID, zram, removable hot-plug during a
   session, HDDs; a desktop install via `scripts/setup-helper.sh`.

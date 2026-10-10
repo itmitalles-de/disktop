@@ -7,6 +7,7 @@ pub mod i18n;
 pub mod model;
 pub mod mounts;
 pub mod privilege;
+pub mod probe;
 pub mod procio;
 pub mod scanner;
 pub mod shutdown;

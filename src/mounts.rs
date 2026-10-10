@@ -1,6 +1,7 @@
 //! Mounted filesystems from /proc/self/mountinfo and their usage via statvfs.
 
 use std::{
+    collections::{HashMap, HashSet},
     ffi::{CString, OsString},
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Component, Path, PathBuf},
@@ -8,10 +9,14 @@ use std::{
 
 use crate::text::sanitize_bytes;
 
-const MAX_MOUNTS: usize = 4096;
+/// Kubernetes nodes and container hosts can have tens of thousands of mounts.
+pub const MAX_MOUNTS: usize = 100_000;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Mount {
+    /// Mount ID and the ID of the mount it is attached to.
+    pub id: u32,
+    pub parent: u32,
     pub major: u32,
     pub minor: u32,
     /// Root of the mount within its filesystem ("/" unless a bind mount).
@@ -20,6 +25,8 @@ pub struct Mount {
     pub fs_type: String,
     pub source: PathBuf,
     pub read_only: bool,
+    /// Superblock options, for example `hidepid=2` on /proc.
+    pub super_options: String,
 }
 
 /// Parse mountinfo. Octal escapes (\040 space, \011 tab, \012 newline, \134
@@ -45,6 +52,8 @@ fn parse_line(line: &[u8]) -> Option<Mount> {
     let (major, minor) = devnum.split_once(':')?;
     let options = fields[5];
     Some(Mount {
+        id: std::str::from_utf8(fields[0]).ok()?.parse().ok()?,
+        parent: std::str::from_utf8(fields[1]).ok()?.parse().ok()?,
         major: major.parse().ok()?,
         minor: minor.parse().ok()?,
         root: PathBuf::from(OsString::from_vec(unescape(fields[3]))),
@@ -54,7 +63,53 @@ fn parse_line(line: &[u8]) -> Option<Mount> {
         read_only: options
             .split(|byte| *byte == b',')
             .any(|flag| flag == b"ro"),
+        super_options: fields
+            .get(separator + 3)
+            .map(|field| String::from_utf8_lossy(&unescape(field)).into_owned())
+            .unwrap_or_default(),
     })
+}
+
+/// Mounts that path lookups can reach. A mount is hidden when another mount
+/// sits on the same mount point on top of it (over-mounting), and so is
+/// everything attached below a hidden mount; statvfs on their path would
+/// report the covering filesystem instead.
+pub fn visible(mounts: &[Mount]) -> Vec<&Mount> {
+    let by_id: HashMap<u32, &Mount> = mounts.iter().map(|mount| (mount.id, mount)).collect();
+    let covered: HashSet<u32> = mounts
+        .iter()
+        .filter(|mount| mount.parent != mount.id)
+        .filter_map(|mount| {
+            by_id
+                .get(&mount.parent)
+                .filter(|parent| parent.mount_point == mount.mount_point)
+                .map(|parent| parent.id)
+        })
+        .collect();
+    let hidden = |mount: &Mount| {
+        // Walk up the mount tree: a mount is unreachable when it or an
+        // ancestor is covered, unless the step up is the covering mount
+        // itself. Bounded; IDs outside this namespace's list end the walk.
+        let mut current = mount;
+        for _ in 0..64 {
+            if covered.contains(&current.id) {
+                return true;
+            }
+            let Some(parent) = by_id
+                .get(&current.parent)
+                .filter(|parent| parent.id != current.id)
+            else {
+                return false;
+            };
+            if covered.contains(&parent.id) && parent.mount_point == current.mount_point {
+                // `current` is the mount that covers its parent.
+                return false;
+            }
+            current = parent;
+        }
+        false
+    };
+    mounts.iter().filter(|mount| !hidden(mount)).collect()
 }
 
 pub fn unescape(field: &[u8]) -> Vec<u8> {
@@ -174,23 +229,36 @@ pub fn statvfs(path: &Path) -> Option<Usage> {
 }
 
 /// The mount whose mount point is the longest prefix of `path`. Paths are
-/// compared component-wise, so /home2 never matches /home.
-pub fn containing<'a>(mounts: &'a [Mount], path: &Path) -> Option<&'a Mount> {
-    let path = normalize(path);
+/// compared component-wise, so /home2 never matches /home. The comparison is
+/// lexical and never touches the filesystem: resolving a path below a hung
+/// NFS or FUSE mount would block. Callers resolve symlinks (a /home symlink to
+/// /var/home is common) off the sampling thread, see `probe::Resolver`.
+/// Among mounts on the same mount point the last one, which covers the
+/// others, wins.
+pub fn containing<'a, 'b>(
+    mounts: impl IntoIterator<Item = &'a Mount>,
+    path: &'b Path,
+) -> Option<&'a Mount> {
+    let path = lexical(path);
     mounts
-        .iter()
+        .into_iter()
         .filter(|mount| path.starts_with(&mount.mount_point))
-        .max_by_key(|mount| mount.mount_point.components().count())
+        .fold(None, |best: Option<&Mount>, mount| match best {
+            Some(best)
+                if best.mount_point.components().count()
+                    > mount.mount_point.components().count() =>
+            {
+                Some(best)
+            }
+            _ => Some(mount),
+        })
 }
 
-/// Resolve symlinks when possible (a /home symlink to /var/home is common);
-/// otherwise keep the lexical path.
-pub fn normalize(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| {
-        path.components()
-            .filter(|component| !matches!(component, Component::CurDir))
-            .collect()
-    })
+/// Drop "." components; the path is otherwise used as given.
+pub fn lexical(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .collect()
 }
 
 pub fn display(path: &Path) -> String {
@@ -292,6 +360,33 @@ garbage line without separator\n\
         assert_eq!(home.mount_point, Path::new("/disktop-test-home"));
         let other = containing(&lexical, Path::new("/disktop-test-home2/tim")).unwrap();
         assert_eq!(other.mount_point, Path::new("/"));
+    }
+
+    #[test]
+    fn over_mounted_filesystems_are_hidden_and_matching_is_lexical() {
+        let mounts = parse(
+            b"22 1 259:4 / / rw - ext4 /dev/sda1 rw\n\
+40 22 8:17 / /mnt rw - ext4 /dev/sdb1 rw\n\
+41 40 8:18 / /mnt/inner rw - ext4 /dev/sdb2 rw\n\
+42 40 0:50 / /mnt rw - nfs4 server:/x rw\n\
+43 22 0:22 / /proc rw - proc proc rw,hidepid=invisible\n\
+44 22 8:33 / /srv rw - xfs /dev/sdc1 rw\n",
+        );
+        let ids: Vec<u32> = visible(&mounts).iter().map(|mount| mount.id).collect();
+        assert_eq!(
+            ids,
+            [22, 42, 43, 44],
+            "covered /mnt and everything below it are hidden"
+        );
+        assert_eq!(mounts[4].super_options, "rw,hidepid=invisible");
+        // Home on a network filesystem: the hit is the NFS mount, not "/".
+        let hit = containing(visible(&mounts), Path::new("/mnt/inner/tim")).unwrap();
+        assert_eq!(hit.fs_type, "nfs4");
+        assert!(!is_storage(hit));
+        // Paths are never resolved: a path below a hung mount cannot block.
+        let srv = containing(&mounts, Path::new("/srv/./data/x")).unwrap();
+        assert_eq!(srv.id, 44);
+        assert_eq!(lexical(Path::new("/a/./b")), Path::new("/a/b"));
     }
 
     #[test]

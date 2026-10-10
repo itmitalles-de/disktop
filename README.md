@@ -34,8 +34,8 @@ palette. The layout works in a split terminal, including 36 × 16.
 
 **Start without sudo.** The interface runs as your regular user and shows your
 own processes and the directories you can read. An optional one-time helper
-setup adds all users' processes and home directories; the interface itself never
-gains privileges.
+setup adds all users' processes and the directory sizes below administrator-
+approved roots (default `/home`); the interface itself never gains privileges.
 
 <p align="center">
   <img src="site/assets/disktop-demo.png" alt="disktop terminal showing four disks side by side, each with read, write, utilization and fill-level meters and a utilization and fill-level graph, above a process I/O table, with F2 Setup and F12 Save in the function-key bar" width="100%">
@@ -79,13 +79,42 @@ Without the helper, Linux only lets you read `/proc/PID/io` of your own
 processes and only scan directories you may read. disktop shows exactly that and
 says how many processes are hidden; it never fills the gap with estimates.
 
-`scripts/setup-helper.sh` builds as your regular user and requests
-administrator authentication through `pkexec` (or `sudo`) only to install
-`/usr/local/libexec/disktop-collector`, owned by root, mode `0750`, executable
-by root and your primary group. **Members of that group can see all processes'
-storage I/O and the names and sizes of all directories** (never file names or
-contents). Its file capabilities are only `CAP_DAC_READ_SEARCH` and
-`CAP_SYS_PTRACE`. The sampling thread keeps both to read other users'
+`scripts/setup-helper.sh [--allow-shared-group] [--allow-owner-change]` builds
+as your regular user and requests administrator authentication through `pkexec`
+(or `sudo`) only to install `/usr/local/libexec/disktop-collector`, owned by
+root, mode `0750`, executable by root and your primary group. **Members of that
+group can see all processes' storage I/O and the names and sizes of the
+directories below the allowed scan roots** (never file names or contents). Its
+file capabilities are only `CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`.
+
+- **Trust:** root runs the setup script from your checkout and installs the
+  binary you built, so the administrator who authenticates must trust that
+  checkout and build. The root side copies the build root-only first, checks it
+  against the digest of your build, refuses symlinked build paths, and only then
+  sets the group, mode and capabilities.
+- **Shared groups:** setup refuses a primary group that is or may be shared: its
+  name differs from your user name, it lists other members, other accounts use it
+  as primary group, or its members cannot be listed reliably. Use a user-private
+  group, or pass `--allow-shared-group` only if every member may see this.
+- **Owner change:** if the helper is already installed for another group (after
+  another user ran setup), setup refuses to move access unless
+  `--allow-owner-change` is given.
+- **Scan roots:** the helper scans only directories at or below the absolute
+  paths listed one per line in `/etc/disktop/scan-roots` (`#` comments allowed);
+  without the file only `/home` is allowed. The file and its directories must be
+  root-owned and not writable by group or others, otherwise nothing is scanned
+  with privileges. Below an allowed root the path is opened component by
+  component without following symlinks, so a link such as `/home/alice/x ->
+  /root` is refused. For any other path the interface scans without the helper,
+  as if it were not installed, and says so. An administrator adds roots with,
+  for example, `echo /srv/home | sudo tee -a /etc/disktop/scan-roots` (create
+  the file with `/home` first to keep the default).
+- **hidepid:** if `/proc` is mounted with `hidepid`, the helper keeps that policy
+  for other users' processes although `CAP_SYS_PTRACE` bypasses it:
+  `hidepid=1`/`noaccess` sends only their task name, never the command line;
+  `hidepid=2`/`invisible`/`ptraceable` omits them and counts them as hidden.
+  Members of the `gid=` group of the mount see everything, as without the helper.
+ The sampling thread keeps both to read other users'
 `/proc/PID/io`; the home scanner thread keeps only `CAP_DAC_READ_SEARCH`. Both
 set `NO_NEW_PRIVS`; core dumps are disabled and the inherited environment is
 cleared at start.
@@ -149,8 +178,9 @@ Every whole disk has its own block: a label row (name, type, size, mounts and
 model) and four htop-style meters with their current values,
 `RD[|||||   12.3 MiB/s]`:
 
-- **RD** read and **WR** write (green / yellow; German LE / SC), scaled to the
-  disk's highest rate in the visible history.
+- **RD** read and **WR** write (green / yellow; German LE / SC). All disks share
+  one scale, the highest read or write rate of any shown disk in the visible
+  history, so equal bar lengths mean equal rates on every disk.
 - **IO** utilization (cyan).
 - **US** fill level (magenta, red from 90 %; German BL): used and total space of
   the filesystems mounted from the disk, its partitions and stacked devices
@@ -214,28 +244,40 @@ directory.
 
 Device rates are deltas of the kernel's **/proc/diskstats** counters, whose
 sectors are always 512 bytes. Utilization is the share of time with requests in
-flight; await is the average request time; `qd` the average queue depth. A
-counter reset or a re-plugged device shows `-` for one interval instead of a
-wrong rate. **All** adds physical whole disks only, since partitions, device
+flight; await is the average request time; `qd` the average queue depth. The
+kernel prints the time counters as 32-bit values; their wrap (about every 1.5
+days for the queue-depth counter under load) is handled. A counter reset or a
+re-plugged device shows `-` for one interval instead of a wrong rate. Size and
+device-mapper names are re-read every refresh, so inserted media, resized or
+renamed volumes show their current values. **All** adds physical whole disks only, since partitions, device
 mapper (LVM, LUKS) and MD RAID would count the same I/O twice.
 
 The fill level comes from `statvfs` of the filesystems listed in the
 Filesystems view, mapped to disks through partitions and holders in sysfs.
 Like `df`'s Use%, it is used / (used + available), so blocks reserved for root
-count as full and the shown total is used + available. A filesystem spanning
-several disks (btrfs, ZFS) is counted on the disk its mount source names. Swap
+count as full and the shown total is used + available. A multi-device btrfs
+filesystem counts on each of its member disks; the all-disks total counts a
+filesystem spanning several disks (btrfs, LVM, MD) once. ZFS pools count on the
+disk their mount source names. Swap
 partitions come from `/proc/swaps` and are not part of the fill level.
 
 `--json` adds a `usage` object to every device (`filesystems`, `unmeasured`,
-`total_bytes`, `used_bytes`, `available_bytes`, `swap`; `null` when not
-measured, for example by a helper from an older release) and `backing_disks`,
-the whole disks below a dm or md device. The document version
+`total_bytes`, `used_bytes`, `available_bytes`, `swap`, `block_devices`; `null`
+when not measured, for example by a helper from an older release) and
+`backing_disks`, the whole disks below a dm, md or other stacked device (bcache,
+DRBD, ZFS volumes and nbd are kind `stacked`, shown as `VIRT`). Filesystems
+carry `not_responding` and, for multi-device btrfs, `member_devices`; a snapshot
+lists kernel files that exceeded the 16 MiB read limit in `truncated`. The document version
 stays 1 because fields are only added. `--once` lists every disk of the
 overview with rates, utilization, await and fill level.
 
-Process rates come from **/proc/PID/io**: `read_bytes` and `write_bytes` are
-bytes a process caused to be read from or dirtied for storage, across all
-devices. **They cannot be attributed to a device**, exclude page-cache hits, and
+Process rates come from the per-thread counters in
+**/proc/PID/task/TID/io**: `read_bytes` and `write_bytes` are bytes a thread
+caused to be read from or dirtied for storage, across all devices. The process
+total in /proc/PID/io (shown as the cumulative `read_bytes`/`write_bytes` in
+`--json`) also contains the lifetime I/O of reaped children, so a shell would
+otherwise show a finished `cp`'s gigabytes in one interval. I/O of a thread in
+its last interval before it exits is not shown. **They cannot be attributed to a device**, exclude page-cache hits, and
 count writes when data is dirtied rather than at writeback. Cancelled writes
 (dirty data truncated before writeback) are charged to the truncating process,
 which need not be the writer, so they are shown separately. Processes that exit
@@ -246,9 +288,17 @@ between two refreshes are not listed; their I/O remains in the device rates.
 
 - Filesystems lists block-backed mounts plus btrfs and ZFS. Pseudo and memory
   filesystems (proc, tmpfs, overlay, …) are skipped, as are network and FUSE
-  filesystems, because `statvfs` on an unreachable server can hang. Bind mounts
-  of the same filesystem root are shown once. `*` marks the filesystem that
-  contains the home path.
+  filesystems, because `statvfs` on an unreachable server can hang. Over-mounted
+  filesystems, which no path reaches, are skipped; bind mounts of the same
+  filesystem root are shown once. `*` marks the filesystem that contains the home
+  path; none is marked when the home path is on a network, memory or FUSE
+  filesystem.
+- `stat`/`statvfs` of block-backed mounts (including FUSE block devices such as
+  ntfs-3g) run in a worker thread with a 0.5-second timeout. A mount that does
+  not answer, for example a stuck FUSE daemon or a failing disk, is shown as
+  `not responding` and skipped until its call returns; the monitor keeps running
+  and `--once`/`--json` finish. The home path's symlinks are resolved off the
+  sampling thread, too.
 - The home scan runs in a background thread with idle I/O priority. It stays on
   one filesystem, never follows symlinks (each directory is opened relative to
   its parent with `O_NOFOLLOW`), counts hard-linked files once, and never reads

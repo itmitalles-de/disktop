@@ -22,14 +22,23 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use crate::{
-    model::{DirNode, Folded, HomeReport, HomeStatus, ScanState, StopReason},
+    model::{DirNode, Folded, HomeErrorKind, HomeReport, HomeStatus, ScanState, StopReason},
     text::{sanitize, sanitize_bytes},
 };
 
 pub const MAX_ROOT_BYTES: usize = 4096;
+/// Longest retained directory name in characters. A name of 255 invalid
+/// bytes would otherwise become 1020 characters of escapes, and 20,000 such
+/// nodes would approach the helper's response limit.
+pub const MAX_NAME_CHARS: usize = 256;
+/// Root-owned list of the trees the helper may scan, one absolute path per
+/// line; `#` starts a comment. Without the file only /home is allowed.
+pub const SCAN_ROOTS_PATH: &str = "/etc/disktop/scan-roots";
+pub const DEFAULT_SCAN_ROOTS: &[&str] = &["/home"];
+const MAX_SCAN_ROOTS: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct Limits {
@@ -60,30 +69,286 @@ impl Default for Limits {
     }
 }
 
+/// An invalid home path; `Display` is the stable English text, the UI
+/// translates the kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootError(pub HomeErrorKind);
+
+impl std::fmt::Display for RootError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self.0 {
+            HomeErrorKind::Length => "home path must be 1 to 4096 bytes",
+            HomeErrorKind::Relative => "home path must be absolute",
+            HomeErrorKind::ControlCharacters => "home path must not contain control characters",
+            HomeErrorKind::NotNormalized => {
+                "home path must be normalized (no trailing or double slashes)"
+            }
+            HomeErrorKind::DotComponents => "home path must not contain . or .. components",
+            HomeErrorKind::NotAllowed => "home path is not below a helper scan root",
+            HomeErrorKind::StartFailed => "cannot start scanner",
+            HomeErrorKind::ScanFailed => "cannot scan home path",
+        })
+    }
+}
+
+impl std::error::Error for RootError {}
+
 /// A home root must be an absolute, normalized path without control
-/// characters. Symlinks in the root itself are followed, as `du` does for
-/// its arguments; nothing below it is.
-pub fn validate_root(root: &str) -> Result<()> {
+/// characters. Without the helper, symlinks in the root itself are followed,
+/// as `du` does for its arguments; nothing below it is.
+pub fn validate_root(root: &str) -> Result<(), RootError> {
+    let fail = |kind| Err(RootError(kind));
     if root.is_empty() || root.len() > MAX_ROOT_BYTES {
-        bail!("home path must be 1 to {MAX_ROOT_BYTES} bytes");
+        return fail(HomeErrorKind::Length);
     }
     if !root.starts_with('/') {
-        bail!("home path must be absolute");
+        return fail(HomeErrorKind::Relative);
     }
     if root.chars().any(char::is_control) {
-        bail!("home path must not contain control characters");
+        return fail(HomeErrorKind::ControlCharacters);
     }
     if root != "/" && (root.ends_with('/') || root.contains("//")) {
-        bail!("home path must be normalized (no trailing or double slashes)");
+        return fail(HomeErrorKind::NotNormalized);
     }
     // Path::components would silently drop "." components; check the text.
     if root
         .split('/')
         .any(|component| component == "." || component == "..")
     {
-        bail!("home path must not contain . or .. components");
+        return fail(HomeErrorKind::DotComponents);
     }
     Ok(())
+}
+
+/// The scan root is outside the helper's allowed roots, or reaches below
+/// one through a symlink.
+#[derive(Debug)]
+pub struct RootNotAllowed;
+
+impl std::fmt::Display for RootNotAllowed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "not below a helper scan root in {SCAN_ROOTS_PATH} (symlinks below it are not followed)"
+        )
+    }
+}
+
+impl std::error::Error for RootNotAllowed {}
+
+fn not_allowed() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, RootNotAllowed)
+}
+
+pub fn is_not_allowed(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<RootNotAllowed>())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllowedRoot {
+    /// As written in the scan-roots file.
+    pub configured: PathBuf,
+    /// With symlinks resolved when the helper started (/home -> /var/home).
+    pub canonical: PathBuf,
+}
+
+/// Which scan roots may be opened, and how.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RootPolicy {
+    /// Without the helper: any root the user can read, opened like `du` does.
+    Follow,
+    /// In the helper: only roots at or below these, opened component by
+    /// component without following any symlink below the allowed root, so
+    /// /home/alice/link -> /root cannot widen the helper's reach.
+    Allowed(Vec<AllowedRoot>),
+}
+
+impl RootPolicy {
+    /// The allowed root that `root` lies in, and the components below it.
+    fn locate<'a>(&'a self, root: &Path) -> Option<(&'a AllowedRoot, PathBuf)> {
+        let Self::Allowed(roots) = self else {
+            return None;
+        };
+        roots
+            .iter()
+            .flat_map(|allowed| {
+                [&allowed.configured, &allowed.canonical]
+                    .into_iter()
+                    .filter_map(move |base| {
+                        root.strip_prefix(base)
+                            .ok()
+                            .map(|rest| (base.components().count(), allowed, rest.to_owned()))
+                    })
+            })
+            .max_by_key(|(depth, _, _)| *depth)
+            .map(|(_, allowed, rest)| (allowed, rest))
+    }
+
+    /// Whether the lexical path may be requested at all.
+    pub fn allows(&self, root: &Path) -> bool {
+        match self {
+            Self::Follow => true,
+            Self::Allowed(_) => self.locate(root).is_some(),
+        }
+    }
+
+    pub fn open(&self, root: &Path) -> io::Result<OwnedFd> {
+        let Self::Allowed(_) = self else {
+            let path = CString::new(root.as_os_str().as_bytes())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+            // SAFETY: path is NUL-terminated; the root itself may be a symlink.
+            let descriptor = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            if descriptor < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: open returned a new descriptor that we now own.
+            return Ok(unsafe { OwnedFd::from_raw_fd(descriptor) });
+        };
+        let (allowed, rest) = self.locate(root).ok_or_else(not_allowed)?;
+        // The allowed root was resolved when the helper started; it is
+        // walked without following symlinks too, so a later swap of one of
+        // its components is refused rather than followed.
+        let mut directory = open_component(None, Path::new("/"))?;
+        for part in allowed.canonical.components().chain(rest.components()) {
+            match part {
+                std::path::Component::RootDir => {}
+                std::path::Component::Normal(name) => {
+                    directory = open_component(Some(&directory), Path::new(name))?;
+                }
+                _ => return Err(not_allowed()),
+            }
+        }
+        Ok(directory)
+    }
+}
+
+/// openat(O_NOFOLLOW|O_DIRECTORY); a symlink is reported as not allowed.
+fn open_component(parent: Option<&OwnedFd>, name: &Path) -> io::Result<OwnedFd> {
+    let name = CString::new(name.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+    let base = parent.map_or(libc::AT_FDCWD, AsRawFd::as_raw_fd);
+    // SAFETY: name is NUL-terminated and base is AT_FDCWD or an open descriptor.
+    let descriptor = unsafe {
+        libc::openat(
+            base,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor >= 0 {
+        // SAFETY: openat returned a new descriptor that we now own.
+        return Ok(unsafe { OwnedFd::from_raw_fd(descriptor) });
+    }
+    let error = io::Error::last_os_error();
+    let symlink =
+        stat_at(base, &name).is_ok_and(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFLNK);
+    if symlink {
+        Err(not_allowed())
+    } else {
+        Err(error)
+    }
+}
+
+/// The helper's scan roots from `path`. The file and every directory above it
+/// must be root-owned regular files/directories that others cannot write;
+/// otherwise nothing may be scanned with privileges. Missing file: /home.
+/// The second value describes a problem with the file, for diagnostics.
+pub fn load_scan_roots(path: &Path) -> (RootPolicy, Option<String>) {
+    use std::os::unix::fs::MetadataExt;
+    let parse_roots = |entries: Vec<String>| {
+        RootPolicy::Allowed(
+            entries
+                .into_iter()
+                .filter(|entry| validate_root(entry).is_ok())
+                .take(MAX_SCAN_ROOTS)
+                .map(|entry| {
+                    let configured = PathBuf::from(&entry);
+                    let canonical =
+                        crate::probe::resolve_with_timeout(&configured, Duration::from_secs(1))
+                            .unwrap_or_else(|| configured.clone());
+                    AllowedRoot {
+                        configured,
+                        canonical,
+                    }
+                })
+                .collect(),
+        )
+    };
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return (
+                parse_roots(
+                    DEFAULT_SCAN_ROOTS
+                        .iter()
+                        .map(|root| (*root).to_owned())
+                        .collect(),
+                ),
+                None,
+            );
+        }
+        Err(error) => {
+            return (
+                RootPolicy::Allowed(Vec::new()),
+                Some(format!("{}: {error}", path.display())),
+            );
+        }
+        Ok(_) => {}
+    }
+    for component in path.ancestors().filter(|part| !part.as_os_str().is_empty()) {
+        let unsafe_file = match std::fs::symlink_metadata(component) {
+            Ok(metadata) => {
+                metadata.file_type().is_symlink()
+                    || metadata.uid() != 0
+                    || metadata.mode() & 0o022 != 0
+                    || (component == path && !metadata.is_file())
+            }
+            Err(_) => true,
+        };
+        if unsafe_file {
+            return (
+                RootPolicy::Allowed(Vec::new()),
+                Some(format!(
+                    "{} must be a root-owned file that others cannot write; \
+                     no helper scans are allowed",
+                    component.display()
+                )),
+            );
+        }
+    }
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path)
+        .and_then(|file| io::Read::read_to_end(&mut io::Read::take(file, 64 * 1024), &mut bytes));
+    if let Err(error) = read {
+        return (
+            RootPolicy::Allowed(Vec::new()),
+            Some(format!("{}: {error}", path.display())),
+        );
+    }
+    let entries = String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or("").trim().to_owned())
+        .filter(|line| !line.is_empty())
+        .collect();
+    (parse_roots(entries), None)
+}
+
+/// Sanitize a directory name for display and bound its length in
+/// characters, marking a cut with "~".
+fn display_name(name: &[u8]) -> String {
+    let name = sanitize_bytes(name);
+    if name.chars().count() <= MAX_NAME_CHARS {
+        return name;
+    }
+    let mut out: String = name.chars().take(MAX_NAME_CHARS - 1).collect();
+    out.push('~');
+    out
 }
 
 #[derive(Default, Clone, Copy)]
@@ -414,7 +679,7 @@ impl Walker<'_> {
             .then(|| {
                 self.tree.alloc(
                     DirNode {
-                        name: sanitize_bytes(name.to_bytes()),
+                        name: display_name(name.to_bytes()),
                         ..DirNode::default()
                     },
                     node,
@@ -519,29 +784,28 @@ fn fold(other: &mut Folded, totals: &Totals) {
     other.files = other.files.saturating_add(totals.files);
 }
 
-/// Scan `root` once. Fails only if the root itself cannot be opened.
+/// Scan `root` once, opened like `du`. Fails only if the root itself
+/// cannot be opened.
 pub fn scan(
     root: &Path,
     limits: &Limits,
     cancel: &AtomicBool,
     progress: &AtomicU64,
 ) -> io::Result<HomeReport> {
+    scan_with(root, &RootPolicy::Follow, limits, cancel, progress)
+}
+
+/// Scan `root` once after opening it under `policy`.
+pub fn scan_with(
+    root: &Path,
+    policy: &RootPolicy,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    progress: &AtomicU64,
+) -> io::Result<HomeReport> {
     let started = Instant::now();
     let started_unix = unix_now();
-    let path = CString::new(root.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
-    // SAFETY: path is NUL-terminated; the root itself may be a symlink.
-    let descriptor = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if descriptor < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: open returned a new descriptor that we now own.
-    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    let descriptor = policy.open(root)?;
     let stat = stat_fd(descriptor.as_raw_fd())?;
     progress.store(0, Ordering::Relaxed);
     let mut walker = Walker {
@@ -655,7 +919,7 @@ struct State {
     report: Option<Arc<HomeReport>>,
     last_finished: Option<Instant>,
     last_finished_unix: Option<u64>,
-    error: Option<String>,
+    error: Option<(HomeErrorKind, String)>,
 }
 
 struct Shared {
@@ -665,6 +929,7 @@ struct Shared {
     stop: AtomicBool,
     progress: AtomicU64,
     privileged: bool,
+    policy: RootPolicy,
 }
 
 /// Periodic background scans in a dedicated, low-priority thread.
@@ -681,6 +946,7 @@ impl HomeService {
         interval: Duration,
         limits: Limits,
         privileged: bool,
+        policy: RootPolicy,
         prepare: fn() -> Result<()>,
     ) -> io::Result<Self> {
         let shared = Arc::new(Shared {
@@ -700,6 +966,7 @@ impl HomeService {
             stop: AtomicBool::new(false),
             progress: AtomicU64::new(0),
             privileged,
+            policy,
         });
         let worker = Arc::clone(&shared);
         std::thread::Builder::new()
@@ -771,7 +1038,9 @@ impl HomeService {
                 })
                 .flatten(),
             privileged: self.shared.privileged,
-            error: state.error.clone(),
+            error: state.error.as_ref().map(|(_, message)| message.clone()),
+            error_kind: state.error.as_ref().map(|(kind, _)| *kind),
+            helper_refused: false,
         }
     }
 
@@ -805,7 +1074,10 @@ fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, State> {
 
 fn run(shared: Arc<Shared>, limits: Limits, prepare: fn() -> Result<()>) {
     if let Err(error) = prepare() {
-        lock(&shared).error = Some(sanitize(&format!("{error:#}")));
+        lock(&shared).error = Some((
+            HomeErrorKind::StartFailed,
+            sanitize(&format!("cannot start scanner: {error:#}")),
+        ));
         return;
     }
     let mut history: Option<History> = None;
@@ -841,7 +1113,13 @@ fn run(shared: Arc<Shared>, limits: Limits, prepare: fn() -> Result<()>) {
             shared.cancel.store(false, Ordering::Relaxed);
             state.root.clone()
         };
-        let result = scan(&root, &limits, &shared.cancel, &shared.progress);
+        let result = scan_with(
+            &root,
+            &shared.policy,
+            &limits,
+            &shared.cancel,
+            &shared.progress,
+        );
         let mut state = lock(&shared);
         state.scanning = false;
         state.last_finished = Some(Instant::now());
@@ -857,16 +1135,22 @@ fn run(shared: Arc<Shared>, limits: Limits, prepare: fn() -> Result<()>) {
                 if history.as_ref().is_none_or(|(path, _, _)| *path != root) {
                     history = None;
                 }
-                annotate(
-                    &mut report,
-                    history.as_ref().map(|(_, previous, _)| previous),
-                    history.as_ref().map(|(_, _, first)| first),
-                );
-                let sizes = path_sizes(&report);
-                history = Some(match history.take() {
-                    Some((path, _, first)) => (path, sizes, first),
-                    None => (root.clone(), sizes.clone(), sizes),
-                });
+                // A scan stopped by its entry or time budget (or cancelled)
+                // misses directories: its sizes would show as shrinking and
+                // then growing again. It is shown as it is, but neither
+                // annotated nor used as a baseline.
+                if report.stopped.is_none() {
+                    annotate(
+                        &mut report,
+                        history.as_ref().map(|(_, previous, _)| previous),
+                        history.as_ref().map(|(_, _, first)| first),
+                    );
+                    let sizes = path_sizes(&report);
+                    history = Some(match history.take() {
+                        Some((path, _, first)) => (path, sizes, first),
+                        None => (root.clone(), sizes.clone(), sizes),
+                    });
+                }
                 generation += 1;
                 report.generation = generation;
                 report.privileged = shared.privileged;
@@ -874,10 +1158,15 @@ fn run(shared: Arc<Shared>, limits: Limits, prepare: fn() -> Result<()>) {
                 state.error = None;
             }
             Err(error) => {
-                state.error = Some(sanitize(&format!(
-                    "cannot scan {}: {error}",
-                    root.display()
-                )));
+                let kind = if is_not_allowed(&error) {
+                    HomeErrorKind::NotAllowed
+                } else {
+                    HomeErrorKind::ScanFailed
+                };
+                state.error = Some((
+                    kind,
+                    sanitize(&format!("cannot scan {}: {error}", root.display())),
+                ));
             }
         }
     }
@@ -1160,6 +1449,139 @@ mod tests {
     }
 
     #[test]
+    fn helper_policy_allows_only_listed_roots_and_never_follows_symlinks_below() {
+        let tree = TempTree::new("policy");
+        let allowed = tree.0.join("home");
+        fs::create_dir_all(allowed.join("alice/docs")).unwrap();
+        let outside = TempTree::new("policy-outside");
+        fs::write(outside.0.join("secret.bin"), vec![1u8; 8192]).unwrap();
+        symlink(&outside.0, allowed.join("alice/link")).unwrap();
+        // A symlinked allowed root (/home -> /var/home) is resolved once.
+        symlink(&allowed, tree.0.join("home-link")).unwrap();
+        let policy = RootPolicy::Allowed(vec![AllowedRoot {
+            configured: tree.0.join("home-link"),
+            canonical: fs::canonicalize(&allowed).unwrap(),
+        }]);
+        for path in [
+            tree.0.join("home-link"),
+            tree.0.join("home-link/alice"),
+            allowed.join("alice/docs"),
+        ] {
+            assert!(policy.allows(&path), "{}", path.display());
+            assert!(policy.open(&path).is_ok(), "{}", path.display());
+        }
+        let report = scan_with(
+            &tree.0.join("home-link/alice"),
+            &policy,
+            &Limits::default(),
+            &AtomicBool::new(false),
+            &AtomicU64::new(0),
+        )
+        .unwrap();
+        assert!(report.root_node().unwrap().allocated < 8192);
+        // Outside the list, and a symlink below an allowed root.
+        assert!(!policy.allows(&outside.0));
+        assert!(!policy.allows(&tree.0.join("home2")));
+        let error = policy.open(&outside.0).unwrap_err();
+        assert!(is_not_allowed(&error), "{error}");
+        let escape = allowed.join("alice/link");
+        assert!(policy.allows(&escape), "lexically below the root");
+        let error = policy.open(&escape).unwrap_err();
+        assert!(is_not_allowed(&error), "{error}");
+        let error = policy.open(&allowed.join("alice/missing")).unwrap_err();
+        assert!(!is_not_allowed(&error) && error.kind() == io::ErrorKind::NotFound);
+        // Without the helper, the root itself may be a symlink, like du.
+        assert!(RootPolicy::Follow.open(&escape).is_ok());
+    }
+
+    #[test]
+    fn scan_roots_default_to_home_and_unsafe_files_allow_nothing() {
+        let tree = TempTree::new("roots");
+        let (policy, problem) = load_scan_roots(&tree.0.join("missing"));
+        assert!(problem.is_none());
+        let RootPolicy::Allowed(roots) = &policy else {
+            panic!("helper policy expected");
+        };
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].configured, Path::new("/home"));
+        assert!(policy.allows(Path::new("/home/alice")));
+        assert!(!policy.allows(Path::new("/root")) && !policy.allows(Path::new("/")));
+        // A file the test user owns is not trusted: nothing may be scanned.
+        let file = tree.0.join("scan-roots");
+        fs::write(&file, "/srv\n").unwrap();
+        let (policy, problem) = load_scan_roots(&file);
+        if !running_as_root() {
+            assert_eq!(policy, RootPolicy::Allowed(Vec::new()));
+            assert!(problem.unwrap().contains("root-owned"));
+            assert!(!policy.allows(Path::new("/srv")) && !policy.allows(Path::new("/home")));
+        }
+    }
+
+    #[test]
+    fn long_names_are_capped_and_aborted_scans_never_set_growth() {
+        let long = vec![0xffu8; 255];
+        let name = display_name(&long);
+        assert_eq!(name.chars().count(), MAX_NAME_CHARS);
+        assert!(name.ends_with('~'));
+        assert_eq!(display_name(b"short"), "short");
+
+        let tree = TempTree::new("aborted");
+        for index in 0..40 {
+            fs::create_dir(tree.0.join(format!("d{index}"))).unwrap();
+        }
+        let wait = |service: &HomeService, known: u64| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(report) = service.report_if_newer(known) {
+                    return report;
+                }
+                assert!(Instant::now() < deadline, "scan did not finish");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        // The first scan hits the entry budget: it is no growth baseline.
+        let service = HomeService::start(
+            tree.0.clone(),
+            Duration::from_secs(3600),
+            Limits {
+                max_entries: 10,
+                ..Limits::default()
+            },
+            false,
+            RootPolicy::Follow,
+            || Ok(()),
+        )
+        .unwrap();
+        let first = wait(&service, 0);
+        assert_eq!(first.stopped, Some(StopReason::EntryBudget));
+        assert!(first.nodes.iter().all(|node| node.growth_start.is_none()));
+        service.rescan();
+        let second = wait(&service, 1);
+        assert!(
+            second
+                .nodes
+                .iter()
+                .all(|node| node.growth_previous.is_none())
+        );
+        drop(service);
+        // After a complete scan, an aborted one is not annotated either.
+        let service = HomeService::start(
+            tree.0.clone(),
+            Duration::from_secs(3600),
+            Limits::default(),
+            false,
+            RootPolicy::Follow,
+            || Ok(()),
+        )
+        .unwrap();
+        let complete = wait(&service, 0);
+        assert_eq!(complete.stopped, None);
+        service.rescan();
+        let again = wait(&service, 1);
+        assert_eq!(again.root_node().unwrap().growth_previous, Some(0));
+    }
+
+    #[test]
     fn root_validation() {
         for valid in ["/", "/home", "/srv/home dirs", "/home/Grüße"] {
             assert!(validate_root(valid).is_ok(), "{valid}");
@@ -1187,6 +1609,7 @@ mod tests {
             Duration::from_secs(3600),
             Limits::default(),
             false,
+            RootPolicy::Follow,
             || Ok(()),
         )
         .unwrap();

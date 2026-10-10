@@ -22,6 +22,7 @@ import time
 def environment():
     # Keep the expected terminal text English regardless of the runner's locale.
     env = {**os.environ, "TERM": "xterm-256color", "LC_ALL": "C.UTF-8"}
+    env.pop("LANGUAGE", None)
     env.pop("NO_COLOR", None)
     return env
 
