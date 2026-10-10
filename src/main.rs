@@ -1,0 +1,790 @@
+use std::{
+    io::{self, IsTerminal, Write},
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, ValueEnum};
+use crossterm::event::{self, Event, KeyEventKind};
+use disktop::{
+    collector::{Collector, default_device},
+    config::{ConfigFile, RootWithForeignSettings, Settings, SortKey, View},
+    demo, diskstats,
+    helper::Client,
+    i18n::Lang,
+    model::{HomeReport, HomeRequest, ScanState, Snapshot},
+    scanner,
+    shutdown::SignalGuard,
+    text::{format_bytes, format_count, format_rate, truncate},
+    ui::{self, Action, App},
+};
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SortArg {
+    Io,
+    Read,
+    Write,
+    Total,
+    Pid,
+    Command,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ViewArg {
+    Processes,
+    Filesystems,
+    Home,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    version,
+    about = "Linux disk monitor with nvtop-style I/O graphs, per-process I/O, filesystems and a home size view"
+)]
+struct Args {
+    /// Block device to show, for example nvme0n1 or sda; 'all' adds physical disks
+    #[arg(short = 'D', long, value_parser = parse_device)]
+    device: Option<String>,
+    /// Refresh interval in seconds (0.1 to 60)
+    #[arg(short = 'd', long, value_parser = parse_interval)]
+    interval: Option<f64>,
+    /// Visible history in seconds
+    #[arg(long, value_parser = clap::value_parser!(u16).range(10..=600))]
+    history: Option<u16>,
+    /// Process sort order
+    #[arg(short, long, value_enum)]
+    sort: Option<SortArg>,
+    /// Table shown below the graph
+    #[arg(long, value_enum)]
+    view: Option<ViewArg>,
+    /// Directory tree for the home view (default /home)
+    #[arg(long, value_parser = parse_home_path)]
+    home_path: Option<String>,
+    /// With --once or --json: wait for a complete home scan and include it
+    #[arg(long)]
+    scan_home: bool,
+    /// Also show loop, ram and zram devices
+    #[arg(long)]
+    all_devices: bool,
+    /// Disable colors (also available in F2 Setup)
+    #[arg(long)]
+    no_color: bool,
+    /// Do not use the installed helper; show only your own processes
+    #[arg(long)]
+    no_helper: bool,
+    /// Print one snapshot after a refresh interval and exit
+    #[arg(long)]
+    once: bool,
+    /// Print one snapshot as JSON and exit
+    #[arg(long)]
+    json: bool,
+    /// Explicit preview with synthetic data, clearly labeled DEMO
+    #[arg(long)]
+    demo: bool,
+}
+
+fn parse_interval(value: &str) -> Result<f64, String> {
+    let interval: f64 = value
+        .parse()
+        .map_err(|_| "expected seconds, for example 0.5".to_string())?;
+    if !interval.is_finite() || !(0.1..=60.0).contains(&interval) {
+        return Err("interval must be between 0.1 and 60 seconds".into());
+    }
+    Ok(interval)
+}
+
+fn parse_device(value: &str) -> Result<String, String> {
+    let name = value.strip_prefix("/dev/").unwrap_or(value);
+    if name == "all" || diskstats::valid_name(name) {
+        Ok(name.to_owned())
+    } else {
+        Err("expected a block device name such as nvme0n1, or 'all'".into())
+    }
+}
+
+fn parse_home_path(value: &str) -> Result<String, String> {
+    let trimmed = value.trim_end_matches('/');
+    let path = if trimmed.is_empty() { "/" } else { trimmed };
+    scanner::validate_root(path)
+        .map(|()| path.to_owned())
+        .map_err(|error| format!("{error:#}"))
+}
+
+enum Source {
+    Live(Box<Collector>),
+    Helper(Client),
+    Demo {
+        tick: u64,
+        start: Instant,
+    },
+    #[cfg(test)]
+    Failing {
+        helper: bool,
+    },
+}
+
+impl Source {
+    fn sample(&mut self, request: &HomeRequest, shutdown: &SignalGuard) -> Result<Snapshot> {
+        match self {
+            Self::Live(collector) => collector.sample(request),
+            Self::Helper(client) => client.sample(request, || shutdown.requested()),
+            Self::Demo { tick, start } => {
+                let snapshot = demo::snapshot(
+                    *tick,
+                    start.elapsed().as_secs_f64(),
+                    &request.root,
+                    request.known_generation,
+                );
+                *tick += 1;
+                Ok(snapshot)
+            }
+            #[cfg(test)]
+            Self::Failing { .. } => bail!("injected sample failure"),
+        }
+    }
+
+    /// A revoked, outdated, stalled or crashed helper must not stop the
+    /// monitor; direct, unprivileged collection replaces it.
+    fn is_helper(&self) -> bool {
+        match self {
+            Self::Helper(_) => true,
+            #[cfg(test)]
+            Self::Failing { helper } => *helper,
+            _ => false,
+        }
+    }
+}
+
+/// Startup notices: English on stderr, the UI language in the terminal.
+enum Notice {
+    Settings(String),
+    UnknownKeys(Vec<String>),
+    DeviceUnavailable(String),
+}
+
+impl Notice {
+    fn text(&self, lang: Lang) -> String {
+        match self {
+            Self::Settings(error) => lang.settings_problem(error),
+            Self::UnknownKeys(keys) => lang.unknown_keys(keys),
+            Self::DeviceUnavailable(name) => lang.device_unavailable(name),
+        }
+    }
+}
+
+/// Apply command-line options and NO_COLOR to a copy of the saved settings.
+/// These overrides apply to this run only and are never saved by F12.
+fn runtime_settings(args: &Args, saved: &Settings, no_color_env: bool) -> Settings {
+    let mut settings = saved.clone();
+    if let Some(interval) = args.interval {
+        settings.interval_ms = (interval * 1000.0).round() as u64;
+    }
+    if let Some(history) = args.history {
+        settings.history_seconds = history;
+    }
+    if let Some(sort) = args.sort {
+        settings.sort = match sort {
+            SortArg::Io => SortKey::Io,
+            SortArg::Read => SortKey::Read,
+            SortArg::Write => SortKey::Write,
+            SortArg::Total => SortKey::Total,
+            SortArg::Pid => SortKey::Pid,
+            SortArg::Command => SortKey::Name,
+        };
+    }
+    if let Some(view) = args.view {
+        settings.view = match view {
+            ViewArg::Processes => View::Processes,
+            ViewArg::Filesystems => View::Filesystems,
+            ViewArg::Home => View::Home,
+        };
+    }
+    if let Some(path) = &args.home_path {
+        settings.home_path = path.clone();
+    }
+    if args.all_devices {
+        settings.show_virtual = true;
+    }
+    if args.no_color || no_color_env {
+        settings.color = false;
+    }
+    if let Some(device) = &args.device {
+        settings.device = Some(device.clone());
+    }
+    settings
+}
+
+fn direct_collector() -> Result<Source> {
+    Ok(Source::Live(Box::new(Collector::new(false).context(
+        "cannot initialize Linux block device counters",
+    )?)))
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let shutdown = SignalGuard::new().context("registering shutdown handlers")?;
+    let mut notices = Vec::new();
+    let config = match ConfigFile::discover() {
+        Ok(config) => Some(config),
+        Err(error) => {
+            notices.push(Notice::Settings(format!("{error:#}")));
+            None
+        }
+    };
+    let saved = match config
+        .as_ref()
+        .map(ConfigFile::load_with_unknown_keys)
+        .transpose()
+    {
+        Ok(loaded) => {
+            let loaded = loaded.unwrap_or_default();
+            if !loaded.unknown_keys.is_empty() {
+                notices.push(Notice::UnknownKeys(loaded.unknown_keys));
+            }
+            loaded.settings
+        }
+        Err(error) => {
+            notices.push(Notice::Settings(format!("{error:#}")));
+            Settings::default()
+        }
+    };
+    let no_color_env = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+    let settings = runtime_settings(&args, &saved, no_color_env);
+    settings.validate()?;
+    for notice in &notices {
+        eprintln!("{}", notice.text(Lang::En));
+    }
+    if !cfg!(target_os = "linux") && !args.demo {
+        bail!("live monitoring requires Linux");
+    }
+    let mut helper_error = None;
+    let mut source = if args.demo {
+        Source::Demo {
+            tick: 0,
+            start: Instant::now(),
+        }
+    } else if !args.no_helper && unsafe { libc::geteuid() } != 0 {
+        match Client::start() {
+            Ok(client) => Source::Helper(client),
+            Err(error) => {
+                helper_error = Some(error);
+                direct_collector()?
+            }
+        }
+    } else {
+        direct_collector()?
+    };
+    let automatic_device = if args.demo {
+        Some("nvme0n1".into())
+    } else {
+        default_device(&settings.home_path)
+    };
+    let device = match settings.device.as_deref() {
+        Some("all") => None,
+        Some(name) => Some(name.to_string()),
+        None => automatic_device.clone(),
+    };
+    let mut app = App::with_saved(device, settings.clone(), saved, args.demo);
+    app.auto_device = automatic_device.clone();
+    if args.scan_home {
+        app.home_active = true;
+    }
+    let first = match source.sample(&app.take_home_request(), &shutdown) {
+        Ok(snapshot) => snapshot,
+        Err(_) if shutdown.requested() => return Ok(()),
+        Err(error) if source.is_helper() => {
+            helper_error = Some(error);
+            source = direct_collector()?;
+            source.sample(&app.take_home_request(), &shutdown)?
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(error) = &helper_error
+        && !format!("{error:#}").contains("not installed")
+    {
+        eprintln!("Helper: {error:#}. Run scripts/setup-helper.sh once; see README.");
+    }
+    if let Some(name) = app.device.clone()
+        && !first.devices.iter().any(|device| device.name == name)
+    {
+        if args.device.is_some() {
+            bail!(
+                "device {name:?} does not exist; available: all, {}",
+                first
+                    .devices
+                    .iter()
+                    .map(|device| device.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let notice = Notice::DeviceUnavailable(name);
+        eprintln!("{}", notice.text(Lang::En));
+        notices.push(notice);
+        // Only this run falls back; F12 keeps the saved choice unless changed.
+        app.settings.device = None;
+        app.device = automatic_device.clone();
+    }
+    if args.once || args.json {
+        return print_once(&args, &mut source, &mut app, first, &shutdown);
+    }
+    if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
+        bail!("interactive mode needs a terminal; use --once or --json for non-interactive output");
+    }
+    app.system_lang = Lang::system();
+    if !notices.is_empty() {
+        let lang = app.lang();
+        app.show_error(
+            notices
+                .iter()
+                .map(|notice| notice.text(lang))
+                .collect::<Vec<_>>()
+                .join(" | "),
+        );
+    }
+    app.update(first);
+    // Color policy is applied to the whole buffer by the UI, so changing it in
+    // Setup can also reset previously colored cells and override NO_COLOR.
+    crossterm::style::force_color_output(true);
+    let mut terminal = ratatui::init();
+    let result = run(
+        &mut terminal,
+        &mut source,
+        &mut app,
+        config.as_ref(),
+        &shutdown,
+    );
+    ratatui::restore();
+    if shutdown.requested() { Ok(()) } else { result }
+}
+
+/// Wait without blocking termination signals.
+fn wait(duration: Duration, shutdown: &SignalGuard) -> bool {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        if shutdown.requested() {
+            return false;
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100)),
+        );
+    }
+    !shutdown.requested()
+}
+
+fn print_once(
+    args: &Args,
+    source: &mut Source,
+    app: &mut App,
+    first: Snapshot,
+    shutdown: &SignalGuard,
+) -> Result<()> {
+    let mut tree: Option<HomeReport> = first.home_tree;
+    if args.scan_home {
+        let mut last_status = first.home;
+        // Scans are bounded by entry and time budgets; signals end the wait.
+        while tree.is_none() {
+            if last_status
+                .as_ref()
+                .is_some_and(|status| status.state == ScanState::Failed)
+            {
+                let error = last_status
+                    .and_then(|status| status.error)
+                    .unwrap_or_else(|| "home scan failed".into());
+                bail!("{error}");
+            }
+            if !wait(Duration::from_millis(250), shutdown) {
+                return Ok(());
+            }
+            let snapshot = match source.sample(&app.take_home_request(), shutdown) {
+                Err(_) if shutdown.requested() => return Ok(()),
+                result => result?,
+            };
+            tree = snapshot.home_tree;
+            last_status = snapshot.home;
+        }
+    }
+    if !wait(Duration::from_millis(app.settings.interval_ms), shutdown) {
+        return Ok(());
+    }
+    let mut snapshot = match source.sample(&app.take_home_request(), shutdown) {
+        Err(_) if shutdown.requested() => return Ok(()),
+        result => result?,
+    };
+    if snapshot.home_tree.is_none() {
+        snapshot.home_tree = tree;
+    }
+    app.update(snapshot.clone());
+    let mut stdout = io::stdout().lock();
+    let written = if args.json {
+        let json = serde_json::to_string_pretty(&snapshot)?;
+        writeln!(stdout, "{json}")
+    } else {
+        print_snapshot(&mut stdout, app, &snapshot)
+    };
+    ignore_closed_output(written.and_then(|()| stdout.flush()))?;
+    Ok(())
+}
+
+/// A reader that exits early, as in `disktop --json | head`, is not an error.
+fn ignore_closed_output(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
+
+/// Take one sample. Failures become a visible notice instead of ending the
+/// monitor; a failed helper is replaced by `fallback`.
+fn refresh(
+    source: &mut Source,
+    app: &mut App,
+    shutdown: &SignalGuard,
+    fallback: impl FnOnce() -> Result<Source>,
+) {
+    let error = match source.sample(&app.take_home_request(), shutdown) {
+        Ok(snapshot) => {
+            app.update(snapshot);
+            return;
+        }
+        Err(_) if shutdown.requested() => return,
+        Err(error) => error,
+    };
+    let lang = app.lang();
+    if !source.is_helper() {
+        app.show_error(lang.sample_failed(&format!("{error:#}")));
+        return;
+    }
+    match fallback() {
+        Ok(replacement) => {
+            // Dropping the client also stops and reaps the failed helper.
+            *source = replacement;
+            app.home_source_changed();
+            match source.sample(&app.take_home_request(), shutdown) {
+                Ok(snapshot) => app.update(snapshot),
+                Err(_) if shutdown.requested() => return,
+                Err(retry) => {
+                    app.show_error(lang.sample_failed(&format!("{retry:#}")));
+                    return;
+                }
+            }
+            app.show_error(lang.helper_failed(&format!("{error:#}")));
+        }
+        Err(fallback_error) => {
+            app.show_error(lang.sample_failed(&format!("{error:#}; {fallback_error:#}")))
+        }
+    }
+}
+
+fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    source: &mut Source,
+    app: &mut App,
+    config: Option<&ConfigFile>,
+    shutdown: &SignalGuard,
+) -> Result<()> {
+    let mut next_sample = Instant::now() + Duration::from_millis(app.settings.interval_ms);
+    'running: loop {
+        if shutdown.requested() {
+            break;
+        }
+        terminal.draw(|frame| ui::draw(frame, app))?;
+        // Poll frequently for external termination without repainting between
+        // events or samples. Even a 60-second interval exits promptly.
+        let event_ready = loop {
+            if shutdown.requested() {
+                break 'running;
+            }
+            let remaining = next_sample.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break false;
+            }
+            if event::poll(remaining.min(Duration::from_millis(100)))? {
+                break true;
+            }
+        };
+        if event_ready {
+            match event::read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => match app.handle_key(key) {
+                    Action::Quit => break,
+                    Action::DeviceChanged => {}
+                    Action::HomeChanged => {
+                        refresh(source, app, shutdown, direct_collector);
+                        next_sample =
+                            Instant::now() + Duration::from_millis(app.settings.interval_ms);
+                    }
+                    Action::SettingsChanged => {
+                        next_sample = next_sample
+                            .min(Instant::now() + Duration::from_millis(app.settings.interval_ms));
+                    }
+                    Action::SaveSettings => save_settings(app, config),
+                    Action::None => {}
+                },
+                _ => {}
+            }
+        }
+        if Instant::now() >= next_sample {
+            refresh(source, app, shutdown, direct_collector);
+            next_sample = Instant::now() + Duration::from_millis(app.settings.interval_ms);
+        }
+    }
+    Ok(())
+}
+
+fn save_settings(app: &mut App, config: Option<&ConfigFile>) {
+    let lang = app.lang();
+    let settings = app.settings_to_save();
+    match config
+        .context("settings path unavailable")
+        .and_then(|config| config.save(&settings).map(|()| config.path()))
+    {
+        Ok(path) => app.settings_saved(lang.saved(&path.display().to_string())),
+        Err(error) if error.downcast_ref::<RootWithForeignSettings>().is_some() => {
+            app.show_error(lang.root_with_foreign_settings())
+        }
+        Err(error) => app.show_error(lang.save_failed(&format!("{error:#}"))),
+    }
+}
+
+fn optional_rate(value: Option<f64>) -> String {
+    value.map_or_else(|| "-".into(), format_rate)
+}
+
+fn print_snapshot(out: &mut impl Write, app: &App, snapshot: &Snapshot) -> io::Result<()> {
+    let device = app.selected_device();
+    let title = match (&app.device, device) {
+        (None, _) => "all physical disks".to_owned(),
+        (Some(name), Some(device)) => {
+            let identity = [device.model.as_deref(), device.label.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!(
+                "{name} ({}{}{})",
+                device.kind.label(),
+                if identity.is_empty() { "" } else { " " },
+                identity
+            )
+        }
+        (Some(name), None) => format!("{name} (unavailable)"),
+    };
+    writeln!(
+        out,
+        "disktop{}  {title}",
+        if snapshot.demo { " DEMO" } else { "" }
+    )?;
+    match app.selected_rates() {
+        Some(rates) => writeln!(
+            out,
+            "READ {}  WRITE {}  IOPS {:.0}/{:.0}  UTIL {:.1}%  AWAIT {}",
+            format_rate(rates.read_rate),
+            format_rate(rates.write_rate),
+            rates.read_iops,
+            rates.write_iops,
+            rates.utilization_percent,
+            rates
+                .await_ms
+                .map_or_else(|| "-".to_owned(), |value| format!("{value:.2} ms"))
+        )?,
+        None => writeln!(out, "READ -  WRITE -  (no rates for this interval)")?,
+    }
+    let access = &snapshot.process_access;
+    writeln!(
+        out,
+        "Processes: {} readable, {} not readable; {}",
+        access.readable, access.unreadable, access.message
+    )?;
+    writeln!(
+        out,
+        "{:>8}  {:<12}  {:>12}  {:>12}  COMMAND",
+        "PID", "USER", "READ/s", "WRITE/s"
+    )?;
+    for row in app.process_rows().into_iter().take(15) {
+        writeln!(
+            out,
+            "{:>8}  {:<12.12}  {:>12}  {:>12}  {}",
+            row.pid,
+            row.user,
+            optional_rate(row.read_rate),
+            optional_rate(row.write_rate),
+            truncate(&row.command, 60)
+        )?;
+    }
+    writeln!(out)?;
+    writeln!(
+        out,
+        "{:<24}  {:<8}  {:>5}  {:>10}  {:>10}  DEVICE",
+        "MOUNT", "TYPE", "USE%", "SIZE", "FREE"
+    )?;
+    for fs in app.filesystem_rows() {
+        writeln!(
+            out,
+            "{}{:<23}  {:<8.8}  {:>5}  {:>10}  {:>10}  {}",
+            if fs.contains_home { "*" } else { " " },
+            truncate(&fs.mount_point, 23),
+            fs.fs_type,
+            fs.use_percent()
+                .map_or_else(|| "-".to_owned(), |value| format!("{value:.0}%")),
+            fs.total_bytes
+                .map_or_else(|| "-".to_owned(), |value| format_bytes(value as f64)),
+            fs.available_bytes
+                .map_or_else(|| "-".to_owned(), |value| format_bytes(value as f64)),
+            fs.block_device.as_deref().unwrap_or(&fs.source)
+        )?;
+    }
+    if let Some(tree) = &snapshot.home_tree
+        && let Some(root) = tree.root_node()
+    {
+        writeln!(out)?;
+        writeln!(
+            out,
+            "HOME {}  {}  {} files{}  scan {:.1}s",
+            tree.root,
+            format_bytes(root.allocated as f64),
+            format_count(root.files),
+            if root.partial() { "  PARTIAL" } else { "" },
+            tree.duration_ms as f64 / 1000.0
+        )?;
+        for child in root
+            .children
+            .iter()
+            .filter_map(|index| tree.node(*index))
+            .take(15)
+        {
+            writeln!(
+                out,
+                "{:>10}  {}{}",
+                format_bytes(child.allocated as f64),
+                child.name,
+                if child.partial() { "  (partial)" } else { "" }
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyCode;
+
+    #[test]
+    fn argument_parsers_reject_invalid_values() {
+        for invalid in ["0", "NaN", "inf", "-1", "61", "nope"] {
+            assert!(parse_interval(invalid).is_err());
+        }
+        assert_eq!(parse_interval("0.5").unwrap(), 0.5);
+        assert_eq!(parse_device("/dev/nvme0n1").unwrap(), "nvme0n1");
+        assert_eq!(parse_device("all").unwrap(), "all");
+        assert!(parse_device("../sda").is_err());
+        assert_eq!(parse_home_path("/home/").unwrap(), "/home");
+        assert_eq!(parse_home_path("/").unwrap(), "/");
+        assert!(parse_home_path("home").is_err());
+        assert!(parse_home_path("/home/../etc").is_err());
+    }
+
+    #[test]
+    fn command_line_overrides_and_no_color_are_runtime_only() {
+        let saved = Settings {
+            device: Some("sda".into()),
+            ..Settings::default()
+        };
+        let args = Args::parse_from([
+            "disktop",
+            "--interval",
+            "0.1",
+            "--history",
+            "10",
+            "--device",
+            "nvme0n1",
+            "--sort",
+            "write",
+            "--view",
+            "home",
+            "--home-path",
+            "/srv/",
+            "--all-devices",
+        ]);
+        let runtime = runtime_settings(&args, &saved, true);
+        assert!(!runtime.color && runtime.show_virtual);
+        assert_eq!(runtime.interval_ms, 100);
+        assert_eq!(runtime.history_seconds, 10);
+        assert_eq!(runtime.device.as_deref(), Some("nvme0n1"));
+        assert_eq!(runtime.sort, SortKey::Write);
+        assert_eq!(runtime.view, View::Home);
+        assert_eq!(runtime.home_path, "/srv");
+        let mut app = App::with_saved(Some("nvme0n1".into()), runtime, saved.clone(), true);
+        assert_eq!(app.settings_to_save(), saved);
+        assert!(!app.settings_dirty());
+        // Changing a preference in the monitor persists only that preference.
+        app.handle_key(KeyCode::Char('s').into());
+        let expected = Settings {
+            sort: SortKey::Total,
+            ..saved.clone()
+        };
+        assert_eq!(app.settings_to_save(), expected);
+        assert!(app.settings_dirty());
+        app.settings_saved("saved".into());
+        assert!(!app.settings_dirty());
+        assert!(app.settings_to_save().color, "NO_COLOR must not be saved");
+        assert_eq!(app.settings_to_save().history_seconds, 60);
+        assert_eq!(app.settings_to_save().home_path, "/home");
+        assert_eq!(app.settings_to_save().device.as_deref(), Some("sda"));
+    }
+
+    #[test]
+    fn closed_output_pipes_are_a_clean_exit_and_once_output_is_labeled() {
+        let closed = io::Error::from(io::ErrorKind::BrokenPipe);
+        assert!(ignore_closed_output(Err(closed)).is_ok());
+        let other = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert!(ignore_closed_output(Err(other)).is_err());
+        let mut app = App::new(Some("nvme0n1".into()), Settings::default(), true);
+        let snapshot = demo::snapshot(1, 1.0, "/home", 0);
+        app.update(snapshot.clone());
+        let mut output = Vec::new();
+        print_snapshot(&mut output, &app, &snapshot).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with("disktop DEMO  nvme0n1 (NVMe"), "{text}");
+        assert!(text.contains("*/home"), "{text}");
+        assert!(text.contains("HOME /home"), "{text}");
+    }
+
+    #[test]
+    fn runtime_sample_errors_are_notices_and_helpers_fall_back() {
+        let shutdown = SignalGuard::new().unwrap();
+        let mut app = App::new(Some("nvme0n1".into()), Settings::default(), true);
+        let mut source = Source::Failing { helper: false };
+        refresh(&mut source, &mut app, &shutdown, || {
+            panic!("only a failed helper may be replaced")
+        });
+        assert!(app.notice_error);
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("injected sample failure")
+        );
+        assert!(matches!(source, Source::Failing { .. }));
+
+        let mut app = App::new(Some("nvme0n1".into()), Settings::default(), true);
+        let mut source = Source::Failing { helper: true };
+        refresh(&mut source, &mut app, &shutdown, || {
+            Ok(Source::Demo {
+                tick: 0,
+                start: Instant::now(),
+            })
+        });
+        assert!(matches!(source, Source::Demo { .. }));
+        assert!(app.notice_error);
+        assert!(app.notice.as_deref().unwrap().starts_with("Helper failed"));
+        assert_eq!(app.history.len(), 1, "fallback samples immediately");
+
+        let mut app = App::new(Some("nvme0n1".into()), Settings::default(), true);
+        let mut source = Source::Failing { helper: true };
+        refresh(&mut source, &mut app, &shutdown, || bail!("no counters"));
+        assert!(app.notice.as_deref().unwrap().contains("no counters"));
+    }
+}

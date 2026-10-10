@@ -1,0 +1,1243 @@
+//! Bounded background scanner for the home view.
+//!
+//! The scan stays on the root's filesystem (st_dev), never follows symlinks
+//! (every directory is opened relative to its parent with O_NOFOLLOW), counts
+//! hard-linked files once while its bounded (dev, inode) set has room, and
+//! never reads file contents. Only directory names and sizes are retained,
+//! in a tree limited by depth, children per directory and total node count.
+
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::{CStr, CString},
+    io,
+    os::{
+        fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    },
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Result, bail};
+
+use crate::{
+    model::{DirNode, Folded, HomeReport, HomeStatus, ScanState, StopReason},
+    text::{sanitize, sanitize_bytes},
+};
+
+pub const MAX_ROOT_BYTES: usize = 4096;
+
+#[derive(Clone, Debug)]
+pub struct Limits {
+    /// Directory entries visited per scan.
+    pub max_entries: u64,
+    pub max_duration: Duration,
+    /// Directories deeper than this are not opened (bounds open descriptors).
+    pub max_depth: usize,
+    /// Directories deeper than this are summarized in their ancestor.
+    pub keep_depth: usize,
+    pub max_nodes: usize,
+    /// Largest subdirectories kept per directory; the rest are summarized.
+    pub top_children: usize,
+    pub max_hardlinks: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_entries: 20_000_000,
+            max_duration: Duration::from_secs(15 * 60),
+            max_depth: 128,
+            keep_depth: 8,
+            max_nodes: 20_000,
+            top_children: 200,
+            max_hardlinks: 500_000,
+        }
+    }
+}
+
+/// A home root must be an absolute, normalized path without control
+/// characters. Symlinks in the root itself are followed, as `du` does for
+/// its arguments; nothing below it is.
+pub fn validate_root(root: &str) -> Result<()> {
+    if root.is_empty() || root.len() > MAX_ROOT_BYTES {
+        bail!("home path must be 1 to {MAX_ROOT_BYTES} bytes");
+    }
+    if !root.starts_with('/') {
+        bail!("home path must be absolute");
+    }
+    if root.chars().any(char::is_control) {
+        bail!("home path must not contain control characters");
+    }
+    if root != "/" && (root.ends_with('/') || root.contains("//")) {
+        bail!("home path must be normalized (no trailing or double slashes)");
+    }
+    // Path::components would silently drop "." components; check the text.
+    if root
+        .split('/')
+        .any(|component| component == "." || component == "..")
+    {
+        bail!("home path must not contain . or .. components");
+    }
+    Ok(())
+}
+
+#[derive(Default, Clone, Copy)]
+struct Totals {
+    allocated: u64,
+    apparent: u64,
+    files: u64,
+    dirs: u64,
+    unreadable: u64,
+    truncated: bool,
+}
+
+impl Totals {
+    fn of(node: &DirNode) -> Self {
+        Self {
+            allocated: node.allocated,
+            apparent: node.apparent,
+            files: node.files,
+            dirs: node.dirs,
+            ..Self::default()
+        }
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.allocated = self.allocated.saturating_add(other.allocated);
+        self.apparent = self.apparent.saturating_add(other.apparent);
+        self.files = self.files.saturating_add(other.files);
+        self.dirs = self.dirs.saturating_add(other.dirs);
+        self.unreadable = self.unreadable.saturating_add(other.unreadable);
+        self.truncated |= other.truncated;
+    }
+}
+
+struct Walker<'a> {
+    limits: &'a Limits,
+    cancel: &'a AtomicBool,
+    progress: &'a AtomicU64,
+    started: Instant,
+    root_dev: u64,
+    entries: u64,
+    stopped: Option<StopReason>,
+    other_filesystems: u64,
+    hardlinks: HashSet<(u64, u64)>,
+    hardlink_limit_reached: bool,
+    tree: Tree,
+}
+
+/// Retained directories in a slab, so indexes held by the recursion stay
+/// valid while finished nodes are evicted.
+struct Slot {
+    node: DirNode,
+    parent: Option<usize>,
+    depth: usize,
+    finished: bool,
+}
+
+#[derive(Default)]
+struct Tree {
+    slots: Vec<Option<Slot>>,
+    free: Vec<usize>,
+    live: usize,
+}
+
+impl Tree {
+    fn alloc(&mut self, node: DirNode, parent: Option<usize>, depth: usize) -> usize {
+        let slot = Some(Slot {
+            node,
+            parent,
+            depth,
+            finished: false,
+        });
+        self.live += 1;
+        match self.free.pop() {
+            Some(index) => {
+                self.slots[index] = slot;
+                index
+            }
+            None => {
+                self.slots.push(slot);
+                self.slots.len() - 1
+            }
+        }
+    }
+
+    fn slot(&self, index: usize) -> &Slot {
+        self.slots[index].as_ref().expect("live slot")
+    }
+
+    fn node(&mut self, index: usize) -> &mut DirNode {
+        &mut self.slots[index].as_mut().expect("live slot").node
+    }
+
+    fn release_subtree(&mut self, index: usize) {
+        let mut pending = vec![index];
+        while let Some(index) = pending.pop() {
+            if let Some(slot) = self.slots[index].take() {
+                pending.extend(slot.node.children.iter().map(|child| *child as usize));
+                self.free.push(index);
+                self.live -= 1;
+            }
+        }
+    }
+
+    /// Keep at most `target` nodes. Unfinished ancestors on the walk stack
+    /// always stay; among finished ones, shallower and then larger directories
+    /// win, so siblings visited late still compete with earlier deep trees.
+    /// The kept set is a prefix of that order, so it is closed under parents.
+    fn evict_to(&mut self, target: usize) {
+        let mut candidates: Vec<usize> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                slot.as_ref()
+                    .filter(|slot| slot.finished && slot.parent.is_some())
+                    .map(|_| index)
+            })
+            .collect();
+        let unfinished = self.live - candidates.len();
+        let keep = target.saturating_sub(unfinished);
+        if candidates.len() <= keep {
+            return;
+        }
+        candidates.sort_by_key(|index| {
+            let slot = self.slot(*index);
+            (slot.depth, std::cmp::Reverse(slot.node.allocated), *index)
+        });
+        let evicted = candidates.split_off(keep);
+        let mut gone = vec![false; self.slots.len()];
+        for index in &evicted {
+            gone[*index] = true;
+        }
+        for index in &evicted {
+            let (parent, totals) = {
+                let slot = self.slot(*index);
+                (slot.parent, Totals::of(&slot.node))
+            };
+            if let Some(parent) = parent.filter(|parent| !gone[*parent]) {
+                let parent = self.node(parent);
+                parent.children.retain(|child| *child as usize != *index);
+                fold(&mut parent.other, &totals);
+            }
+        }
+        for index in evicted {
+            if self.slots[index].take().is_some() {
+                self.free.push(index);
+                self.live -= 1;
+            }
+        }
+    }
+
+    /// Renumber the reachable nodes breadth-first from the root.
+    fn into_nodes(mut self) -> Vec<DirNode> {
+        let mut out: Vec<DirNode> = Vec::with_capacity(self.live);
+        let mut queue = std::collections::VecDeque::from([(0usize, None::<usize>)]);
+        while let Some((old, parent)) = queue.pop_front() {
+            let Some(mut slot) = self.slots.get_mut(old).and_then(Option::take) else {
+                continue;
+            };
+            let index = out.len();
+            let children = std::mem::take(&mut slot.node.children);
+            out.push(slot.node);
+            if let Some(parent) = parent {
+                out[parent].children.push(index as u32);
+            }
+            queue.extend(
+                children
+                    .into_iter()
+                    .map(|child| (child as usize, Some(index))),
+            );
+        }
+        out
+    }
+}
+
+fn stat_at(directory: libc::c_int, name: &CStr) -> io::Result<libc::stat> {
+    // SAFETY: zeroed stat is a valid out-parameter; name is NUL-terminated.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::fstatat(
+            directory,
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(stat)
+}
+
+fn stat_fd(descriptor: libc::c_int) -> io::Result<libc::stat> {
+    // SAFETY: zeroed stat is a valid out-parameter for fstat.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(descriptor, &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(stat)
+}
+
+fn is_directory(stat: &libc::stat) -> bool {
+    stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+}
+
+fn allocated(stat: &libc::stat) -> u64 {
+    (stat.st_blocks.max(0) as u64).saturating_mul(512)
+}
+
+fn apparent(stat: &libc::stat) -> u64 {
+    let kind = stat.st_mode & libc::S_IFMT;
+    if kind == libc::S_IFREG || kind == libc::S_IFLNK || kind == libc::S_IFDIR {
+        stat.st_size.max(0) as u64
+    } else {
+        0
+    }
+}
+
+impl Walker<'_> {
+    fn budget_exhausted(&mut self) -> bool {
+        if self.stopped.is_some() {
+            return true;
+        }
+        self.entries += 1;
+        if self.entries > self.limits.max_entries {
+            self.stopped = Some(StopReason::EntryBudget);
+        } else if self.entries.is_multiple_of(512) {
+            self.progress.store(self.entries, Ordering::Relaxed);
+            if self.cancel.load(Ordering::Relaxed) {
+                self.stopped = Some(StopReason::Cancelled);
+            } else if self.started.elapsed() > self.limits.max_duration {
+                self.stopped = Some(StopReason::TimeBudget);
+            }
+        }
+        self.stopped.is_some()
+    }
+
+    /// Walk one open directory. The descriptor is consumed and closed.
+    fn walk(&mut self, descriptor: OwnedFd, node: Option<usize>, depth: usize) -> Totals {
+        let mut totals = Totals::default();
+        let raw = descriptor.into_raw_fd();
+        // SAFETY: raw is an open directory descriptor owned by us; on success
+        // the DIR stream owns it and closedir closes it.
+        let stream = unsafe { libc::fdopendir(raw) };
+        if stream.is_null() {
+            // SAFETY: fdopendir failed, so we still own raw.
+            drop(unsafe { OwnedFd::from_raw_fd(raw) });
+            totals.unreadable = 1;
+            return totals;
+        }
+        let directory = raw;
+        loop {
+            // SAFETY: errno is thread-local; reset to detect readdir errors.
+            unsafe { *libc::__errno_location() = 0 };
+            // SAFETY: stream is a valid open DIR stream.
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                if io::Error::last_os_error().raw_os_error().unwrap_or(0) != 0 {
+                    totals.unreadable += 1;
+                }
+                break;
+            }
+            // SAFETY: d_name is NUL-terminated within the returned dirent.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            if self.budget_exhausted() {
+                break;
+            }
+            let stat = match stat_at(directory, name) {
+                Ok(stat) => stat,
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
+                Err(_) => {
+                    totals.unreadable += 1;
+                    continue;
+                }
+            };
+            if is_directory(&stat) {
+                if stat.st_dev != self.root_dev {
+                    self.other_filesystems += 1;
+                    continue;
+                }
+                totals.dirs += 1;
+                let child = self.directory(directory, name, &stat, node, depth + 1);
+                totals.add(&child);
+            } else {
+                totals.files += 1;
+                let counted = stat.st_nlink <= 1 || self.first_link(stat.st_dev, stat.st_ino);
+                let (bytes, size) = if counted {
+                    (allocated(&stat), apparent(&stat))
+                } else {
+                    (0, 0)
+                };
+                totals.allocated = totals.allocated.saturating_add(bytes);
+                totals.apparent = totals.apparent.saturating_add(size);
+                if let Some(index) = node {
+                    let own = &mut self.tree.node(index).own_files;
+                    own.files += 1;
+                    own.allocated = own.allocated.saturating_add(bytes);
+                    own.apparent = own.apparent.saturating_add(size);
+                }
+            }
+        }
+        // SAFETY: stream is valid and closed exactly once.
+        unsafe { libc::closedir(stream) };
+        if let Some(index) = node {
+            self.prune(index, self.limits.top_children);
+        }
+        totals
+    }
+
+    /// Count a subdirectory: its own inode plus its subtree.
+    fn directory(
+        &mut self,
+        parent: libc::c_int,
+        name: &CStr,
+        stat: &libc::stat,
+        node: Option<usize>,
+        depth: usize,
+    ) -> Totals {
+        let mut sub = Totals {
+            allocated: allocated(stat),
+            apparent: apparent(stat),
+            ..Totals::default()
+        };
+        let child_node = (node.is_some() && depth <= self.limits.keep_depth && self.reserve())
+            .then(|| {
+                self.tree.alloc(
+                    DirNode {
+                        name: sanitize_bytes(name.to_bytes()),
+                        ..DirNode::default()
+                    },
+                    node,
+                    depth,
+                )
+            });
+        if depth >= self.limits.max_depth {
+            sub.truncated = true;
+        } else {
+            // SAFETY: name is NUL-terminated; O_NOFOLLOW refuses a symlink that
+            // replaced the directory after fstatat, O_DIRECTORY anything else.
+            let child = unsafe {
+                libc::openat(
+                    parent,
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if child < 0 {
+                sub.unreadable += 1;
+            } else {
+                // SAFETY: openat returned a new descriptor that we now own.
+                let child = unsafe { OwnedFd::from_raw_fd(child) };
+                match stat_fd(child.as_raw_fd()) {
+                    // A mount or replacement appeared between fstatat and openat.
+                    Ok(opened) if opened.st_dev != stat.st_dev || opened.st_ino != stat.st_ino => {
+                        sub.unreadable += 1;
+                    }
+                    Ok(_) => {
+                        let inner = self.walk(child, child_node, depth);
+                        sub.add(&inner);
+                    }
+                    Err(_) => sub.unreadable += 1,
+                }
+            }
+        }
+        match (child_node, node) {
+            (Some(index), Some(parent)) => {
+                let slot = self.tree.slots[index].as_mut().expect("live slot");
+                slot.finished = true;
+                let entry = &mut slot.node;
+                entry.allocated = sub.allocated;
+                entry.apparent = sub.apparent;
+                entry.files = sub.files;
+                entry.dirs = sub.dirs;
+                entry.unreadable = sub.unreadable;
+                entry.truncated = sub.truncated;
+                let siblings = &mut self.tree.node(parent).children;
+                siblings.push(index as u32);
+                // Exact streaming top-K: an evicted child can never re-enter.
+                if siblings.len() > 2 * self.limits.top_children {
+                    self.prune(parent, self.limits.top_children);
+                }
+            }
+            (None, Some(parent)) => fold(&mut self.tree.node(parent).other, &sub),
+            _ => {}
+        }
+        sub
+    }
+
+    /// Room for one more retained node, evicting low-priority ones if needed.
+    fn reserve(&mut self) -> bool {
+        let cap = self.limits.max_nodes.saturating_mul(2) + self.limits.keep_depth + 1;
+        if self.tree.live >= cap {
+            self.tree.evict_to(self.limits.max_nodes);
+        }
+        self.tree.live < cap
+    }
+
+    fn first_link(&mut self, device: u64, inode: u64) -> bool {
+        if self.hardlinks.contains(&(device, inode)) {
+            return false;
+        }
+        if self.hardlinks.len() >= self.limits.max_hardlinks {
+            self.hardlink_limit_reached = true;
+        } else {
+            self.hardlinks.insert((device, inode));
+        }
+        true
+    }
+
+    /// Keep only the largest subdirectories of a node; summarize the rest.
+    fn prune(&mut self, index: usize, keep: usize) {
+        let mut children = std::mem::take(&mut self.tree.node(index).children);
+        children
+            .sort_by_key(|child| std::cmp::Reverse(self.tree.slot(*child as usize).node.allocated));
+        if children.len() > keep {
+            for child in children.split_off(keep) {
+                let totals = Totals::of(&self.tree.slot(child as usize).node);
+                fold(&mut self.tree.node(index).other, &totals);
+                self.tree.release_subtree(child as usize);
+            }
+        }
+        self.tree.node(index).children = children;
+    }
+}
+
+fn fold(other: &mut Folded, totals: &Totals) {
+    other.dirs = other.dirs.saturating_add(1);
+    other.allocated = other.allocated.saturating_add(totals.allocated);
+    other.apparent = other.apparent.saturating_add(totals.apparent);
+    other.files = other.files.saturating_add(totals.files);
+}
+
+/// Scan `root` once. Fails only if the root itself cannot be opened.
+pub fn scan(
+    root: &Path,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    progress: &AtomicU64,
+) -> io::Result<HomeReport> {
+    let started = Instant::now();
+    let started_unix = unix_now();
+    let path = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+    // SAFETY: path is NUL-terminated; the root itself may be a symlink.
+    let descriptor = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: open returned a new descriptor that we now own.
+    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    let stat = stat_fd(descriptor.as_raw_fd())?;
+    progress.store(0, Ordering::Relaxed);
+    let mut walker = Walker {
+        limits,
+        cancel,
+        progress,
+        started,
+        root_dev: stat.st_dev,
+        entries: 0,
+        stopped: None,
+        other_filesystems: 0,
+        hardlinks: HashSet::new(),
+        hardlink_limit_reached: false,
+        tree: Tree::default(),
+    };
+    walker.tree.alloc(
+        DirNode {
+            name: sanitize_bytes(root.as_os_str().as_bytes()),
+            ..DirNode::default()
+        },
+        None,
+        0,
+    );
+    let mut totals = walker.walk(descriptor, Some(0), 0);
+    totals.allocated = totals.allocated.saturating_add(allocated(&stat));
+    totals.apparent = totals.apparent.saturating_add(apparent(&stat));
+    walker.tree.evict_to(limits.max_nodes);
+    let root_node = walker.tree.node(0);
+    root_node.allocated = totals.allocated;
+    root_node.apparent = totals.apparent;
+    root_node.files = totals.files;
+    root_node.dirs = totals.dirs;
+    root_node.unreadable = totals.unreadable;
+    root_node.truncated = totals.truncated;
+    progress.store(walker.entries, Ordering::Relaxed);
+    Ok(HomeReport {
+        root: sanitize_bytes(root.as_os_str().as_bytes()),
+        generation: 0,
+        started_unix,
+        duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        entries: walker.entries.min(limits.max_entries),
+        stopped: walker.stopped,
+        other_filesystems: walker.other_filesystems,
+        hardlink_limit_reached: walker.hardlink_limit_reached,
+        privileged: false,
+        nodes: walker.tree.into_nodes(),
+    })
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+/// Annotate allocated growth against earlier scans of the same root, keyed
+/// by the retained directory paths.
+fn path_sizes(report: &HomeReport) -> HashMap<String, u64> {
+    let mut sizes = HashMap::with_capacity(report.nodes.len());
+    let mut stack = vec![(0u32, String::new())];
+    while let Some((index, path)) = stack.pop() {
+        let Some(node) = report.node(index) else {
+            continue;
+        };
+        sizes.insert(path.clone(), node.allocated);
+        for child in &node.children {
+            if let Some(child_node) = report.node(*child) {
+                stack.push((*child, format!("{path}/{}", child_node.name)));
+            }
+        }
+    }
+    sizes
+}
+
+fn annotate(
+    report: &mut HomeReport,
+    previous: Option<&HashMap<String, u64>>,
+    first: Option<&HashMap<String, u64>>,
+) {
+    let mut stack = vec![(0u32, String::new())];
+    while let Some((index, path)) = stack.pop() {
+        let Some(node) = report.nodes.get_mut(index as usize) else {
+            continue;
+        };
+        let current = node.allocated;
+        let growth = |map: Option<&HashMap<String, u64>>| {
+            map.and_then(|map| map.get(&path)).map(|old| {
+                (current as i128 - *old as i128).clamp(i64::MIN.into(), i64::MAX.into()) as i64
+            })
+        };
+        node.growth_previous = growth(previous);
+        node.growth_start = growth(first);
+        let children: Vec<u32> = node.children.clone();
+        for child in children {
+            if let Some(child_node) = report.nodes.get(child as usize) {
+                stack.push((child, format!("{path}/{}", child_node.name)));
+            }
+        }
+    }
+}
+
+/// Root, sizes after the previous scan, and sizes after the first scan.
+type History = (PathBuf, HashMap<String, u64>, HashMap<String, u64>);
+
+struct State {
+    root: PathBuf,
+    interval: Duration,
+    rescan: bool,
+    scanning: bool,
+    scan_started: Option<Instant>,
+    report: Option<Arc<HomeReport>>,
+    last_finished: Option<Instant>,
+    last_finished_unix: Option<u64>,
+    error: Option<String>,
+}
+
+struct Shared {
+    state: Mutex<State>,
+    wake: Condvar,
+    cancel: AtomicBool,
+    stop: AtomicBool,
+    progress: AtomicU64,
+    privileged: bool,
+}
+
+/// Periodic background scans in a dedicated, low-priority thread.
+pub struct HomeService {
+    shared: Arc<Shared>,
+}
+
+impl HomeService {
+    /// `prepare` runs first in the new thread, for example to drop
+    /// capabilities and lower I/O priority. Its failure becomes a visible
+    /// error and no scan runs.
+    pub fn start(
+        root: PathBuf,
+        interval: Duration,
+        limits: Limits,
+        privileged: bool,
+        prepare: fn() -> Result<()>,
+    ) -> io::Result<Self> {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State {
+                root,
+                interval,
+                rescan: true,
+                scanning: false,
+                scan_started: None,
+                report: None,
+                last_finished: None,
+                last_finished_unix: None,
+                error: None,
+            }),
+            wake: Condvar::new(),
+            cancel: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            progress: AtomicU64::new(0),
+            privileged,
+        });
+        let worker = Arc::clone(&shared);
+        std::thread::Builder::new()
+            .name("disktop-scan".into())
+            // Directory recursion is depth-bounded; leave generous room.
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || run(worker, limits, prepare))?;
+        Ok(Self { shared })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Change the root or interval; a new root discards the old tree and
+    /// growth history and starts scanning at once.
+    pub fn configure(&self, root: PathBuf, interval: Duration) {
+        let mut state = self.lock();
+        state.interval = interval;
+        if state.root != root {
+            state.root = root;
+            state.report = None;
+            state.error = None;
+            state.rescan = true;
+            self.shared.cancel.store(true, Ordering::Relaxed);
+        }
+        self.shared.wake.notify_all();
+    }
+
+    pub fn rescan(&self) {
+        let mut state = self.lock();
+        state.rescan = true;
+        self.shared.wake.notify_all();
+    }
+
+    pub fn status(&self) -> HomeStatus {
+        let state = self.lock();
+        let scan_state = if state.scanning {
+            ScanState::Scanning
+        } else if state.error.is_some() {
+            ScanState::Failed
+        } else if state.report.is_some() {
+            ScanState::Done
+        } else {
+            ScanState::Idle
+        };
+        HomeStatus {
+            root: sanitize_bytes(state.root.as_os_str().as_bytes()),
+            state: scan_state,
+            generation: state.report.as_ref().map_or(0, |report| report.generation),
+            progress_entries: if state.scanning {
+                self.shared.progress.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            progress_seconds: state
+                .scan_started
+                .filter(|_| state.scanning)
+                .map_or(0.0, |started| started.elapsed().as_secs_f64()),
+            last_finished_unix: state.last_finished_unix,
+            next_scan_in_seconds: (!state.scanning)
+                .then(|| {
+                    state
+                        .last_finished
+                        .map(|finished| state.interval.saturating_sub(finished.elapsed()).as_secs())
+                })
+                .flatten(),
+            privileged: self.shared.privileged,
+            error: state.error.clone(),
+        }
+    }
+
+    /// A copy of the latest report if it is newer than `known`.
+    pub fn report_if_newer(&self, known: u64) -> Option<HomeReport> {
+        let state = self.lock();
+        state
+            .report
+            .as_ref()
+            .filter(|report| report.generation > known)
+            .map(|report| (**report).clone())
+    }
+}
+
+impl Drop for HomeService {
+    fn drop(&mut self) {
+        // The thread is detached: a scan blocked in a slow filesystem call
+        // must not delay the UI's exit. It stops at its next entry.
+        self.shared.stop.store(true, Ordering::Relaxed);
+        self.shared.cancel.store(true, Ordering::Relaxed);
+        self.shared.wake.notify_all();
+    }
+}
+
+fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, State> {
+    shared
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn run(shared: Arc<Shared>, limits: Limits, prepare: fn() -> Result<()>) {
+    if let Err(error) = prepare() {
+        lock(&shared).error = Some(sanitize(&format!("{error:#}")));
+        return;
+    }
+    let mut history: Option<History> = None;
+    let mut generation = 0u64;
+    loop {
+        let root = {
+            let mut state = lock(&shared);
+            loop {
+                if shared.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let due = state
+                    .last_finished
+                    .is_none_or(|finished| finished.elapsed() >= state.interval);
+                if state.rescan || due {
+                    break;
+                }
+                let wait = state
+                    .last_finished
+                    .map_or(state.interval, |finished| {
+                        state.interval.saturating_sub(finished.elapsed())
+                    })
+                    .min(Duration::from_secs(1));
+                state = shared
+                    .wake
+                    .wait_timeout(state, wait)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0;
+            }
+            state.rescan = false;
+            state.scanning = true;
+            state.scan_started = Some(Instant::now());
+            shared.cancel.store(false, Ordering::Relaxed);
+            state.root.clone()
+        };
+        let result = scan(&root, &limits, &shared.cancel, &shared.progress);
+        let mut state = lock(&shared);
+        state.scanning = false;
+        state.last_finished = Some(Instant::now());
+        state.last_finished_unix = Some(unix_now());
+        if shared.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if state.root != root {
+            continue; // Reconfigured meanwhile; `rescan` is already set.
+        }
+        match result {
+            Ok(mut report) => {
+                if history.as_ref().is_none_or(|(path, _, _)| *path != root) {
+                    history = None;
+                }
+                annotate(
+                    &mut report,
+                    history.as_ref().map(|(_, previous, _)| previous),
+                    history.as_ref().map(|(_, _, first)| first),
+                );
+                let sizes = path_sizes(&report);
+                history = Some(match history.take() {
+                    Some((path, _, first)) => (path, sizes, first),
+                    None => (root.clone(), sizes.clone(), sizes),
+                });
+                generation += 1;
+                report.generation = generation;
+                report.privileged = shared.privileged;
+                state.report = Some(Arc::new(report));
+                state.error = None;
+            }
+            Err(error) => {
+                state.error = Some(sanitize(&format!(
+                    "cannot scan {}: {error}",
+                    root.display()
+                )));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt, symlink},
+    };
+
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new(label: &str) -> Self {
+            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "disktop-scan-{label}-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            // Restore permissions so cleanup can descend everywhere.
+            let _ = fs::set_permissions(
+                self.0.join("alice/private"),
+                fs::Permissions::from_mode(0o755),
+            );
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn run_scan(root: &Path, limits: &Limits) -> HomeReport {
+        scan(root, limits, &AtomicBool::new(false), &AtomicU64::new(0)).unwrap()
+    }
+
+    fn child<'a>(report: &'a HomeReport, parent: u32, name: &str) -> &'a DirNode {
+        let node = report.node(parent).unwrap();
+        node.children
+            .iter()
+            .map(|index| report.node(*index).unwrap())
+            .find(|node| node.name == name)
+            .unwrap_or_else(|| panic!("{name} missing"))
+    }
+
+    fn running_as_root() -> bool {
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[test]
+    fn sizes_hardlinks_symlinks_and_unreadable_directories() {
+        let tree = TempTree::new("basic");
+        let root = &tree.0;
+        fs::create_dir_all(root.join("alice/docs/deep")).unwrap();
+        fs::create_dir_all(root.join("bob")).unwrap();
+        fs::write(root.join("alice/docs/a.bin"), vec![1u8; 64 * 1024]).unwrap();
+        fs::write(root.join("alice/docs/deep/b.bin"), vec![2u8; 32 * 1024]).unwrap();
+        fs::write(root.join("bob/c.bin"), vec![3u8; 16 * 1024]).unwrap();
+        // A hard link to the same inode is counted once.
+        fs::hard_link(root.join("bob/c.bin"), root.join("alice/c-link.bin")).unwrap();
+        // Symlinks are counted as entries but never followed.
+        let outside = TempTree::new("outside");
+        fs::write(outside.0.join("huge.bin"), vec![4u8; 256 * 1024]).unwrap();
+        symlink(&outside.0, root.join("alice/escape")).unwrap();
+        // Non-UTF-8 and control characters are displayed safely.
+        fs::create_dir(root.join(std::ffi::OsStr::from_bytes(b"bad\xffname\n"))).unwrap();
+        fs::create_dir_all(root.join("alice/private/hidden")).unwrap();
+        fs::write(root.join("alice/private/hidden/secret"), vec![5u8; 8192]).unwrap();
+        fs::set_permissions(
+            root.join("alice/private"),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        let report = run_scan(root, &Limits::default());
+        let top = report.root_node().unwrap();
+        assert_eq!(report.stopped, None);
+        let alice = child(&report, 0, "alice");
+        let bob = child(&report, 0, "bob");
+        let docs = child(&report, report.resolve(&["alice".into()]).0, "docs");
+        assert!(docs.allocated >= 96 * 1024, "{}", docs.allocated);
+        assert_eq!(
+            docs.apparent,
+            96 * 1024
+                + fs::metadata(root.join("alice/docs")).unwrap().len()
+                + fs::metadata(root.join("alice/docs/deep")).unwrap().len()
+        );
+        assert_eq!(docs.files, 2);
+        assert_eq!(docs.dirs, 1);
+        // Exactly one of the two links carries the 16 KiB.
+        let linked = alice.own_files.apparent + bob.own_files.apparent;
+        assert_eq!(
+            linked,
+            16 * 1024
+                + fs::symlink_metadata(root.join("alice/escape"))
+                    .unwrap()
+                    .len()
+        );
+        assert!(top.allocated < 256 * 1024, "symlink was followed");
+        assert!(
+            report
+                .nodes
+                .iter()
+                .any(|node| node.name == "bad\\xffname\\x0a"),
+            "non-UTF-8 name"
+        );
+        if !running_as_root() {
+            let private = child(&report, report.resolve(&["alice".into()]).0, "private");
+            assert_eq!(private.unreadable, 1);
+            assert!(private.partial() && alice.partial() && top.partial());
+            assert!(!bob.partial());
+        }
+        // The tree is navigable by sanitized names.
+        assert_eq!(
+            report
+                .resolve(&["alice".into(), "docs".into(), "deep".into()])
+                .1,
+            3
+        );
+        assert_eq!(report.resolve(&["alice".into(), "gone".into()]).1, 1);
+    }
+
+    #[test]
+    fn budgets_depth_and_node_limits_bound_the_result() {
+        let tree = TempTree::new("bounds");
+        let root = &tree.0;
+        for index in 0..30 {
+            let directory = root.join(format!("d{index:02}"));
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("f"), vec![0u8; 4096 * (index + 1)]).unwrap();
+        }
+        let mut deep = root.join("d29");
+        for level in 0..12 {
+            deep = deep.join(format!("l{level}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("deepest"), vec![0u8; 4096]).unwrap();
+
+        let limits = Limits {
+            top_children: 5,
+            keep_depth: 3,
+            max_depth: 6,
+            ..Limits::default()
+        };
+        let report = run_scan(root, &limits);
+        let top = report.root_node().unwrap();
+        assert_eq!(top.children.len(), 5);
+        // The largest directories are kept, sorted by allocated size.
+        assert_eq!(report.node(top.children[0]).unwrap().name, "d29");
+        assert_eq!(top.other.dirs, 25);
+        let kept: u64 = top
+            .children
+            .iter()
+            .map(|child| report.node(*child).unwrap().allocated)
+            .sum();
+        assert!(kept + top.other.allocated <= top.allocated);
+        assert!(top.truncated, "max_depth must mark the subtree truncated");
+        assert!(report.nodes.len() <= 5 + 1 + 3, "{}", report.nodes.len());
+        let (_, depth) = report.resolve(&["d29".into(), "l0".into(), "l1".into(), "l2".into()]);
+        assert_eq!(depth, 3, "keep_depth limits retained nodes");
+
+        let report = run_scan(
+            root,
+            &Limits {
+                max_entries: 10,
+                ..Limits::default()
+            },
+        );
+        assert_eq!(report.stopped, Some(StopReason::EntryBudget));
+        assert_eq!(report.entries, 10);
+        let cancelled = scan(
+            root,
+            &Limits::default(),
+            &AtomicBool::new(true),
+            &AtomicU64::new(0),
+        )
+        .unwrap();
+        // Cancellation is checked periodically; small trees may finish first.
+        assert!(matches!(
+            cancelled.stopped,
+            None | Some(StopReason::Cancelled)
+        ));
+        let report = run_scan(
+            root,
+            &Limits {
+                max_nodes: 3,
+                ..Limits::default()
+            },
+        );
+        assert!(report.nodes.len() <= 3);
+        assert!(report.root_node().unwrap().other.dirs >= 28);
+    }
+
+    #[test]
+    fn node_budget_prefers_shallow_and_large_directories_over_visit_order() {
+        let tree = TempTree::new("budget");
+        let root = &tree.0;
+        let mut deep = root.join("deep");
+        for level in 0..20 {
+            deep = deep.join(format!("l{level}"));
+            fs::create_dir_all(&deep).unwrap();
+            fs::create_dir(deep.with_file_name(format!("side{level}"))).unwrap();
+        }
+        for (index, size) in [(1, 64), (2, 128), (3, 256)] {
+            let directory = root.join(format!("big{index}"));
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("data"), vec![1u8; size * 1024]).unwrap();
+        }
+        let report = run_scan(
+            root,
+            &Limits {
+                max_nodes: 6,
+                ..Limits::default()
+            },
+        );
+        assert!(report.nodes.len() <= 6, "{}", report.nodes.len());
+        let top: Vec<_> = report
+            .root_node()
+            .unwrap()
+            .children
+            .iter()
+            .map(|index| report.node(*index).unwrap().name.as_str())
+            .collect();
+        for name in ["big3", "big2", "big1", "deep"] {
+            assert!(top.contains(&name), "{name} missing from {top:?}");
+        }
+        // Everything not retained is still counted in the parents' totals.
+        let deep_node = child(&report, 0, "deep");
+        assert_eq!(deep_node.dirs, 40);
+        let kept: u64 = report.nodes.iter().skip(1).map(|node| node.files).sum();
+        assert!(kept <= report.root_node().unwrap().files);
+    }
+
+    #[test]
+    fn hardlink_limit_is_reported_and_other_filesystems_are_skipped() {
+        let tree = TempTree::new("links");
+        let root = &tree.0;
+        for index in 0..4 {
+            fs::write(root.join(format!("f{index}")), vec![0u8; 4096]).unwrap();
+            fs::hard_link(
+                root.join(format!("f{index}")),
+                root.join(format!("g{index}")),
+            )
+            .unwrap();
+        }
+        let report = run_scan(
+            root,
+            &Limits {
+                max_hardlinks: 2,
+                ..Limits::default()
+            },
+        );
+        assert!(report.hardlink_limit_reached);
+        // /dev usually contains separate mounts (pts, shm, mqueue).
+        let dev = run_scan(Path::new("/dev"), &Limits::default());
+        let pts_is_mount = fs::metadata("/dev/pts").is_ok_and(|pts| {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata("/dev").is_ok_and(|dev| dev.dev() != pts.dev())
+        });
+        if pts_is_mount {
+            assert!(dev.other_filesystems >= 1);
+        }
+        assert!(
+            scan(
+                Path::new("/nonexistent-disktop"),
+                &Limits::default(),
+                &AtomicBool::new(false),
+                &AtomicU64::new(0)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn root_validation() {
+        for valid in ["/", "/home", "/srv/home dirs", "/home/Grüße"] {
+            assert!(validate_root(valid).is_ok(), "{valid}");
+        }
+        for invalid in [
+            "",
+            "home",
+            "/home/",
+            "//home",
+            "/home/../etc",
+            "/home/./x",
+            "/a\nb",
+        ] {
+            assert!(validate_root(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(validate_root(&format!("/{}", "a".repeat(MAX_ROOT_BYTES))).is_err());
+    }
+
+    #[test]
+    fn service_scans_reports_growth_and_follows_reconfiguration() {
+        let tree = TempTree::new("service");
+        fs::create_dir(tree.0.join("grow")).unwrap();
+        let service = HomeService::start(
+            tree.0.clone(),
+            Duration::from_secs(3600),
+            Limits::default(),
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        let wait = |known: u64| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(report) = service.report_if_newer(known) {
+                    return report;
+                }
+                assert!(Instant::now() < deadline, "scan did not finish");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let first = wait(0);
+        assert_eq!(first.generation, 1);
+        assert_eq!(first.root_node().unwrap().growth_previous, None);
+        assert_eq!(service.status().state, ScanState::Done);
+        assert!(service.report_if_newer(1).is_none());
+        fs::write(tree.0.join("grow/new.bin"), vec![7u8; 128 * 1024]).unwrap();
+        service.rescan();
+        let second = wait(1);
+        let grow = child(&second, 0, "grow");
+        assert!(grow.growth_previous.unwrap() >= 128 * 1024);
+        assert_eq!(grow.growth_previous, grow.growth_start);
+        let other = TempTree::new("service-other");
+        service.configure(other.0.clone(), Duration::from_secs(3600));
+        let third = wait(2);
+        assert_eq!(third.root, sanitize_bytes(other.0.as_os_str().as_bytes()));
+        assert_eq!(
+            third.root_node().unwrap().growth_previous,
+            None,
+            "new root resets growth"
+        );
+        service.configure(
+            PathBuf::from("/nonexistent-disktop"),
+            Duration::from_secs(3600),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while service.status().state != ScanState::Failed {
+            assert!(
+                Instant::now() < deadline,
+                "missing root did not fail visibly"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            service
+                .status()
+                .error
+                .unwrap()
+                .contains("nonexistent-disktop")
+        );
+    }
+}
