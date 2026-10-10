@@ -1,6 +1,6 @@
 # Real kernel integration checks
 
-`kernel.py` covers [issue #7](https://github.com/itmitalles-de/disktop/issues/7)
+`kernel.py` covers [issue #7](https://github.com/itmitalles-de/spctop/issues/7)
 in a **fresh disposable QEMU/KVM VM**. It must never run on the workstation,
 on a production guest, or in a container sharing the workstation's kernel.
 It requires explicit `--isolated-vm`, root, a private mount namespace and
@@ -21,20 +21,20 @@ helper scan-root configuration, export configuration and its nftables table.
    ```sh
    sudo apt-get update
    sudo apt-get install -y nfs-kernel-server nfs-common nftables libcap2-bin python3
-   sudo mkdir -p /etc/exports.d /opt/disktop-kernel
+   sudo mkdir -p /etc/exports.d /opt/spctop-kernel
    ```
 
 3. Build both binaries with `cargo build --release` on a compatible Linux
    system and copy them, plus `tests/kernel.py`, into the VM. Install the
-   binaries in `/opt/disktop-kernel/` with mode 0755 so the temporary users can
+   binaries in `/opt/spctop-kernel/` with mode 0755 so the temporary users can
    execute them (an SSH user's private home directory is unsuitable).
 4. Run in the guest:
 
    ```sh
    sudo unshare --mount --propagation private \
      python3 /path/to/kernel.py --isolated-vm \
-     --evidence /var/tmp/disktop-kernel-evidence \
-     /opt/disktop-kernel/disktop /opt/disktop-kernel/disktop-collector
+     --evidence /var/tmp/spctop-kernel-evidence \
+     /opt/spctop-kernel/spctop /opt/spctop-kernel/spctop-collector
    ```
 
    `--only hidepid` or `--only nfs` selects one part. Both parts are required

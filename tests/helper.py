@@ -5,7 +5,7 @@ Run only in an isolated container/runner as root, with DAC_READ_SEARCH,
 SYS_PTRACE and SETFCAP in its capability bounding set. This test installs at
 the real helper path and refuses to replace a pre-existing installation:
 
-  python3 tests/helper.py --isolated target/release/disktop target/release/disktop-collector
+  python3 tests/helper.py --isolated target/release/spctop target/release/spctop-collector
 
 The UI itself runs as nobody with no supplementary groups or capabilities.
 Every process, directory and installed file is test-owned.
@@ -31,13 +31,14 @@ import time
 from unittest.mock import patch
 
 
-HELPER = Path("/usr/local/libexec/disktop-collector")
-RECEIPT = HELPER.with_name(".disktop-collector.sha256")
+HELPER = Path("/usr/local/libexec/spctop-collector")
+RECEIPT = HELPER.with_name(".spctop-collector.sha256")
 READ_CAPS = (1 << 2) | (1 << 19)
 SCAN_CAPS = 1 << 2
 FILE_CAPS = "cap_dac_read_search,cap_sys_ptrace=ep"
-HOME = Path("/srv/disktop-home")
-SCAN_ROOTS = Path("/etc/disktop/scan-roots")
+HOME = Path("/srv/spctop-home")
+SCAN_ROOTS = Path("/etc/spctop/scan-roots")
+LEGACY_SCAN_ROOTS = Path("/etc/disktop/scan-roots")
 SECRET_NAME = "secret-file-name-never-reported"
 MIB = 1024 * 1024
 
@@ -89,7 +90,7 @@ def run_json(binary, account, *arguments, timeout=20):
         check=False,
         **unprivileged(account),
     )
-    assert result.returncode == 0, f"disktop {arguments} failed: {result.stderr}"
+    assert result.returncode == 0, f"spctop {arguments} failed: {result.stderr}"
     return json.loads(result.stdout), result.stdout, result.stderr
 
 
@@ -115,7 +116,7 @@ def check_threads(binary, account):
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env={**os.environ, "TERM": "xterm-256color", "LC_ALL": "C.UTF-8", "DISKTOP_INJECTED": "1"},
+            env={**os.environ, "TERM": "xterm-256color", "LC_ALL": "C.UTF-8", "SPCTOP_INJECTED": "1"},
             start_new_session=True,
             **unprivileged(account),
         )
@@ -125,7 +126,7 @@ def check_threads(binary, account):
         def scanner_started():
             tasks = list(Path(f"/proc/{helper_pid}/task").iterdir())
             names = {task.name: (task / "comm").read_text().strip() for task in tasks}
-            return names if "disktop-scan" in names.values() else None
+            return names if "spctop-scan" in names.values() else None
 
         names = wait_until(scanner_started, "home scanner thread")
         ui = status(monitor.pid)
@@ -134,7 +135,7 @@ def check_threads(binary, account):
             assert int(ui[field], 16) == 0, f"UI retained {field}: {ui[field]}"
         for tid, comm in names.items():
             state = status(helper_pid, tid)
-            expected = SCAN_CAPS if comm == "disktop-scan" else READ_CAPS
+            expected = SCAN_CAPS if comm == "spctop-scan" else READ_CAPS
             assert all(int(value) == account.pw_uid for value in state["Uid"].split()), "Helper changed UID"
             assert int(state["CapEff"], 16) == expected, f"{comm}: CapEff {state['CapEff']}"
             assert int(state["CapPrm"], 16) == expected, f"{comm}: CapPrm {state['CapPrm']}"
@@ -216,11 +217,11 @@ def check_home_scan(binary, account):
           "only directory names and sizes are returned")
 
 
-def write_scan_roots(text, mode=0o644):
-    SCAN_ROOTS.parent.mkdir(mode=0o755, exist_ok=True)
-    SCAN_ROOTS.write_text(text)
-    os.chown(SCAN_ROOTS, 0, 0)
-    SCAN_ROOTS.chmod(mode)
+def write_scan_roots(text, mode=0o644, path=SCAN_ROOTS):
+    path.parent.mkdir(mode=0o755, exist_ok=True)
+    path.write_text(text)
+    os.chown(path, 0, 0)
+    path.chmod(mode)
 
 
 def run_scan(binary, account, root, scan=True):
@@ -244,7 +245,7 @@ def check_scan_roots(binary, account):
     an allowed root cannot widen the helper's reach."""
     escape = HOME / "bob" / "escape-to-root"
     escape.symlink_to("/root")
-    Path("/root/disktop-test-private").mkdir(exist_ok=True)
+    Path("/root/spctop-test-private").mkdir(exist_ok=True)
     try:
         # Allowed below the listed root: privileged.
         code, snapshot, errors = run_scan(binary, account, HOME / "bob")
@@ -258,7 +259,7 @@ def check_scan_roots(binary, account):
         assert home["helper_refused"] and not home["privileged"], home
         code, snapshot, errors = run_scan(binary, account, "/root")
         assert code != 0 and "Permission denied" in errors, (code, errors)
-        assert "disktop-test-private" not in errors
+        assert "spctop-test-private" not in errors
         # A symlink below an allowed root is not followed by the helper.
         code, snapshot, errors = run_scan(binary, account, escape)
         assert code != 0 and "Permission denied" in errors, (code, errors)
@@ -275,10 +276,81 @@ def check_scan_roots(binary, account):
             assert code == 0 and snapshot["home"]["helper_refused"], snapshot["home"]
     finally:
         escape.unlink()
-        Path("/root/disktop-test-private").rmdir()
+        Path("/root/spctop-test-private").rmdir()
         write_scan_roots(f"# test root\n{HOME}\n")
     print("PASS scan roots: helper scans only allowlisted roots (default /home); /root, a symlink "
           "escape and an unsafe allowlist fall back to unprivileged scans")
+
+
+def check_policy_migration(binary, account):
+    """Legacy policies preserve restrictions; invalid policies never widen scans."""
+    def expect(root, privileged):
+        code, snapshot, errors = run_scan(binary, account, root, scan=False)
+        assert code == 0, errors
+        home = snapshot["home"]
+        assert bool(home.get("helper_refused")) == (not privileged), home
+        assert home["privileged"] == privileged, home
+
+    try:
+        SCAN_ROOTS.unlink()
+        write_scan_roots(f"{HOME}\n", path=LEGACY_SCAN_ROOTS)
+        expect(HOME, True)
+        expect("/home", False)
+
+        # The new policy replaces the old one, rather than merging allowed roots.
+        write_scan_roots("/home\n")
+        expect("/home", True)
+        expect(HOME, False)
+
+        # Invalid new policy must not fall back to the valid restrictive old one.
+        write_scan_roots("/home\n", mode=0o666)
+        expect("/home", False)
+        expect(HOME, False)
+        SCAN_ROOTS.unlink()
+        SCAN_ROOTS.symlink_to("/nonexistent-spctop-policy")
+        expect("/home", False)
+        expect(HOME, False)
+        SCAN_ROOTS.unlink()
+
+        # A missing leaf beneath a dangling parent symlink is unsafe, not absent.
+        SCAN_ROOTS.parent.rmdir()
+        SCAN_ROOTS.parent.symlink_to("/nonexistent-spctop-policy")
+        expect("/home", False)
+        expect(HOME, False)
+        SCAN_ROOTS.parent.unlink()
+        SCAN_ROOTS.parent.mkdir(mode=0o755)
+
+        # With the new policy absent, unsafe legacy parents/files still deny.
+        LEGACY_SCAN_ROOTS.chmod(0o666)
+        expect("/home", False)
+        expect(HOME, False)
+        LEGACY_SCAN_ROOTS.unlink()
+        LEGACY_SCAN_ROOTS.parent.chmod(0o777)
+        expect("/home", False)
+        expect(HOME, False)
+        LEGACY_SCAN_ROOTS.parent.chmod(0o755)
+        LEGACY_SCAN_ROOTS.parent.rmdir()
+        LEGACY_SCAN_ROOTS.parent.symlink_to("/nonexistent-spctop-policy")
+        expect("/home", False)
+        expect(HOME, False)
+        LEGACY_SCAN_ROOTS.parent.unlink()
+
+        # Only safe absence of both policies grants the documented /home default.
+        expect("/home", True)
+        expect(HOME, False)
+    finally:
+        for path in (SCAN_ROOTS, LEGACY_SCAN_ROOTS):
+            if path.parent.is_symlink():
+                path.parent.unlink()
+            else:
+                if os.path.lexists(path):
+                    path.unlink()
+                if path.parent.exists():
+                    path.parent.chmod(0o755)
+                    path.parent.rmdir()
+        write_scan_roots(f"# test root\n{HOME}\n")
+    print("PASS policy migration: legacy restrictions, new precedence, invalid file/ancestor "
+          "fail-closed behavior and safe /home default")
 
 
 def check_no_helper(binary, account):
@@ -333,7 +405,7 @@ def check_protocol(account):
     result = subprocess.run(
         [str(HELPER)], capture_output=True, timeout=5, check=False, **unprivileged(account)
     )
-    assert result.returncode != 0 and b"launched by disktop" in result.stdout
+    assert result.returncode != 0 and b"launched by spctop" in result.stdout
     print("PASS helper rejects invalid versions, unknown fields, unsafe paths and unbounded/incomplete frames")
 
 
@@ -456,24 +528,24 @@ def check_abrupt_exit(binary, account):
         assert libc.prctl(36, previous_subreaper.value, 0, 0, 0) == 0
 
 
-INSTALLER_USERS = ("disktop-solo", "disktop-peer", "disktop-member")
+INSTALLER_USERS = ("spctop-solo", "spctop-peer", "spctop-member")
 
 
 def add_installer_accounts():
-    """disktop-solo has a user-private primary group; the other two accounts
+    """spctop-solo has a user-private primary group; the other two accounts
     are added to that group later to make it shared."""
     remove_installer_accounts()
-    subprocess.run(["groupadd", "disktop-solo"], check=True)
+    subprocess.run(["groupadd", "spctop-solo"], check=True)
     for name in INSTALLER_USERS:
         subprocess.run(["useradd", "--no-create-home", "--shell", "/usr/sbin/nologin",
-                        "--gid", "disktop-solo" if name == "disktop-solo" else "nogroup", name], check=True)
-    return pwd.getpwnam("disktop-solo")
+                        "--gid", "spctop-solo" if name == "spctop-solo" else "nogroup", name], check=True)
+    return pwd.getpwnam("spctop-solo")
 
 
 def remove_installer_accounts():
     for name in INSTALLER_USERS:
         subprocess.run(["userdel", name], check=False, capture_output=True)
-    subprocess.run(["groupdel", "disktop-solo"], check=False, capture_output=True)
+    subprocess.run(["groupdel", "spctop-solo"], check=False, capture_output=True)
 
 
 def check_installer(script, build, account):
@@ -551,8 +623,8 @@ def check_installer(script, build, account):
         assert_installed(solo)
         install(True, owner=solo, source=solo_build)
         # Supplementary membership and another account's primary group.
-        for change, undo, member in ((["--append", "--groups", "disktop-solo"], ["--groups", ""], "disktop-member"),
-                                     (["--gid", "disktop-solo"], ["--gid", "nogroup"], "disktop-peer")):
+        for change, undo, member in ((["--append", "--groups", "spctop-solo"], ["--groups", ""], "spctop-member"),
+                                     (["--gid", "spctop-solo"], ["--gid", "nogroup"], "spctop-peer")):
             subprocess.run(["usermod", *change, member], check=True)
             install(False, owner=solo, source=solo_build, expect=member)
             install(True, shared, owner=solo, source=solo_build)
@@ -621,6 +693,7 @@ def main():
     assert not os.path.lexists(HELPER) and not os.path.lexists(RECEIPT), "Refusing a pre-existing helper installation"
     assert not os.path.lexists(HOME), f"Refusing a pre-existing {HOME}"
     assert not os.path.lexists(SCAN_ROOTS.parent), f"Refusing a pre-existing {SCAN_ROOTS.parent}"
+    assert not os.path.lexists(LEGACY_SCAN_ROOTS.parent), f"Refusing a pre-existing {LEGACY_SCAN_ROOTS.parent}"
     binary = args.binary.resolve(strict=True)
     helper_binary = args.helper_binary.resolve(strict=True)
     script = Path(__file__).resolve().parents[1] / "scripts/setup-helper.sh"
@@ -630,11 +703,11 @@ def main():
         make_home(account)
         # The helper may scan the test tree only because it is listed here.
         write_scan_roots(f"# test root\n{HOME}\n")
-        with tempfile.TemporaryDirectory(prefix="disktop-helper-test-") as directory:
+        with tempfile.TemporaryDirectory(prefix="spctop-helper-test-") as directory:
             # Source ownership is checked by the real installer; allow nobody to
             # traverse the test staging directory without making it writable.
             os.chmod(directory, 0o755)
-            build = Path(directory) / "disktop-collector"
+            build = Path(directory) / "spctop-collector"
             shutil.copy2(helper_binary, build)
             os.chown(build, account.pw_uid, account.pw_gid)
             # Popen(user=...) changes credentials but inherits root's environment.
@@ -649,6 +722,7 @@ def main():
                 check_other_users(binary, account)
                 check_home_scan(binary, account)
                 check_scan_roots(binary, account)
+                check_policy_migration(binary, account)
                 check_no_helper(binary, account)
                 check_protocol(account)
                 check_stopped_helper(binary, account)
@@ -661,7 +735,11 @@ def main():
             if os.path.lexists(path):
                 path.unlink()
         shutil.rmtree(HOME, ignore_errors=True)
-        shutil.rmtree(SCAN_ROOTS.parent, ignore_errors=True)
+        for directory in (SCAN_ROOTS.parent, LEGACY_SCAN_ROOTS.parent):
+            if directory.is_symlink():
+                directory.unlink()
+            else:
+                shutil.rmtree(directory, ignore_errors=True)
     print("All capability helper checks passed.")
 
 

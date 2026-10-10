@@ -347,7 +347,7 @@ pub enum HomeErrorKind {
     NotNormalized,
     /// "." or ".." components.
     DotComponents,
-    /// The helper may scan only the roots in /etc/disktop/scan-roots, and
+    /// The helper may scan only the roots in /etc/spctop/scan-roots, and
     /// never through a symlink below them.
     NotAllowed,
     /// The scanner thread could not be started or prepared.

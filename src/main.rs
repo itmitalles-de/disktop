@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use crossterm::event::{self, Event, KeyEventKind};
-use disktop::{
+use spctop::{
     collector::{Collector, HomeScan, complete_storage, default_device},
     config::{ConfigFile, RootWithForeignSettings, Settings, SortKey, View},
     demo, diskstats,
@@ -35,7 +35,9 @@ enum SortArg {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ViewArg {
+    #[value(name = "io", alias = "processes")]
     Processes,
+    #[value(alias = "space")]
     Filesystems,
     Home,
 }
@@ -43,7 +45,7 @@ enum ViewArg {
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Linux disk monitor with nvtop-style I/O graphs, per-process I/O, filesystems and a home size view"
+    about = "Linux storage-space monitor with used-space history, directory growth and a separate I/O view"
 )]
 struct Args {
     /// Block device to show, for example nvme0n1 or sda; 'all' adds physical disks
@@ -58,7 +60,7 @@ struct Args {
     /// Process sort order
     #[arg(short, long, value_enum)]
     sort: Option<SortArg>,
-    /// Table shown below the graph
+    /// View: storage space (default), home directory growth, or I/O
     #[arg(long, value_enum)]
     view: Option<ViewArg>,
     /// Directory tree for the home view (default /home)
@@ -495,7 +497,7 @@ fn spawn_hangup_watchdog(shutdown: &SignalGuard) -> Arc<AtomicBool> {
     let done = Arc::clone(&finished);
     let requested = shutdown.flag();
     let spawned = std::thread::Builder::new()
-        .name("disktop-hangup".into())
+        .name("spctop-hangup".into())
         .spawn(move || {
             while !done.load(Ordering::Relaxed) {
                 let mut descriptor = libc::pollfd {
@@ -623,7 +625,7 @@ fn sample_once(
     }
 }
 
-/// A reader that exits early, as in `disktop --json | head`, is not an error.
+/// A reader that exits early, as in `spctop --json | head`, is not an error.
 fn ignore_closed_output(result: io::Result<()>) -> io::Result<()> {
     match result {
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
@@ -775,7 +777,7 @@ fn print_snapshot(out: &mut impl Write, app: &App, snapshot: &Snapshot) -> io::R
     };
     writeln!(
         out,
-        "disktop{}  {title}",
+        "spctop{}  {title}",
         if snapshot.demo { " DEMO" } else { "" }
     )?;
     if !snapshot.truncated.is_empty() {
@@ -793,106 +795,151 @@ fn print_snapshot(out: &mut impl Write, app: &App, snapshot: &Snapshot) -> io::R
             writeln!(
                 out,
                 "WARNING ZFS pool {}: {}",
-                disktop::text::sanitize(&pool.name),
-                disktop::text::sanitize(error)
+                spctop::text::sanitize(&pool.name),
+                spctop::text::sanitize(error)
             )?;
         }
     }
-    match app.selected_rates() {
-        Some(rates) => writeln!(
+    if app.settings.view == View::Processes {
+        match app.selected_rates() {
+            Some(rates) => writeln!(
+                out,
+                "READ {}  WRITE {}  IOPS {:.0}/{:.0}  UTIL {:.1}%  AWAIT {}",
+                format_rate(rates.read_rate),
+                format_rate(rates.write_rate),
+                rates.read_iops,
+                rates.write_iops,
+                rates.utilization_percent,
+                rates
+                    .await_ms
+                    .map_or_else(|| "-".to_owned(), |value| format!("{value:.2} ms"))
+            )?,
+            None => writeln!(out, "READ -  WRITE -  (no rates for this interval)")?,
+        }
+        // Every disk of the overview, as the terminal UI shows them.
+        writeln!(out)?;
+        writeln!(
             out,
-            "READ {}  WRITE {}  IOPS {:.0}/{:.0}  UTIL {:.1}%  AWAIT {}",
-            format_rate(rates.read_rate),
-            format_rate(rates.write_rate),
-            rates.read_iops,
-            rates.write_iops,
-            rates.utilization_percent,
-            rates
-                .await_ms
-                .map_or_else(|| "-".to_owned(), |value| format!("{value:.2} ms"))
-        )?,
-        None => writeln!(out, "READ -  WRITE -  (no rates for this interval)")?,
-    }
-    // Every disk of the overview, as the terminal UI shows them.
-    writeln!(out)?;
-    writeln!(
-        out,
-        "{:<12}  {:<5}  {:>12}  {:>12}  {:>6}  {:>9}  {:>4}  {:<21}  MOUNTS",
-        "DISK", "TYPE", "READ/s", "WRITE/s", "UTIL", "AWAIT", "USE", "USED / SIZE"
-    )?;
-    for device in app.overview_devices() {
-        let rates = device.rates.as_ref();
-        let usage = device.usage.as_ref();
-        let (percent, used) = match usage {
-            Some(usage) => match usage.percent() {
-                Some(percent) => (
-                    format!("{percent:.0}%"),
-                    format!(
-                        "{} / {}",
-                        format_bytes(usage.used_bytes as f64),
-                        format_bytes(usage.used_bytes.saturating_add(usage.available_bytes) as f64)
+            "{:<12}  {:<5}  {:>12}  {:>12}  {:>6}  {:>9}  {:>4}  {:<21}  MOUNTS",
+            "DISK", "TYPE", "READ/s", "WRITE/s", "UTIL", "AWAIT", "USE", "USED / SIZE"
+        )?;
+        for device in app.overview_devices() {
+            let rates = device.rates.as_ref();
+            let usage = device.usage.as_ref();
+            let (percent, used) = match usage {
+                Some(usage) => match usage.percent() {
+                    Some(percent) => (
+                        format!("{percent:.0}%"),
+                        format!(
+                            "{} / {}",
+                            format_bytes(usage.used_bytes as f64),
+                            format_bytes(
+                                usage.used_bytes.saturating_add(usage.available_bytes) as f64
+                            )
+                        ),
                     ),
+                    None if usage.filesystems == 0 && usage.unmeasured == 0 => (
+                        "-".into(),
+                        if usage.swap {
+                            "swap only"
+                        } else {
+                            "not mounted"
+                        }
+                        .into(),
+                    ),
+                    None => ("-".into(), "-".into()),
+                },
+                None => ("-".into(), "-".into()),
+            };
+            writeln!(
+                out,
+                "{:<12}  {:<5}  {:>12}  {:>12}  {:>6}  {:>9}  {:>4}  {:<21}  {}",
+                truncate(&device.name, 12),
+                device.kind.label(),
+                optional_rate(rates.map(|rates| rates.read_rate)),
+                optional_rate(rates.map(|rates| rates.write_rate)),
+                rates.map_or_else(
+                    || "-".to_owned(),
+                    |rates| format!("{:.1}%", rates.utilization_percent)
                 ),
-                None if usage.filesystems == 0 && usage.unmeasured == 0 => (
-                    "-".into(),
+                rates
+                    .and_then(|rates| rates.await_ms)
+                    .map_or_else(|| "-".to_owned(), |value| format!("{value:.2} ms")),
+                percent,
+                used,
+                truncate(&device.mounts.join(" "), 40)
+            )?;
+        }
+        writeln!(out)?;
+        let access = &snapshot.process_access;
+        writeln!(
+            out,
+            "Processes: {} readable, {} not readable; {}",
+            access.readable, access.unreadable, access.message
+        )?;
+        writeln!(
+            out,
+            "{:>8}  {:<12}  {:>12}  {:>12}  COMMAND",
+            "PID", "USER", "READ/s", "WRITE/s"
+        )?;
+        for row in app.process_rows().into_iter().take(15) {
+            writeln!(
+                out,
+                "{:>8}  {}  {:>12}  {:>12}  {}",
+                row.pid,
+                pad(&row.user, 12),
+                optional_rate(row.read_rate),
+                optional_rate(row.write_rate),
+                truncate(&row.command, 60)
+            )?;
+        }
+    } else {
+        writeln!(out, "SPACE  Used / Free / Use%")?;
+        writeln!(out)?;
+        writeln!(
+            out,
+            "{:<12}  {:<5}  {:>12}  {:>12}  {:>6}  MOUNTS",
+            "DISK", "TYPE", "USED", "FREE", "USE%"
+        )?;
+        for device in app.overview_devices() {
+            let usage = device.usage.as_ref();
+            let measured = usage.filter(|usage| usage.percent().is_some());
+            let note = usage
+                .filter(|usage| usage.filesystems == 0 && usage.unmeasured == 0)
+                .map_or("", |usage| {
                     if usage.swap {
                         "swap only"
                     } else {
                         "not mounted"
                     }
-                    .into(),
+                });
+            writeln!(
+                out,
+                "{:<12}  {:<5}  {:>12}  {:>12}  {:>6}  {} {}",
+                truncate(&device.name, 12),
+                device.kind.label(),
+                measured.map_or_else(|| "-".into(), |usage| format_bytes(usage.used_bytes as f64)),
+                measured.map_or_else(
+                    || "-".into(),
+                    |usage| format_bytes(usage.available_bytes as f64)
                 ),
-                None => ("-".into(), "-".into()),
-            },
-            None => ("-".into(), "-".into()),
-        };
-        writeln!(
-            out,
-            "{:<12}  {:<5}  {:>12}  {:>12}  {:>6}  {:>9}  {:>4}  {:<21}  {}",
-            truncate(&device.name, 12),
-            device.kind.label(),
-            optional_rate(rates.map(|rates| rates.read_rate)),
-            optional_rate(rates.map(|rates| rates.write_rate)),
-            rates.map_or_else(
-                || "-".to_owned(),
-                |rates| format!("{:.1}%", rates.utilization_percent)
-            ),
-            rates
-                .and_then(|rates| rates.await_ms)
-                .map_or_else(|| "-".to_owned(), |value| format!("{value:.2} ms")),
-            percent,
-            used,
-            truncate(&device.mounts.join(" "), 40)
-        )?;
-    }
-    writeln!(out)?;
-    let access = &snapshot.process_access;
-    writeln!(
-        out,
-        "Processes: {} readable, {} not readable; {}",
-        access.readable, access.unreadable, access.message
-    )?;
-    writeln!(
-        out,
-        "{:>8}  {:<12}  {:>12}  {:>12}  COMMAND",
-        "PID", "USER", "READ/s", "WRITE/s"
-    )?;
-    for row in app.process_rows().into_iter().take(15) {
-        writeln!(
-            out,
-            "{:>8}  {}  {:>12}  {:>12}  {}",
-            row.pid,
-            pad(&row.user, 12),
-            optional_rate(row.read_rate),
-            optional_rate(row.write_rate),
-            truncate(&row.command, 60)
-        )?;
+                measured
+                    .and_then(|usage| usage.percent())
+                    .map_or_else(|| "-".into(), |value| format!("{value:.0}%")),
+                truncate(&device.mounts.join(" "), 40),
+                if usage.is_some_and(|usage| usage.unmeasured > 0) {
+                    "PARTIAL"
+                } else {
+                    note
+                }
+            )?;
+        }
     }
     writeln!(out)?;
     writeln!(
         out,
         "{:<24}  {:<8}  {:>5}  {:>10}  {:>10}  DEVICE",
-        "MOUNT", "TYPE", "USE%", "SIZE", "FREE"
+        "MOUNT", "TYPE", "USE%", "USED", "FREE"
     )?;
     for fs in app.filesystem_rows() {
         writeln!(
@@ -903,7 +950,7 @@ fn print_snapshot(out: &mut impl Write, app: &App, snapshot: &Snapshot) -> io::R
             fs.fs_type,
             fs.use_percent()
                 .map_or_else(|| "-".to_owned(), |value| format!("{value:.0}%")),
-            fs.total_bytes
+            fs.used_bytes
                 .map_or_else(|| "-".to_owned(), |value| format_bytes(value as f64)),
             fs.available_bytes
                 .map_or_else(|| "-".to_owned(), |value| format_bytes(value as f64)),
@@ -973,7 +1020,7 @@ mod tests {
             ..Settings::default()
         };
         let args = Args::parse_from([
-            "disktop",
+            "spctop",
             "--interval",
             "0.1",
             "--history",
@@ -1000,8 +1047,10 @@ mod tests {
         assert_eq!(app.settings_to_save(), saved);
         assert!(!app.settings_dirty());
         // Changing a preference in the monitor persists only that preference.
+        app.handle_key(KeyCode::Char('i').into());
         app.handle_key(KeyCode::Char('s').into());
         let expected = Settings {
+            view: View::Processes,
             sort: SortKey::Total,
             ..saved.clone()
         };
@@ -1027,8 +1076,12 @@ mod tests {
         let mut output = Vec::new();
         print_snapshot(&mut output, &app, &snapshot).unwrap();
         let text = String::from_utf8(output).unwrap();
-        assert!(text.starts_with("disktop DEMO  nvme0n1 (NVMe"), "{text}");
+        assert!(text.starts_with("spctop DEMO  nvme0n1 (NVMe"), "{text}");
         assert!(text.contains("*/home"), "{text}");
+        assert!(
+            !text.contains("READ/s") && !text.contains("IOPS") && !text.contains("COMMAND"),
+            "{text}"
+        );
         // Every disk of the overview is listed with rates and fill level.
         for disk in ["nvme0n1 ", "nvme1n1 ", "sda ", "sdb "] {
             assert!(
@@ -1046,7 +1099,7 @@ mod tests {
 
     #[test]
     fn once_reports_unavailable_zfs_once_per_pool() {
-        let pool = disktop::model::ZfsPool {
+        let pool = spctop::model::ZfsPool {
             name: "tank".into(),
             error: Some("ZFS pool discovery pending".into()),
             ..Default::default()
@@ -1054,7 +1107,7 @@ mod tests {
         let snapshot = Snapshot {
             filesystems: ["tank", "tank/home"]
                 .into_iter()
-                .map(|source| disktop::model::Filesystem {
+                .map(|source| spctop::model::Filesystem {
                     source: source.into(),
                     fs_type: "zfs".into(),
                     zfs: Some(pool.clone()),

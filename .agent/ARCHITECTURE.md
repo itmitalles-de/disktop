@@ -2,35 +2,32 @@
 
 `main.rs` owns CLI validation, source selection (helper, direct collector or
 explicit demo), refresh timing, `--once`/`--json` output and terminal
-restoration. `ui.rs` receives snapshots and draws an htop-style layout: title
-with disk count, focus and view tabs; a summary row (focused device details or
-all disks); an optional status row; the disk overview; the lower area (process
-strip, filesystems or home table); the footer. The overview lists
-`App::overview_devices()` (visible whole devices plus a focused partition;
-dm/md devices whose `backing_disks` is one shown disk are folded into it unless
-`show_stacked`) in a
-grid chosen by the pure `disk_layout()`: `BlockStyle::Side`/`Below` (label,
-RD/WR/IO/US meters and a graph of 4-16 rows), then `Meters`, `Pair`, `Row`, then
-a scrolled `Row` grid with a "+N more" row; scrolling follows the focus. History
-is kept per device name (`App::history`), so focus changes keep every graph;
-the per-disk graph plots utilization and fill level on one 0-100% scale
-(stepped or Braille). RD/WR meters of all disks share one scale, the highest
-rate of any overview device in the visible history (`rate_scale`). The
-process strip reserves `process_rows` (0-20; at most 3 below 20 body rows) and
-gets the rows the disks leave free; filesystems and home reserve half the body.
-It never derives or invents measurements. `demo.rs` holds the explicit
-synthetic data for `--demo` and tests (four disks with different load, one
-filling up over 100 ticks, one not mounted).
+restoration. `ui.rs` receives snapshots and draws a compact htop-style layout.
+The default Space view shows used/free capacity and fill-level history per disk
+above a filesystem table; Home shows directory sizes and growth. F4 opens the
+view menu, including the secondary I/O view, which retains RD/WR/IO meters,
+utilization history, detailed device statistics and the process table.
+`App::overview_devices()` lists visible whole devices plus a focused partition;
+dm/md devices backed by one shown disk fold into it unless `show_stacked`.
+The pure `disk_layout()` reduces graph height, then meters and rows as space
+shrinks; a "+N more" row and focus scrolling expose overflow. Per-device
+`App::history` survives focus changes. RD/WR meters in the I/O view share the
+highest visible rate across all overview devices. Space views never substitute
+I/O rates for capacity. Unavailable measurements remain explicit; `demo.rs`
+contains the only synthetic data, used by explicit `--demo` and tests.
 
 `config.rs` owns versioned preferences, XDG paths and atomic private writes;
 CLI options, `NO_COLOR` and the unavailable-device fallback change only a
 runtime copy, and F12 saves the file values plus fields the user touched.
+When the spctop configuration is absent, legacy disktop
+preferences are read without modification; the legacy process-first view
+migrates to Space. Saving targets spctop and preserves unknown fields.
 `i18n.rs` provides English/German UI text; CLI, stderr and JSON stay English.
 `shutdown.rs` turns SIGINT/SIGTERM/SIGHUP into cooperative exits so the
 terminal is always restored. A hung-up terminal (POLLHUP/POLLERR on stdin)
 ends the monitor like SIGHUP: `run()` polls stdin itself before letting
 crossterm read, because crossterm 0.29 retries reads that return end of file
-forever; a `disktop-hangup` watchdog thread exits after two seconds if a
+forever; a `spctop-hangup` watchdog thread exits after two seconds if a
 hangup slips into that window, and the dead terminal is not written to on exit; `ratatui::init` restores it on panics.
 
 `collector.rs` samples everything for one snapshot: `diskstats.rs` parses
@@ -81,7 +78,7 @@ Direct collection also detects hidepid: stat EACCES counts as unreadable,
 while invisible processes have no fabricated total. The TUI warns even when
 the kernel hides enumeration; gid exemptions retain the kernel's behavior.
 
-`scanner.rs` runs the home scan in a `disktop-scan` thread (idle I/O priority,
+`scanner.rs` runs the home scan in a `spctop-scan` thread (idle I/O priority,
 nice 10, only DAC_READ_SEARCH). It walks with fdopendir/readdir, fstatat
 (AT_SYMLINK_NOFOLLOW) and openat (O_DIRECTORY|O_NOFOLLOW), re-checks dev/inode
 after opening, skips other filesystems, dedupes hard links in a bounded set and
@@ -100,13 +97,15 @@ generation (only newer trees are sent), and annotates growth per retained path
 (only for complete scans; budget-stopped scans are neither annotated nor a
 baseline). Names are capped at 256 characters. `RootPolicy` decides how roots
 open: `Follow` (UI, like du) or `Allowed` (helper: roots from the root-owned
-/etc/disktop/scan-roots, default /home, opened component by component with
+/etc/spctop/scan-roots, falling back to legacy /etc/disktop/scan-roots only
+when absent. /home is the default only if neither file exists; invalid policies
+fail closed. Roots are opened component by component with
 O_NOFOLLOW). `collector::HomeScan` drives the service from requests; a root the
 helper refuses (`HomeErrorKind::NotAllowed`) is scanned by the UI's own
 unprivileged `HomeScan` (`Source::Helper`), marked `helper_refused`. Home and
 helper errors carry kinds that `i18n.rs` translates.
 
-`helper.rs` and `bin/disktop-collector.rs` implement the optional root-owned
+`helper.rs` and `bin/spctop-collector.rs` implement the optional root-owned
 helper: fixed path and ownership checks, cleared environment, `--stdio` only,
 versioned newline-delimited JSON with request (8 KiB) and response (32 MiB)
 bounds, unknown fields rejected, a 10-second reply deadline with cancellation,

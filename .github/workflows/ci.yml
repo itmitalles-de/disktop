@@ -55,20 +55,20 @@ jobs:
       - name: Build release
         run: cargo +stable build --release --locked
       - name: Test terminal restoration
-        run: python3 tests/terminal.py target/release/disktop
+        run: python3 tests/terminal.py target/release/spctop
       - name: Test Setup and saved preferences
-        run: python3 tests/setup.py target/release/disktop
+        run: python3 tests/setup.py target/release/spctop
       - name: Build isolated test environment
-        run: docker build --tag disktop-test tests
+        run: docker build --tag spctop-test tests
       - name: Test real per-process and device storage I/O
         run: >-
           docker run --rm --network none --volume "$PWD:/work:ro"
-          disktop-test python3 tests/live_io.py --isolated target/release/disktop
+          spctop-test python3 tests/live_io.py --isolated target/release/spctop
       - name: Test unprivileged UI and capability helper
         run: >-
           docker run --rm --network none --cap-add DAC_READ_SEARCH --cap-add SYS_PTRACE
-          --volume "$PWD:/work:ro" disktop-test
-          python3 tests/helper.py --isolated target/release/disktop target/release/disktop-collector
+          --volume "$PWD:/work:ro" spctop-test
+          python3 tests/helper.py --isolated target/release/spctop target/release/spctop-collector
       - name: Check installer scripts
         run: shellcheck scripts/*.sh
   audit:

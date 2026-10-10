@@ -1,12 +1,12 @@
 [package]
-name = "disktop"
+name = "spctop"
 version = "0.1.0"
 edition = "2024"
-default-run = "disktop"
+default-run = "spctop"
 rust-version = "1.88"
-description = "An nvtop-inspired Linux disk monitor with I/O graphs, per-process I/O, filesystems and a /home size view"
+description = "A Linux storage-space monitor with used-space history, directory growth and a separate I/O view"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/itmitalles-de/disktop"
+repository = "https://github.com/itmitalles-de/spctop"
 
 [dependencies]
 anyhow = "1.0"
@@ -20,12 +20,12 @@ signal-hook = "0.3"
 unicode-width = "0.2"
 
 [[bin]]
-name = "disktop"
+name = "spctop"
 path = "src/main.rs"
 
 [[bin]]
-name = "disktop-collector"
-path = "src/bin/disktop-collector.rs"
+name = "spctop-collector"
+path = "src/bin/spctop-collector.rs"
 
 [profile.release]
 lto = "thin"

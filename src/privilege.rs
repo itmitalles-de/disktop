@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn reset_environment_removes_injected_variables() {
-        const CHILD: &str = "DISKTOP_TEST_RESET_ENVIRONMENT_CHILD";
+        const CHILD: &str = "SPCTOP_TEST_RESET_ENVIRONMENT_CHILD";
         const NAME: &str = "privilege::tests::reset_environment_removes_injected_variables";
         if std::env::var_os(CHILD).is_some() {
             // SAFETY: this re-executed test process runs only this test on one
@@ -150,9 +150,9 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", NAME, "--test-threads=1"])
             .env(CHILD, "1")
-            .env("MALLOC_CONF", "/tmp/disktop-test-injected")
-            .env("LOCPATH", "/tmp/disktop-test-injected")
-            .env("LD_LIBRARY_PATH", "/tmp/disktop-test-injected")
+            .env("MALLOC_CONF", "/tmp/spctop-test-injected")
+            .env("LOCPATH", "/tmp/spctop-test-injected")
+            .env("LD_LIBRARY_PATH", "/tmp/spctop-test-injected")
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);

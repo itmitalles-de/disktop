@@ -121,7 +121,7 @@ impl MountProber {
             let worker_abandoned = Arc::clone(&abandoned);
             let worker_finished = Arc::clone(&finished);
             let spawned = std::thread::Builder::new()
-                .name("disktop-probe".into())
+                .name("spctop-probe".into())
                 .stack_size(256 * 1024)
                 .spawn(move || {
                     for (index, path) in jobs {
@@ -189,7 +189,7 @@ pub fn resolve_with_timeout(path: &Path, timeout: Duration) -> Option<PathBuf> {
     let (sender, receiver) = mpsc::channel();
     let owned = path.to_owned();
     std::thread::Builder::new()
-        .name("disktop-resolve".into())
+        .name("spctop-resolve".into())
         .stack_size(256 * 1024)
         .spawn(move || {
             let _ = sender.send(canonicalize(&owned));
@@ -244,7 +244,7 @@ impl Resolver {
                 let resolve = self.resolve;
                 let owned = path.to_owned();
                 let spawned = std::thread::Builder::new()
-                    .name("disktop-resolve".into())
+                    .name("spctop-resolve".into())
                     .stack_size(256 * 1024)
                     .spawn(move || {
                         let _ = sender.send(resolve(&owned));
@@ -345,8 +345,8 @@ mod tests {
         }
         let mut real = Resolver::default();
         assert_eq!(
-            real.resolve(Path::new("/nonexistent-disktop/x")),
-            Path::new("/nonexistent-disktop/x")
+            real.resolve(Path::new("/nonexistent-spctop/x")),
+            Path::new("/nonexistent-spctop/x")
         );
         assert_eq!(
             resolve_with_timeout(Path::new("/"), Duration::from_secs(2)),

@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use disktop::{
+use spctop::{
     collector::Collector,
     helper::{self, PROTOCOL_VERSION, Reply, Request},
     privilege,
@@ -19,7 +19,7 @@ use disktop::{
 fn serve() -> Result<()> {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     if arguments.len() != 1 || arguments[0] != "--stdio" {
-        bail!("this helper is launched by disktop; use disktop for the terminal interface");
+        bail!("this helper is launched by spctop; use spctop for the terminal interface");
     }
     privilege::require_helper_capabilities()?;
     // Directory names of other users must not end up in core dumps.

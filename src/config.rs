@@ -134,15 +134,16 @@ pub enum SortKey {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum View {
-    #[default]
+    #[serde(rename = "io", alias = "processes")]
     Processes,
+    #[default]
     Filesystems,
     Home,
 }
 
 impl View {
     pub fn next(self, direction: i32) -> Self {
-        let views = [Self::Processes, Self::Filesystems, Self::Home];
+        let views = [Self::Filesystems, Self::Home, Self::Processes];
         let index = views.iter().position(|view| *view == self).unwrap_or(0);
         views[(index as i64 + i64::from(direction)).rem_euclid(views.len() as i64) as usize]
     }
@@ -226,7 +227,7 @@ impl Default for Settings {
             graph_style: GraphStyle::Steps,
             read_color: PlotColor::Green,
             write_color: PlotColor::Yellow,
-            view: View::Processes,
+            view: View::Filesystems,
             sort: SortKey::Io,
             show_idle: false,
             language: Language::Auto,
@@ -338,7 +339,7 @@ impl Settings {
     pub fn validate(&self) -> Result<()> {
         if self.version != VERSION {
             bail!(
-                "unsupported settings version {}; this disktop supports version {VERSION}",
+                "unsupported settings version {}; this spctop supports version {VERSION}",
                 self.version
             );
         }
@@ -373,15 +374,15 @@ pub struct Loaded {
 }
 
 /// Saving or loading as root in another user's settings directory, typically
-/// after `sudo -E disktop`, would create root-owned files there.
+/// after `sudo -E spctop`, would create root-owned files there.
 #[derive(Debug)]
 pub struct RootWithForeignSettings;
 
 impl std::fmt::Display for RootWithForeignSettings {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(
-            "disktop runs as root, but the settings directory belongs to another user \
-             (for example after sudo -E); start disktop without sudo to change preferences",
+            "spctop runs as root, but the settings directory belongs to another user \
+             (for example after sudo -E); start spctop without sudo to change preferences",
         )
     }
 }
@@ -404,6 +405,7 @@ struct StoredRef<'a> {
 #[derive(Clone, Debug)]
 pub struct ConfigFile {
     path: PathBuf,
+    legacy_path: Option<PathBuf>,
 }
 
 impl ConfigFile {
@@ -420,11 +422,17 @@ impl ConfigFile {
                 PathBuf::from(home).join(".config")
             }
         };
-        Ok(Self::at(base.join("disktop/config.json")))
+        Ok(Self {
+            path: base.join("spctop/config.json"),
+            legacy_path: Some(base.join("disktop/config.json")),
+        })
     }
 
     pub fn at(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            legacy_path: None,
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -447,21 +455,46 @@ impl ConfigFile {
     }
 
     fn load_inner(&self) -> Result<Loaded> {
-        let (parent, name) = self.location()?;
-        let directory = match open_directory(parent) {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(Loaded::default());
-            }
-            Err(error) => return Err(error.into()),
+        let stored = match self.read_stored()? {
+            Some(stored) => Some(stored),
+            None => self.read_legacy()?,
         };
-        validate_directory(&directory)?;
-        Ok(read_settings(&directory, &name)?
+        Ok(stored
             .map(|stored| Loaded {
                 unknown_keys: stored.extra.keys().cloned().collect(),
                 settings: stored.settings,
             })
             .unwrap_or_default())
+    }
+
+    fn read_legacy(&self) -> Result<Option<Stored>> {
+        let Some(path) = &self.legacy_path else {
+            return Ok(None);
+        };
+        let mut stored = Self::at(path.clone())
+            .read_stored()
+            .with_context(|| format!("cannot read legacy settings {}", path.display()))?;
+        // The old product opened its process strip by default. Start migrated
+        // installations in Space; an explicit new I/O preference is preserved.
+        if let Some(stored) = &mut stored
+            && stored.settings.view == View::Processes
+        {
+            stored.settings.view = View::Filesystems;
+        }
+        Ok(stored)
+    }
+
+    fn read_stored(&self) -> Result<Option<Stored>> {
+        let (parent, name) = self.location()?;
+        let directory = match open_directory(parent) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        validate_directory(&directory)?;
+        read_settings(&directory, &name)
     }
 
     pub fn save(&self, settings: &Settings) -> Result<()> {
@@ -486,9 +519,11 @@ impl ConfigFile {
         let directory = open_directory(parent)?;
         validate_directory(&directory)?;
         // Never replace an unreadable, malformed, unsupported, or unsafe file.
-        let extra = read_settings(&directory, &name)?
-            .map(|stored| stored.extra)
-            .unwrap_or_default();
+        let stored = match read_settings(&directory, &name)? {
+            Some(stored) => Some(stored),
+            None => self.read_legacy()?,
+        };
+        let extra = stored.map(|stored| stored.extra).unwrap_or_default();
         let mut bytes = serde_json::to_vec_pretty(&StoredRef {
             settings,
             extra: &extra,
@@ -641,7 +676,7 @@ impl<'a> TemporaryFile<'a> {
     fn create(directory: &'a File) -> Result<(File, Self)> {
         for _ in 0..100 {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let name = CString::new(format!(".disktop-{}-{sequence}.tmp", std::process::id()))?;
+            let name = CString::new(format!(".spctop-{}-{sequence}.tmp", std::process::id()))?;
             // SAFETY: name is a valid C string; O_EXCL reserves a new owned file.
             let descriptor = unsafe {
                 libc::openat(
@@ -697,7 +732,7 @@ mod tests {
         fn new() -> Self {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = env::temp_dir().join(format!(
-                "disktop-config-test-{}-{sequence}",
+                "spctop-config-test-{}-{sequence}",
                 std::process::id()
             ));
             DirBuilder::new().mode(0o700).create(&path).unwrap();
@@ -705,7 +740,7 @@ mod tests {
         }
 
         fn config(&self) -> ConfigFile {
-            ConfigFile::at(self.0.join("disktop/config.json"))
+            ConfigFile::at(self.0.join("spctop/config.json"))
         }
     }
 
@@ -713,6 +748,60 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn legacy_preferences_migrate_read_only_and_preserve_unknown_keys() {
+        let directory = TestDirectory::new();
+        let legacy = ConfigFile::at(directory.0.join("disktop/config.json"));
+        legacy.save(&Settings::default()).unwrap();
+        let original = br#"{"view":"processes","future_option":{"keep":true}}"#;
+        fs::write(legacy.path(), original).unwrap();
+        let config = ConfigFile {
+            path: directory.config().path,
+            legacy_path: Some(legacy.path.clone()),
+        };
+        let loaded = config.load_with_unknown_keys().unwrap();
+        assert_eq!(loaded.settings.view, View::Filesystems);
+        assert_eq!(loaded.unknown_keys, ["future_option"]);
+        assert!(!config.path().exists());
+        config.save(&loaded.settings).unwrap();
+        assert_eq!(fs::read(legacy.path()).unwrap(), original);
+        assert_eq!(config.load_with_unknown_keys().unwrap(), loaded);
+        let mut chosen = loaded.settings;
+        chosen.view = View::Processes;
+        config.save(&chosen).unwrap();
+        fs::write(legacy.path(), "invalid").unwrap();
+        assert_eq!(config.load().unwrap().view, View::Processes);
+        let value: Value = serde_json::from_slice(&fs::read(config.path()).unwrap()).unwrap();
+        assert_eq!(value["view"], "io");
+        assert_eq!(value["future_option"]["keep"], true);
+    }
+
+    #[test]
+    fn invalid_primary_or_legacy_preferences_cannot_be_overwritten_by_migration() {
+        let directory = TestDirectory::new();
+        let legacy = ConfigFile::at(directory.0.join("disktop/config.json"));
+        legacy.save(&Settings::default()).unwrap();
+        let config = ConfigFile {
+            path: directory.config().path,
+            legacy_path: Some(legacy.path.clone()),
+        };
+        fs::write(legacy.path(), "invalid").unwrap();
+        assert!(config.load().is_err());
+        assert!(config.save(&Settings::default()).is_err());
+        assert!(!config.path().exists());
+        fs::remove_file(legacy.path()).unwrap();
+        symlink(directory.0.join("missing"), legacy.path()).unwrap();
+        assert!(config.load().is_err());
+        assert!(config.save(&Settings::default()).is_err());
+        fs::remove_file(legacy.path()).unwrap();
+        legacy.save(&Settings::default()).unwrap();
+        directory.config().save(&Settings::default()).unwrap();
+        fs::write(config.path(), "invalid").unwrap();
+        assert!(config.load().is_err());
+        assert!(config.save(&Settings::default()).is_err());
+        assert_eq!(fs::read_to_string(config.path()).unwrap(), "invalid");
     }
 
     #[test]
@@ -892,7 +981,7 @@ mod tests {
     #[test]
     fn root_refuses_settings_below_another_users_directory() {
         let directory = TestDirectory::new();
-        let nested = directory.0.join("missing/disktop");
+        let nested = directory.0.join("missing/spctop");
         // Ordinary users are never affected by the root-only refusal.
         assert!(refuse_foreign_directory_as_root(&nested, 1000).is_ok());
         let owner = fs::metadata(&directory.0).unwrap().uid();
