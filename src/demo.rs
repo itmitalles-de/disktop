@@ -2,8 +2,8 @@
 //! every demo snapshot has `demo: true` and the UI labels it DEMO.
 
 use crate::model::{
-    Device, DeviceKind, DeviceRates, DirNode, Filesystem, Folded, HomeReport, HomeStatus,
-    JSON_VERSION, ProcessAccess, ProcessRow, ScanState, Snapshot,
+    Device, DeviceKind, DeviceRates, DeviceUsage, DirNode, Filesystem, Folded, HomeReport,
+    HomeStatus, JSON_VERSION, ProcessAccess, ProcessRow, ScanState, Snapshot,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -41,14 +41,16 @@ pub fn snapshot(tick: u64, elapsed: f64, home_root: &str, known_generation: u64)
         writes: 52_000_000 + tick * 400,
         ..Device::default()
     };
-    let devices = vec![
+    // nvme1n1 fills up over about 100 seconds, then is cleaned up again.
+    let filling = 0.40 + 0.58 * ((tick % 100) as f64 / 100.0);
+    let mut devices = vec![
         disk(
             "nvme0n1",
             DeviceKind::Nvme,
             "Example NVMe SSD 2TB",
             2000 * GIB,
             &["/", "/boot/efi", "/home"],
-            rates(read, write, 2.4e9),
+            rates(read, write, 2.8e8),
         ),
         Device {
             name: "nvme0n1p2".into(),
@@ -57,7 +59,26 @@ pub fn snapshot(tick: u64, elapsed: f64, home_root: &str, known_generation: u64)
             parent: Some("nvme0n1".into()),
             mounts: vec!["/home".into()],
             size_bytes: Some(1500 * GIB),
-            rates: Some(rates(read * 0.8, write * 0.7, 2.4e9)),
+            rates: Some(rates(read * 0.8, write * 0.7, 2.8e8)),
+            ..Device::default()
+        },
+        disk(
+            "nvme1n1",
+            DeviceKind::Nvme,
+            "Example NVMe SSD 1TB",
+            1000 * GIB,
+            &["/data"],
+            rates(wave(5.0, 22e6), wave(0.7, 140e6), 4.0e8),
+        ),
+        // LUKS on nvme1n1: hidden in the overview, its mount counts on nvme1n1.
+        Device {
+            name: "dm-0".into(),
+            kind: DeviceKind::Dm,
+            label: Some("luks-data".into()),
+            mounts: vec!["/data".into()],
+            size_bytes: Some(1000 * GIB),
+            rates: Some(rates(wave(5.0, 22e6), wave(0.7, 140e6), 4.0e8)),
+            backing_disks: vec!["nvme1n1".into()],
             ..Device::default()
         },
         disk(
@@ -66,8 +87,19 @@ pub fn snapshot(tick: u64, elapsed: f64, home_root: &str, known_generation: u64)
             "Example HDD 8TB",
             8000 * GIB,
             &["/srv/backup"],
-            rates(wave(3.0, 9e6), wave(4.0, 22e6), 2.2e8),
+            rates(wave(3.0, 9e6), wave(4.0, 22e6), 3.5e7),
         ),
+        Device {
+            removable: true,
+            ..disk(
+                "sdb",
+                DeviceKind::Ssd,
+                "Example USB SSD 4TB",
+                4000 * GIB,
+                &[],
+                DeviceRates::default(),
+            )
+        },
         Device {
             name: "loop0".into(),
             kind: DeviceKind::Loop,
@@ -145,6 +177,12 @@ pub fn snapshot(tick: u64, elapsed: f64, home_root: &str, known_generation: u64)
         let rates = devices
             .iter()
             .find(|candidate| candidate.name == device)
+            // Partitions without their own demo counters use their disk's.
+            .or_else(|| {
+                devices
+                    .iter()
+                    .find(|candidate| !candidate.partition && device.starts_with(&candidate.name))
+            })
             .and_then(|device| device.rates.as_ref());
         Filesystem {
             mount_point: mount.into(),
@@ -155,7 +193,7 @@ pub fn snapshot(tick: u64, elapsed: f64, home_root: &str, known_generation: u64)
             read_only: false,
             total_bytes: Some(total),
             used_bytes: Some(used),
-            available_bytes: Some(total - used - total / 20),
+            available_bytes: Some(total.saturating_sub(used).saturating_sub(total / 50)),
             inodes_total: Some(total / 16384),
             inodes_used: Some(used / 65536),
             read_rate: rates.map(|rates| rates.read_rate),
@@ -193,15 +231,45 @@ pub fn snapshot(tick: u64, elapsed: f64, home_root: &str, known_generation: u64)
             true,
         ),
         filesystem(
+            "/data",
+            "/dev/mapper/luks-data",
+            "xfs",
+            "dm-0",
+            1000 * GIB,
+            (1000.0 * filling) as u64 * GIB,
+            false,
+        ),
+        filesystem(
             "/srv/backup",
             "/dev/sda1",
             "xfs",
-            "sda",
+            "sda1",
             8000 * GIB,
             5100 * GIB,
             false,
         ),
     ];
+    for device in &mut devices {
+        let mut members = std::collections::BTreeSet::from([device.name.clone()]);
+        if device.name == "nvme1n1" {
+            // The holder chain nvme1n1 -> nvme1n1p1 -> dm-0, as sysfs reports it.
+            members.extend(["nvme1n1p1".to_owned(), "dm-0".to_owned()]);
+        }
+        let prefix = match device.name.as_str() {
+            "nvme0n1" | "nvme1n1" => format!("{}p", device.name),
+            "sda" | "sdb" => device.name.clone(),
+            _ => String::new(),
+        };
+        if !prefix.is_empty() {
+            members.extend(
+                filesystems
+                    .iter()
+                    .filter_map(|fs| fs.block_device.clone())
+                    .filter(|name| name.starts_with(&prefix)),
+            );
+        }
+        device.usage = Some(DeviceUsage::from_filesystems(&filesystems, &members, false));
+    }
     let generation = 1 + tick / 120;
     Snapshot {
         version: JSON_VERSION,

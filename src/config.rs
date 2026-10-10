@@ -130,7 +130,7 @@ pub enum SortKey {
     Name,
 }
 
-/// The table below the graph.
+/// The table below the disk overview.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum View {
@@ -169,11 +169,24 @@ pub struct Settings {
     pub language: Language,
     /// Show loop, ram and zram devices (and their filesystems).
     pub show_virtual: bool,
+    /// Show device-mapper and MD devices that sit on a single shown disk as
+    /// their own overview blocks; that disk already includes their mounts.
+    pub show_stacked: bool,
     pub home_path: String,
     pub rescan_minutes: u16,
     /// Show apparent sizes (st_size) instead of allocated disk usage.
     pub apparent_size: bool,
+    /// Rows of the process strip below the disks (0 hides it, at most 20).
+    /// Rows left free by the disk overview are added to the strip.
+    pub process_rows: u8,
+    /// Per-disk graph series: utilization and fill level, both 0-100%.
+    pub show_io_series: bool,
+    pub show_usage_series: bool,
+    /// Color of the fill-level meter and graph series.
+    pub usage_color: PlotColor,
 }
+
+pub const MAX_PROCESS_ROWS: u8 = 20;
 
 /// One user preference, used to persist only what the user changed at runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -191,9 +204,14 @@ pub enum Field {
     ShowIdle,
     Language,
     ShowVirtual,
+    ShowStacked,
     HomePath,
     RescanMinutes,
     ApparentSize,
+    ProcessRows,
+    ShowIoSeries,
+    ShowUsageSeries,
+    UsageColor,
 }
 
 impl Default for Settings {
@@ -213,9 +231,14 @@ impl Default for Settings {
             show_idle: false,
             language: Language::Auto,
             show_virtual: false,
+            show_stacked: false,
             home_path: DEFAULT_HOME.into(),
             rescan_minutes: 5,
             apparent_size: false,
+            process_rows: 5,
+            show_io_series: true,
+            show_usage_series: true,
+            usage_color: PlotColor::Magenta,
         }
     }
 }
@@ -240,9 +263,14 @@ impl Settings {
             show_idle,
             language,
             show_virtual,
+            show_stacked,
             home_path,
             rescan_minutes,
             apparent_size,
+            process_rows,
+            show_io_series,
+            show_usage_series,
+            usage_color,
         } = self;
         [
             (Field::Device, *device != other.device),
@@ -261,12 +289,20 @@ impl Settings {
             (Field::ShowIdle, *show_idle != other.show_idle),
             (Field::Language, *language != other.language),
             (Field::ShowVirtual, *show_virtual != other.show_virtual),
+            (Field::ShowStacked, *show_stacked != other.show_stacked),
             (Field::HomePath, *home_path != other.home_path),
             (
                 Field::RescanMinutes,
                 *rescan_minutes != other.rescan_minutes,
             ),
             (Field::ApparentSize, *apparent_size != other.apparent_size),
+            (Field::ProcessRows, *process_rows != other.process_rows),
+            (Field::ShowIoSeries, *show_io_series != other.show_io_series),
+            (
+                Field::ShowUsageSeries,
+                *show_usage_series != other.show_usage_series,
+            ),
+            (Field::UsageColor, *usage_color != other.usage_color),
         ]
         .into_iter()
         .filter_map(|(field, differs)| differs.then_some(field))
@@ -288,9 +324,14 @@ impl Settings {
             Field::ShowIdle => self.show_idle = from.show_idle,
             Field::Language => self.language = from.language,
             Field::ShowVirtual => self.show_virtual = from.show_virtual,
+            Field::ShowStacked => self.show_stacked = from.show_stacked,
             Field::HomePath => self.home_path.clone_from(&from.home_path),
             Field::RescanMinutes => self.rescan_minutes = from.rescan_minutes,
             Field::ApparentSize => self.apparent_size = from.apparent_size,
+            Field::ProcessRows => self.process_rows = from.process_rows,
+            Field::ShowIoSeries => self.show_io_series = from.show_io_series,
+            Field::ShowUsageSeries => self.show_usage_series = from.show_usage_series,
+            Field::UsageColor => self.usage_color = from.usage_color,
         }
     }
 
@@ -309,6 +350,9 @@ impl Settings {
         }
         if !(1..=1440).contains(&self.rescan_minutes) {
             bail!("rescan_minutes must be between 1 and 1440");
+        }
+        if self.process_rows > MAX_PROCESS_ROWS {
+            bail!("process_rows must be between 0 and {MAX_PROCESS_ROWS}");
         }
         if let Some(name) = &self.device
             && !crate::diskstats::valid_name(name)
@@ -724,6 +768,9 @@ mod tests {
             r#"{"home_path":"relative"}"#.to_owned(),
             r#"{"home_path":"/home/../etc"}"#.to_owned(),
             r#"{"rescan_minutes":0}"#.to_owned(),
+            r#"{"process_rows":21}"#.to_owned(),
+            r#"{"process_rows":-1}"#.to_owned(),
+            r#"{"usage_color":"pink"}"#.to_owned(),
             r#"{"view":"bogus"}"#.to_owned(),
             r#"{"graph_style":"unknown"}"#.to_owned(),
             "x".repeat(MAX_BYTES as usize + 1),
@@ -830,6 +877,12 @@ mod tests {
         assert_eq!(config.load().unwrap().language, Language::Auto);
         fs::write(config.path(), br#"{"version": 1, "language": "de"}"#).unwrap();
         assert_eq!(config.load().unwrap().language, Language::De);
+        // Files written before the disk overview get its defaults.
+        let older = config.load().unwrap();
+        assert_eq!(older.process_rows, 5);
+        assert!(older.show_io_series && older.show_usage_series);
+        assert_eq!(older.usage_color, PlotColor::Magenta);
+        assert!(!older.show_stacked);
         fs::write(config.path(), br#"{"version": 1, "language": "fr"}"#).unwrap();
         assert!(config.load().is_err());
         assert_eq!(Language::Auto.next(1), Language::En);

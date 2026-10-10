@@ -49,7 +49,7 @@ def run_case(binary, exit_signal):
             start_new_session=True,
         )
         deadline = time.monotonic() + 5
-        while b"Device" not in output or b"\x1b[?1049h" not in output:
+        while b"Focus" not in output or b"\x1b[?1049h" not in output:
             assert child.poll() is None, f"{label}: monitor exited during startup: {output!r}"
             assert time.monotonic() < deadline, f"{label}: monitor did not draw: {output!r}"
             read_available(master, output, 0.05)
@@ -107,7 +107,7 @@ def run_error_case(binary):
         os.close(screen_slave)
         screen_slave = None
         deadline = time.monotonic() + 5
-        while b"Device" not in output or b"\x1b[?1049h" not in output:
+        while b"Focus" not in output or b"\x1b[?1049h" not in output:
             assert child.poll() is None, f"error case: monitor exited during startup: {output!r}"
             assert time.monotonic() < deadline, f"error case: monitor did not draw: {output!r}"
             read_available(screen_master, output, 0.05)
@@ -156,6 +156,59 @@ def run_closed_pipe_case(binary):
     print("PASS closed pipe: --json and --once exit cleanly without a panic")
 
 
+def run_hangup_case(binary, mode):
+    """A terminal that goes away must end the monitor promptly and cleanly.
+
+    "closed": the PTY master closes without any signal (crossterm alone would
+    read end of file forever); "closed+SIGHUP": a SIGHUP follows the close;
+    "session": the monitor leads its own session with the PTY as controlling
+    terminal, as in a terminal window, so the kernel sends SIGHUP itself.
+    """
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 36, 120, 0, 0))
+    output = bytearray()
+
+    def controlling_terminal():
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+    child = subprocess.Popen(
+        [str(binary), "--demo", "--interval", "60"],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        env=environment(),
+        start_new_session=mode != "session",
+        preexec_fn=controlling_terminal if mode == "session" else None,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while b"Focus" not in output or b"\x1b[?1049h" not in output:
+            assert child.poll() is None, f"{mode}: monitor exited during startup: {output!r}"
+            assert time.monotonic() < deadline, f"{mode}: monitor did not draw: {output!r}"
+            read_available(master, output, 0.05)
+        os.close(master)
+        master = None
+        os.close(slave)
+        slave = None
+        if mode == "closed+SIGHUP":
+            child.send_signal(signal.SIGHUP)
+        started = time.monotonic()
+        try:
+            child.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            raise AssertionError(f"{mode}: monitor still running 2 s after the terminal closed")
+        assert child.returncode == 0, f"{mode}: unexpected exit code {child.returncode}"
+        print(f"PASS hangup {mode}: exited cleanly after {time.monotonic() - started:.2f}s")
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=3)
+        for descriptor in (master, slave):
+            if descriptor is not None:
+                os.close(descriptor)
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("Usage: python3 tests/terminal.py /path/to/disktop")
@@ -163,6 +216,8 @@ def main():
     for exit_signal in (None, signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         run_case(binary, exit_signal)
     run_error_case(binary)
+    for mode in ("closed", "closed+SIGHUP", "session"):
+        run_hangup_case(binary, mode)
     run_closed_pipe_case(binary)
     print("All terminal restoration checks passed.")
 

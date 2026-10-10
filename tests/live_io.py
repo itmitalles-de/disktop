@@ -135,6 +135,13 @@ def main():
         device_written = sum((d["rates"] or {}).get("write_rate", 0) for d in disks) * interval
         assert device_written >= SIZE * 0.9, f"physical disks wrote only {device_written / MIB:.1f} MiB"
         print(f"PASS devices: physical disks wrote {device_written / MIB:.1f} MiB during the interval")
+        # Capacity use is measured for every device; null would mean "not measured".
+        assert all(d["usage"] is not None for d in snapshot["devices"]), "device usage missing"
+        mounted = [d for d in snapshot["devices"] if d["usage"]["filesystems"] > 0]
+        for d in mounted:
+            usage = d["usage"]
+            assert usage["used_bytes"] <= usage["total_bytes"], d
+        print(f"PASS usage: {len(mounted)} devices with mounted filesystems report used/total")
         access = snapshot["process_access"]
         assert not access["privileged"], access
         assert access["unreadable"] > 0, "root-owned processes should be hidden without the helper"

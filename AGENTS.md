@@ -3,9 +3,10 @@
 Follow `/home/tim/AGENTS.md` when working on the owner's machine.
 
 This is a Linux terminal monitor in Rust, the disk counterpart of nettop and
-visually based on nvtop: compact device information, a green read / yellow write
-history graph, a process, filesystem or home-size table, and function-key help.
-Keep the layout usable at 36x16, 40x24, 80x24 and 120x36, in English and German.
+visually based on htop/nvtop: an overview of every disk (RD/WR/IO/US meters and
+a per-disk utilization/fill-level graph), a compact process strip or a
+filesystem or home-size table, and function-key help. Keep the layout usable at
+36x16, 40x24, 80x24, 120x36 and 200x60 with 1 to 16 disks, in English and German.
 
 Device rates come from /proc/diskstats deltas (512-byte sectors); process rates
 from /proc/PID/io and are not attributable to devices. Unavailable data,

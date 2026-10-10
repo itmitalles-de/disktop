@@ -89,6 +89,17 @@ impl Lang {
         )
     }
 
+    pub fn helper_outdated(self) -> String {
+        match self {
+            Self::En => "Helper is older than this disktop; fill levels are added without it. \
+                         Rerun scripts/setup-helper.sh to update it"
+                .into(),
+            Self::De => "Helper ist älter als dieses disktop; Füllstände werden ohne ihn ergänzt. \
+                         scripts/setup-helper.sh erneut ausführen, um ihn zu aktualisieren"
+                .into(),
+        }
+    }
+
     pub fn helper_failed(self, error: &str) -> String {
         match self {
             Self::En => format!("Helper failed: {error}; using unprivileged collection"),
