@@ -1,7 +1,8 @@
 # Verified state
 
-- Repository `itmitalles-de/disktop` (GitHub, `main` @ 3d72ddf). MIT, Rust
-  1.88+, Linux only. Built on the nettop codebase (config, i18n, shutdown,
+- Repository `itmitalles-de/disktop` (GitHub, `main` @ 3d72ddf). Rust 1.88+,
+  Linux only. License GPL-3.0-or-later: the owner relicensed from MIT on
+  2026-10-10; the change is part of `feat/site` until it is merged. Built on the nettop codebase (config, i18n, shutdown,
   helper protocol, privilege, installer and PTY test patterns).
 - Branch `feat/all-disks-overview` (worktree `../disktop-worktrees/all-disks`,
   uncommitted at hand-off): the main screen shows every disk at once, htop
@@ -48,10 +49,30 @@
   the container `tests/live_io.py` (incl. usage) and `tests/helper.py`. Real
   `--once`/`--json` on this host: nvme0n1 (LUKS dm-0), nvme1n1 match `df`.
 
+- Branch `feat/site` (worktree `../disktop-worktrees/site`, based on
+  `feat/all-disks-overview` 424dd63, uncommitted at hand-off): branded README
+  (banner, self-hosted badges, explicit DEMO image, website link, license
+  section) and `site/`, the dependency-free project website modeled on
+  nettop's: strict CSP without inline code, local Chivo/IBM Plex Mono with OFL
+  notices, system-aware light/dark theme and EN/DE, both with persisted
+  toggles (`disktop-theme`, `disktop-lang`), accessible tabs, skip link, live
+  region and reduced motion. Assets are actual `--demo` captures at 120x36
+  (PTY + pyte render, see `site/assets/README.md`) and an MP4 recording.
+  `.github/workflows/pages.yml` deploys only `site/` from `main` (same pinned
+  actions as nettop), checks `site/CNAME` = `disktop.wutz.io` and probes the
+  public HTTPS page after deploy. Review: `../disktop-review/site/`.
+
 ## Open / not yet done
 
 - Commit/PR for `feat/all-disks-overview` after owner review; then CI run.
   Track further work as GitHub issues in `itmitalles-de/disktop`.
+- Website: GitHub Pages is planned with custom domain `disktop.wutz.io`, not
+  configured yet; DNS is still to be set up. After merge: enable Pages (source
+  GitHub Actions) with that domain, add a DNS-only Cloudflare CNAME `disktop` ->
+  `itmitalles-de.github.io` (like nettop) and enforce HTTPS once the certificate
+  is issued. The repository is private (2026-10-10); nettop's Pages site is
+  served from a public repository, so visibility or the org plan must allow it.
+  The first deploy's HTTPS probe fails until DNS and the certificate work.
 - Overview: multi-device btrfs/ZFS fill level counts only on the disk named by
   the mount source; swap detection only tested via unit data, not a real swap
   partition. nettop has the same terminal-hangup spin (fixed separately there).

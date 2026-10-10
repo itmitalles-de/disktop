@@ -5,7 +5,7 @@ edition = "2024"
 default-run = "disktop"
 rust-version = "1.88"
 description = "An nvtop-inspired Linux disk monitor with I/O graphs, per-process I/O, filesystems and a /home size view"
-license = "MIT"
+license = "GPL-3.0-or-later"
 repository = "https://github.com/itmitalles-de/disktop"
 
 [dependencies]

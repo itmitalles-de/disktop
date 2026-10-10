@@ -1,10 +1,28 @@
-# disktop
+<p align="center">
+  <a href="https://disktop.wutz.io">
+    <img src="site/assets/readme-banner.svg" alt="disktop — your disks, in view" width="100%">
+  </a>
+</p>
 
-**Linux disk activity and storage use. Right in your terminal.**
-Every disk at a glance with live meters and history graphs, per-process reads
-and writes, filesystems and a `/home` size view, with F2 Setup — inspired by
-htop and nvtop, and the disk counterpart of
-[nettop](https://github.com/itmitalles-de/nettop).
+<p align="center">
+  <strong>Linux disk activity and storage use. Right in your terminal.</strong><br>
+  All disks at once, per-process I/O, filesystems, <code>/home</code> sizes and F2 Setup —
+  inspired by htop and nvtop, the disk counterpart of
+  <a href="https://github.com/itmitalles-de/nettop">nettop</a>.
+</p>
+
+<p align="center">
+  <img src="site/assets/badge-linux.svg" alt="Platform: Linux">
+  <a href="Cargo.toml"><img src="site/assets/badge-rust.svg" alt="Rust 1.88 or newer"></a>
+  <a href="LICENSE"><img src="site/assets/badge-license.svg" alt="License: GPL-3.0-or-later"></a>
+</p>
+
+<p align="center">
+  <a href="https://disktop.wutz.io">Website</a> ·
+  <a href="#install">Install</a> ·
+  <a href="#keyboard">Keyboard</a> ·
+  <a href="https://github.com/itmitalles-de/disktop">Source</a>
+</p>
 
 **disktop** shows **all your disks at once**, like htop shows every CPU core:
 each disk gets its own block with read, write, utilization and fill-level
@@ -19,6 +37,12 @@ own processes and the directories you can read. An optional one-time helper
 setup adds all users' processes and home directories; the interface itself never
 gains privileges.
 
+<p align="center">
+  <img src="site/assets/disktop-demo.png" alt="disktop terminal showing four disks side by side, each with read, write, utilization and fill-level meters and a utilization and fill-level graph, above a process I/O table, with F2 Setup and F12 Save in the function-key bar" width="100%">
+  <br>
+  <sub>Actual terminal output in explicit DEMO mode. Disks, rates and processes are synthetic.</sub>
+</p>
+
 | At a glance | Under your control |
 | --- | --- |
 | **All disks** | RD, WR, IO and fill-level (US) meters plus a graph per disk |
@@ -30,7 +54,8 @@ gains privileges.
 
 ## Install
 
-You need **Linux** and **Rust 1.88+**. The source is MIT licensed.
+You need **Linux** and **Rust 1.88+**. The source is licensed under the
+[GNU GPL v3 or later](LICENSE).
 
 ```bash
 git clone https://github.com/itmitalles-de/disktop.git
@@ -283,6 +308,25 @@ tests, ShellCheck and a dependency audit.
 
 See [AGENTS.md](AGENTS.md) for repository-specific contributor instructions.
 
+The [project website](https://disktop.wutz.io) is a dependency-free static site in
+[`site/`](site/), published by the [Pages workflow](.github/workflows/pages.yml).
+Its terminal images and recording use explicit DEMO mode with synthetic data.
+
+## License
+
+Copyright (C) 2026 itmitalles
+
+disktop is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version (SPDX: `GPL-3.0-or-later`). disktop is distributed in the hope that it
+will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE) for
+the full license text.
+
+The self-hosted website fonts are licensed separately under the SIL Open Font
+License; see [`site/assets/fonts/`](site/assets/fonts/).
+
 ---
 
-[MIT licensed](LICENSE) · Inspired by htop, nvtop and iotop.
+[GPL-3.0-or-later](LICENSE) · Inspired by htop, nvtop and iotop.

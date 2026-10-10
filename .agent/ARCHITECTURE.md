@@ -73,3 +73,10 @@ NO_NEW_PRIVS. `scripts/setup-helper.sh` builds unprivileged and installs with
 `cap_dac_read_search,cap_sys_ptrace=ep` after digest and ownership checks.
 `text.rs` sanitizes every kernel- or user-controlled string for the terminal and
 formats units.
+
+The public project website is a dependency-free static site in `site/`, deployed
+by `.github/workflows/pages.yml` from `main`, independently of the Rust CI. Only
+`site/` is uploaded to Pages; the custom domain is `disktop.wutz.io` (`site/CNAME`)
+and each deployment probes the public HTTPS endpoint. The site uses local fonts
+and explicit DEMO captures as intentional public product assets; local QA
+evidence stays outside Git.
