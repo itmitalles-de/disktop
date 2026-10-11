@@ -258,13 +258,21 @@ fn run_with_timeout_in_pool<T: Send + 'static>(
     if timeout.is_zero() {
         return None;
     }
-    workers
-        .fetch_update(
+    let mut count = workers.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        if count >= MAX_ONE_SHOT_WORKERS {
+            return None;
+        }
+        match workers.compare_exchange_weak(
+            count,
+            count + 1,
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
-            |count| (count < MAX_ONE_SHOT_WORKERS).then_some(count + 1),
-        )
-        .ok()?;
+        ) {
+            Ok(_) => break,
+            Err(current) => count = current,
+        }
+    }
     let slot = WorkerSlot(workers);
     let (sender, receiver) = mpsc::channel();
     std::thread::Builder::new()

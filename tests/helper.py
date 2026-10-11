@@ -461,8 +461,8 @@ class HelperSession:
 def check_policy_aliases(account):
     """A user-replaceable configured root cannot authorize an outside alias."""
     parent = Path("/srv/dwtop-user-policy")
-    trusted_alias = Path("/srv/dwtop-trusted-policy-alias")
-    assert not parent.exists() and not os.path.lexists(trusted_alias)
+    system_alias = Path("/srv/dwtop-system-policy-alias")
+    assert not parent.exists() and not os.path.lexists(system_alias)
     parent.mkdir()
     os.chown(parent, account.pw_uid, account.pw_gid)
     projects = parent / "projects"
@@ -491,10 +491,10 @@ def check_policy_aliases(account):
                 return data["home"].get("error_kind") == "not_allowed"
             wait_until(startup_refused, "pre-startup alias rejection")
         # A root-owned system alias under trusted /srv remains supported.
-        trusted_alias.symlink_to(HOME)
-        write_scan_roots(f"{trusted_alias}\n")
+        system_alias.symlink_to(HOME)
+        write_scan_roots(f"{system_alias}\n")
         with HelperSession(account) as helper:
-            for root in (trusted_alias, HOME, HOME / "alice"):
+            for root in (system_alias, HOME, HOME / "alice"):
                 home = helper.sample(root)["home"]
                 assert home["privileged"] and home.get("error") is None, home
     finally:
@@ -503,7 +503,7 @@ def check_policy_aliases(account):
         elif projects.exists():
             projects.rmdir()
         parent.rmdir()
-        trusted_alias.unlink(missing_ok=True)
+        system_alias.unlink(missing_ok=True)
         write_scan_roots(f"{HOME}\n")
     print("PASS user-controlled aliases refused before/after helper startup; trusted system aliases retained")
 
