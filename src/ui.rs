@@ -294,6 +294,7 @@ impl App {
     /// A new data source (helper fallback) numbers its scans from scratch.
     pub fn home_source_changed(&mut self) {
         self.known_generation = 0;
+        self.history.clear();
     }
 
     pub fn selected_device(&self) -> Option<&Device> {
@@ -404,6 +405,10 @@ impl App {
             self.home_cwd.clear();
         }
         let at = snapshot.elapsed;
+        // A restarted collector has a new monotonic clock and rate baseline.
+        if at < self.snapshot.elapsed {
+            self.history.clear();
+        }
         self.snapshot = snapshot;
         let window = self.history_seconds();
         // Removed devices drop their history; a re-added one starts anew.
@@ -2231,11 +2236,18 @@ fn draw_disk_graph(frame: &mut Frame<'_>, app: &App, name: &str, area: Rect) {
     .filter(|(enabled, _, _)| *enabled)
     .map(|(_, color, value)| (color, value))
     .collect();
+    let data: Vec<(Color, Vec<(f64, f64)>)> = series
+        .iter()
+        .flat_map(|(color, value)| {
+            history_segments(history, *value)
+                .into_iter()
+                .map(|points| (*color, points))
+        })
+        .collect();
     if app.settings.graph_style == GraphStyle::Steps {
-        for (color, value) in &series {
-            let points = history.iter().filter_map(|sample| {
-                let progress = (sample.at - now + window) / window;
-                let value = value(sample)?;
+        for (color, points) in &data {
+            let points = points.iter().filter_map(|(at, value)| {
+                let progress = (at - now + window) / window;
                 (0.0..=1.0)
                     .contains(&progress)
                     .then_some((progress, value / 100.0))
@@ -2244,30 +2256,47 @@ fn draw_disk_graph(frame: &mut Frame<'_>, app: &App, name: &str, area: Rect) {
         }
         return;
     }
-    let data: Vec<Vec<(f64, f64)>> = series
+    let relative: Vec<Vec<(f64, f64)>> = data
         .iter()
-        .map(|(_, value)| {
-            history
+        .map(|(_, points)| {
+            points
                 .iter()
-                .filter_map(|sample| Some((sample.at - now, value(sample)?.clamp(0.0, 100.0))))
+                .map(|(at, value)| (at - now, *value))
                 .collect()
         })
         .collect();
-    let datasets = series
+    let datasets = data
         .iter()
-        .zip(&data)
-        .map(|((color, _), data)| {
+        .zip(&relative)
+        .map(|((color, _), points)| {
             Dataset::default()
                 .marker(symbols::Marker::Braille)
                 .graph_type(GraphType::Line)
                 .style(Style::default().fg(*color))
-                .data(data)
+                .data(points)
         })
         .collect();
     let chart = Chart::new(datasets)
         .x_axis(Axis::default().bounds([-window, 0.0]))
         .y_axis(Axis::default().bounds([0.0, 100.0]));
     frame.render_widget(chart, plot);
+}
+
+/// Missing measurements separate curves; they are never interpolated.
+fn history_segments(history: &VecDeque<Sample>, value: SampleValue) -> Vec<Vec<(f64, f64)>> {
+    let mut segments = Vec::new();
+    let mut current = Vec::new();
+    for sample in history {
+        match value(sample) {
+            Some(value) => current.push((sample.at, value.clamp(0.0, 100.0))),
+            None if !current.is_empty() => segments.push(std::mem::take(&mut current)),
+            None => {}
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
 }
 
 /// nvtop-style stepped line from (progress 0..1, value 0..1) points, drawn
@@ -2928,6 +2957,16 @@ fn draw_home(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         lang.pick("SIZE", "GRÖSSE")
     };
     let files_header = lang.pick("FILES", "DATEIEN");
+    let previous_header = if app.settings.apparent_size {
+        lang.pick("+PREV alloc", "+LETZT bel")
+    } else {
+        lang.pick("+PREV", "+LETZTER")
+    };
+    let start_header = if app.settings.apparent_size {
+        lang.pick("+START blk", "+START bel")
+    } else {
+        "+START"
+    };
     let (headers, widths, rows): (Vec<(&str, bool)>, Vec<Constraint>, Vec<Row<'_>>) = if wide {
         (
             vec![
@@ -2935,8 +2974,8 @@ fn draw_home(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 (size_header, true),
                 (lang.pick("SHARE", "ANTEIL"), false),
                 (files_header, true),
-                (lang.pick("+PREV", "+LETZTER"), true),
-                (lang.pick("+START", "+START"), true),
+                (previous_header, true),
+                (start_header, true),
             ],
             vec![
                 Constraint::Min(16),
@@ -2967,7 +3006,7 @@ fn draw_home(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 (name_header, false),
                 (size_header, true),
                 (lang.pick("SHARE", "ANTEIL"), false),
-                (lang.pick("+PREV", "+LETZTER"), true),
+                (previous_header, true),
             ],
             vec![
                 Constraint::Min(12),
@@ -3353,8 +3392,8 @@ fn setup_description(app: &App) -> &'static str {
             "Zeit zwischen Hintergrund-Scans, von 1 Minute bis 24 Stunden.",
         ),
         (_, 2) => lang.pick(
-            "Allocated counts disk blocks (du); apparent counts file lengths (du -b).",
-            "Belegt zählt Plattenblöcke (du); scheinbar zählt Dateilängen (du -b).",
+            "Allocated counts disk blocks (du); apparent counts file lengths (du -b). Growth always counts allocated blocks.",
+            "Belegt zählt Plattenblöcke (du); scheinbar zählt Dateilängen (du -b). Wachstum zählt immer belegte Blöcke.",
         ),
         _ => lang.pick(
             "Start a new scan now. The previous result stays visible meanwhile.",
@@ -3602,6 +3641,7 @@ const HELP_EN: &[&str] = &[
     "* marks the filesystem that contains the home path.",
     "Home: one filesystem, no symlinks, hard links once.",
     "Sizes are allocated blocks (du) unless apparent is set.",
+    "Growth always measures allocated disk blocks.",
     "! marks directories that were partly unreadable.",
     "Command-line options and NO_COLOR apply only to this run.",
     "",
@@ -3660,6 +3700,7 @@ const HELP_DE: &[&str] = &[
     "* markiert das Dateisystem mit dem Home-Pfad.",
     "Home: ein Dateisystem, keine Symlinks, Hardlinks einmal.",
     "Größen sind belegte Blöcke (du), außer scheinbar ist aktiv.",
+    "Wachstum misst immer belegte Plattenblöcke.",
     "! markiert teilweise unlesbare Verzeichnisse.",
     "Kommandozeilenoptionen und NO_COLOR gelten nur für diesen Lauf.",
     "",
@@ -3847,6 +3888,139 @@ mod tests {
             .chunks(width)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>() + "\n")
             .collect()
+    }
+
+    #[test]
+    fn collector_clock_restart_drops_old_history_and_rate_scale() {
+        const MIB: f64 = 1024.0 * 1024.0;
+        let mut app = App::new(
+            None,
+            Settings {
+                history_seconds: 10,
+                ..Settings::default()
+            },
+            false,
+        );
+        let mut old = demo::snapshot(10, 3600.0, "/home", 0);
+        for device in &mut old.devices {
+            if let Some(rates) = &mut device.rates {
+                rates.read_rate = 1024.0 * MIB;
+                rates.write_rate = 0.0;
+            }
+        }
+        app.update(old);
+        assert_eq!(rate_scale(&app), 1024.0 * MIB);
+        app.home_source_changed();
+        assert!(app.history.is_empty());
+        for tick in 1..=30 {
+            let mut snapshot = demo::snapshot(10, f64::from(tick), "/home", 0);
+            for device in &mut snapshot.devices {
+                if let Some(rates) = &mut device.rates {
+                    rates.read_rate = MIB;
+                    rates.write_rate = 0.0;
+                }
+            }
+            app.update(snapshot);
+        }
+        assert_eq!(rate_scale(&app), MIB);
+        assert!(
+            app.history
+                .values()
+                .all(|history| history.len() == 11 && history.front().unwrap().at == 20.0)
+        );
+        // Also recover when a clock reset arrives without a source notification.
+        app.update(demo::snapshot(0, 0.0, "/home", 0));
+        assert!(app.history.values().all(|history| history.len() == 1));
+    }
+
+    #[test]
+    fn missing_measurements_leave_visible_gaps_in_both_graph_styles() {
+        for style in [GraphStyle::Steps, GraphStyle::Braille] {
+            let mut app = App::new(
+                None,
+                Settings {
+                    graph_style: style,
+                    history_seconds: 10,
+                    ..Settings::default()
+                },
+                false,
+            );
+            let history: VecDeque<_> = (0..=9)
+                .map(|tick| Sample {
+                    at: f64::from(tick),
+                    read: None,
+                    write: None,
+                    util: Some(50.0),
+                    used: match tick {
+                        0 => Some(90.0),
+                        9 => Some(10.0),
+                        _ => None,
+                    },
+                })
+                .collect();
+            app.history.insert("disk".into(), history);
+            let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+            terminal
+                .draw(|frame| draw_disk_graph(frame, &app, "disk", Rect::new(0, 0, 80, 12)))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let usage = plot_color(app.settings.usage_color);
+            assert!(
+                (10..80).any(|x| (0..12)
+                    .any(|y| buffer[(x, y)].fg == usage && buffer[(x, y)].symbol() != " ")),
+                "{style:?}: valid endpoints missing"
+            );
+            assert!(
+                (30..55).all(|x| (0..12)
+                    .all(|y| buffer[(x, y)].fg != usage || buffer[(x, y)].symbol() == " ")),
+                "{style:?}: interpolated missing fill level"
+            );
+            // A gap in fill level must not break independently measured I/O.
+            app.settings.view = View::Processes;
+            terminal
+                .draw(|frame| draw_disk_graph(frame, &app, "disk", Rect::new(0, 0, 80, 12)))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert!(
+                (30..55).all(|x| (0..12)
+                    .any(|y| buffer[(x, y)].fg == UTIL && buffer[(x, y)].symbol() != " ")),
+                "{style:?}: measured I/O lost"
+            );
+        }
+    }
+
+    #[test]
+    fn apparent_home_sizes_label_growth_as_allocated_in_both_languages() {
+        for language in [crate::config::Language::En, crate::config::Language::De] {
+            for width in [60, 120] {
+                let mut app = app();
+                app.settings.language = language;
+                app.settings.view = View::Home;
+                app.settings.apparent_size = true;
+                let before: Vec<_> = app
+                    .home_entries()
+                    .iter()
+                    .map(|entry| entry.growth_previous)
+                    .collect();
+                let mut terminal = Terminal::new(TestBackend::new(width, 36)).unwrap();
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                let text = screen(&terminal);
+                let label = if language == crate::config::Language::En {
+                    "+PREV alloc"
+                } else {
+                    "+LETZT bel"
+                };
+                assert!(text.contains(label), "{language:?}/{width}: {text}");
+                app.settings.apparent_size = false;
+                assert_eq!(
+                    before,
+                    app.home_entries()
+                        .iter()
+                        .map(|entry| entry.growth_previous)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[test]

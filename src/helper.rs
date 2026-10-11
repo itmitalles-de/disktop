@@ -20,8 +20,9 @@ use crate::{
 
 pub const HELPER_PATH: &str = "/usr/local/libexec/dwtop-collector";
 pub const PROTOCOL_VERSION: u32 = 1;
-/// A request carries at most a 4 KiB home path plus small fields.
-pub const MAX_REQUEST: usize = 8 * 1024;
+/// Every valid UTF-8 home path fits, including worst-case JSON escaping of
+/// quotes/backslashes, maximum integer fields and the newline terminator.
+pub const MAX_REQUEST: usize = 2 * scanner::MAX_ROOT_BYTES + 512;
 /// Snapshots with a full home tree stay far below this bound.
 pub const MAX_RESPONSE: usize = 32 * 1024 * 1024;
 const REPLY_DEADLINE: Duration = Duration::from_secs(10);
@@ -73,8 +74,24 @@ impl Request {
         if self.home.interval_minutes > 1440 {
             bail!("invalid rescan interval");
         }
+        if serde_json::to_vec(self)?.len() >= MAX_REQUEST {
+            bail!("helper request exceeds limit");
+        }
         Ok(())
     }
+}
+
+/// Validate the complete outgoing frame before writing even its first byte.
+pub fn write_request(writer: &mut impl Write, request: &Request) -> Result<()> {
+    request.validate()?;
+    let bytes = serde_json::to_vec(request)?;
+    if bytes.len() >= MAX_REQUEST {
+        bail!("helper request exceeds limit");
+    }
+    writer.write_all(&bytes)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
 }
 
 #[derive(Deserialize, Serialize)]
@@ -115,6 +132,83 @@ pub fn write_reply(writer: &mut impl Write, reply: &Reply) -> Result<()> {
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
+}
+
+/// Count serialized bytes without allocating a potentially oversized frame.
+#[derive(Default)]
+struct JsonSize(usize);
+
+impl Write for JsonSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_size(value: &impl Serialize) -> Result<usize> {
+    let mut size = JsonSize::default();
+    serde_json::to_writer(&mut size, value)?;
+    Ok(size.0)
+}
+
+/// Keep a complete Home report while fitting process and capacity rows into
+/// the aggregate frame budget. Omitted rows are explicitly disclosed; collection
+/// continues on the same connection instead of dropping into helper fallback.
+pub fn bounded_snapshot(snapshot: Snapshot) -> Result<Reply> {
+    let mut reply = Reply::Snapshot {
+        version: PROTOCOL_VERSION,
+        snapshot: Box::new(snapshot),
+    };
+    let size = json_size(&reply)?;
+    if size < MAX_RESPONSE {
+        return Ok(reply);
+    }
+    // Keep headroom for omission counters and source/message annotations.
+    // Removing rows accounts for their exact escaped JSON size; the final
+    // complete serialization is checked again before writing.
+    let mut excess = size.saturating_sub(MAX_RESPONSE - 512);
+    let Reply::Snapshot { snapshot, .. } = &mut reply else {
+        unreachable!()
+    };
+    fn trim<T: Serialize>(rows: &mut Vec<T>, excess: &mut usize) -> Result<usize> {
+        let original = rows.len();
+        while *excess > 0 {
+            let Some(row) = rows.pop() else {
+                break;
+            };
+            *excess = excess.saturating_sub(json_size(&row)?.saturating_add(1));
+        }
+        Ok(original - rows.len())
+    }
+    let omitted = trim(&mut snapshot.processes, &mut excess)?;
+    if omitted > 0 {
+        snapshot.process_access.omitted = snapshot.process_access.omitted.saturating_add(omitted);
+        snapshot.process_access.message.push_str(&format!(
+            "; process data truncated: {omitted} rows omitted by response budget"
+        ));
+        snapshot.truncated.push("/proc process data".into());
+    }
+    // A very large mount table can itself exhaust the remaining budget
+    // alongside Home. Preserve the complete bounded scan, disclose missing
+    // metadata and keep the helper session alive in that case too.
+    if trim(&mut snapshot.filesystems, &mut excess)? > 0 {
+        snapshot.truncated.push("/proc/self/mountinfo".into());
+    }
+    if trim(&mut snapshot.devices, &mut excess)? > 0 {
+        snapshot.truncated.push("/proc/diskstats".into());
+    }
+    snapshot.truncated.sort();
+    snapshot.truncated.dedup();
+    if json_size(&reply)? >= MAX_RESPONSE {
+        // The maximum bounded Home tree fits by itself; a future expansion
+        // of that contract must not emit an invalid frame.
+        bail!(HelperError::ResponseTooLarge);
+    }
+    Ok(reply)
 }
 
 /// Only the fixed administrator-installed path is eligible. No environment or
@@ -184,9 +278,7 @@ impl Client {
         };
         request.validate()?;
         let input = self.input.as_mut().context("helper input closed")?;
-        serde_json::to_writer(&mut *input, &request)?;
-        input.write_all(b"\n")?;
-        input.flush()?;
+        write_request(input, &request)?;
         let frame = self.read_response(interrupted)?;
         let reply: Reply = serde_json::from_slice(&frame).context("decoding helper response")?;
         match reply {
@@ -317,6 +409,74 @@ mod tests {
     }
 
     #[test]
+    fn escaped_maximum_paths_fit_and_invalid_outgoing_frames_write_nothing() {
+        // Components fit Linux NAME_MAX, but the valid 4096-byte path almost
+        // doubles in size when serialized (the old 8192-byte frame failed).
+        let mut root = String::from("/");
+        while root.len() < scanner::MAX_ROOT_BYTES {
+            if root.len() > 1 {
+                root.push('/');
+            }
+            let left = scanner::MAX_ROOT_BYTES - root.len();
+            root.push_str(&"\"".repeat(left.min(254)));
+        }
+        let mut value = request(&root, PROTOCOL_VERSION);
+        value.home.known_generation = u64::MAX;
+        value.home.interval_minutes = 1440;
+        let mut output = Vec::new();
+        write_request(&mut output, &value).unwrap();
+        assert!(output.len() > 8192 && output.len() <= MAX_REQUEST);
+        let bytes = read_frame(&mut Cursor::new(output), MAX_REQUEST)
+            .unwrap()
+            .unwrap();
+        let parsed: Request = serde_json::from_slice(&bytes).unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(parsed.home.root, root);
+        let mut output = Vec::new();
+        assert!(write_request(&mut output, &request("relative", 1)).is_err());
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn oversized_process_replies_remain_partial_and_allow_another_frame() {
+        let row = crate::model::ProcessRow {
+            command: "\\xff".repeat(4096),
+            ..crate::model::ProcessRow::default()
+        };
+        let snapshot = Snapshot {
+            processes: vec![row; 1650],
+            process_access: crate::model::ProcessAccess {
+                privileged: true,
+                readable: 1650,
+                ..crate::model::ProcessAccess::default()
+            },
+            ..Snapshot::default()
+        };
+        let reply = bounded_snapshot(snapshot).unwrap();
+        let Reply::Snapshot { snapshot, .. } = &reply else {
+            unreachable!()
+        };
+        assert!(!snapshot.processes.is_empty() && snapshot.processes.len() < 1650);
+        assert_eq!(
+            snapshot.process_access.omitted + snapshot.processes.len(),
+            1650
+        );
+        assert_eq!(snapshot.process_access.readable, 1650);
+        let mut stream = Vec::new();
+        write_reply(&mut stream, &reply).unwrap();
+        write_reply(&mut stream, &bounded_snapshot(Snapshot::default()).unwrap()).unwrap();
+        let mut reader = Cursor::new(stream);
+        for _ in 0..2 {
+            let bytes = read_frame(&mut reader, MAX_RESPONSE).unwrap().unwrap();
+            assert!(matches!(
+                serde_json::from_slice::<Reply>(&bytes).unwrap(),
+                Reply::Snapshot { .. }
+            ));
+        }
+        assert!(read_frame(&mut reader, MAX_RESPONSE).unwrap().is_none());
+    }
+
+    #[test]
     fn largest_home_tree_reply_with_identity_keys_fits_the_response_limit() {
         use crate::model::{DirNode, Folded, HomeReport};
         // Worst case per node: a name of invalid bytes at the name cap, every
@@ -370,5 +530,59 @@ mod tests {
         assert!(size < MAX_RESPONSE * 9 / 10, "{size} bytes");
         let mut out = Vec::new();
         write_reply(&mut out, &reply).unwrap();
+        let Reply::Snapshot { mut snapshot, .. } = reply else {
+            unreachable!()
+        };
+        let row = crate::model::ProcessRow {
+            command: "\\xff".repeat(4096),
+            ..crate::model::ProcessRow::default()
+        };
+        snapshot.processes = vec![row; 1650];
+        snapshot.process_access.readable = snapshot.processes.len();
+        snapshot.process_access.privileged = true;
+        // Capacity metadata can also overflow the residual space. This must
+        // disclose missing mounts instead of sacrificing the Home tree.
+        snapshot.filesystems = vec![
+            crate::model::Filesystem {
+                mount_point: "\"".repeat(4096),
+                ..crate::model::Filesystem::default()
+            };
+            2000
+        ];
+        assert!(json_size(&snapshot).unwrap() > MAX_RESPONSE);
+        let bounded = bounded_snapshot(*snapshot).unwrap();
+        let mut output = Vec::new();
+        write_reply(&mut output, &bounded).unwrap();
+        assert!(output.len() <= MAX_RESPONSE);
+        let decoded: Reply = serde_json::from_slice(&output).unwrap();
+        let Reply::Snapshot { snapshot, .. } = decoded else {
+            unreachable!()
+        };
+        assert!(snapshot.processes.len() < 1650);
+        assert!(snapshot.filesystems.len() < 2000);
+        assert!(
+            snapshot
+                .truncated
+                .iter()
+                .any(|source| source == "/proc/self/mountinfo")
+        );
+        assert_eq!(
+            snapshot.home_tree.unwrap().nodes.len(),
+            count,
+            "keep the whole Home tree"
+        );
+        assert!(snapshot.process_access.privileged);
+        assert!(snapshot.process_access.message.contains("rows omitted"));
+        assert_eq!(snapshot.process_access.readable, 1650);
+        assert_eq!(
+            snapshot.process_access.omitted,
+            1650 - snapshot.processes.len()
+        );
+        assert!(
+            snapshot
+                .truncated
+                .iter()
+                .any(|source| source == "/proc process data")
+        );
     }
 }

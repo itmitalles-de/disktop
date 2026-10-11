@@ -348,37 +348,48 @@ impl Sysfs {
     }
 
     /// Physical whole disks below a device: a partition's disk, or the disks
-    /// below a dm/md stack. Depth and fan-out are bounded.
+    /// below a dm/md stack. Shared subgraphs and cycles are visited once;
+    /// depth, node count and leaves are bounded.
     pub fn backing_disks(&self, name: &str, infos: &HashMap<String, Info>) -> Vec<String> {
-        let mut found = BTreeSet::new();
-        self.collect_backing(name, infos, 0, &mut found);
-        found.into_iter().collect()
+        self.backing_disks_cached(name, infos, &mut HashMap::new())
     }
 
-    fn collect_backing(
+    /// Reuse slave directory listings across all backing-device traversals
+    /// within a sample. Each distinct sysfs directory is read once.
+    pub fn backing_disks_cached(
         &self,
         name: &str,
         infos: &HashMap<String, Info>,
-        depth: usize,
-        found: &mut BTreeSet<String>,
-    ) {
-        if depth > MAX_STACK_DEPTH || found.len() > 64 {
-            return;
+        slaves: &mut HashMap<String, Vec<String>>,
+    ) -> Vec<String> {
+        let mut found = BTreeSet::new();
+        let mut queued = BTreeSet::from([name.to_owned()]);
+        let mut pending = VecDeque::from([(name.to_owned(), 0)]);
+        while let Some((device, depth)) = pending.pop_front() {
+            if let Some(parent) = infos.get(&device).and_then(|info| info.parent.as_ref()) {
+                if depth < MAX_STACK_DEPTH && queued.len() < 256 && queued.insert(parent.clone()) {
+                    pending.push_back((parent.clone(), depth + 1));
+                }
+                continue;
+            }
+            let below = slaves
+                .entry(device.clone())
+                .or_insert_with(|| self.slaves(&device));
+            if below.is_empty() {
+                if found.len() < 64 {
+                    found.insert(device);
+                }
+                continue;
+            }
+            if depth < MAX_STACK_DEPTH {
+                for next in below.iter().take(256) {
+                    if queued.len() < 256 && queued.insert(next.clone()) {
+                        pending.push_back((next.clone(), depth + 1));
+                    }
+                }
+            }
         }
-        if let Some(parent) = infos.get(name).and_then(|info| info.parent.as_deref()) {
-            // A partition of a whole disk, or of an MD array (md0p1), whose
-            // own disks lie further below.
-            self.collect_backing(parent, infos, depth + 1, found);
-            return;
-        }
-        let slaves = self.slaves(name);
-        if slaves.is_empty() {
-            found.insert(name.to_owned());
-            return;
-        }
-        for slave in slaves {
-            self.collect_backing(&slave, infos, depth + 1, found);
-        }
+        found.into_iter().collect()
     }
 
     /// The device itself, its partitions and everything stacked above them,
@@ -918,5 +929,59 @@ mod tests {
         );
         let bounded = sysfs.descendants_cached("root", &partitions, &mut holders);
         assert_eq!(bounded.len(), 256);
+    }
+
+    #[test]
+    fn backing_traversal_visits_shared_graph_once_and_bounds_cycles() {
+        let root = std::env::temp_dir().join(format!("dwtop-backing-dag-{}", std::process::id()));
+        // Eight reconvergent levels used to expand to 6^8 recursive visits.
+        for level in 0..8 {
+            for branch in 0..6 {
+                let name = format!("dm-{level}-{branch}");
+                let dir = root.join("class/block").join(&name).join("slaves");
+                fs::create_dir_all(&dir).unwrap();
+                if level == 7 {
+                    fs::write(dir.join("sda"), "").unwrap();
+                } else {
+                    for next in 0..6 {
+                        fs::write(dir.join(format!("dm-{}-{next}", level + 1)), "").unwrap();
+                    }
+                }
+            }
+        }
+        let sysfs = Sysfs::at(&root);
+        let infos = HashMap::new();
+        let mut cache = HashMap::new();
+        assert_eq!(
+            sysfs.backing_disks_cached("dm-0-0", &infos, &mut cache),
+            ["sda"]
+        );
+        assert_eq!(cache.len(), 44); // root + seven six-wide levels + leaf.
+        let cached = cache.clone();
+        // A second root shares all downstream listings. Remove the fixture to
+        // prove a traversal can use those lists without rereading sysfs.
+        fs::remove_dir_all(root.join("class/block/dm-1-0")).unwrap();
+        assert_eq!(
+            sysfs.backing_disks_cached("dm-1-0", &infos, &mut cache),
+            ["sda"]
+        );
+        assert_eq!(cache, cached);
+        // Cycles cannot fabricate a physical disk; a real sibling still wins.
+        cache.insert("cycle-a".into(), vec!["cycle-b".into(), "sda".into()]);
+        cache.insert("cycle-b".into(), vec!["cycle-a".into()]);
+        assert_eq!(
+            sysfs.backing_disks_cached("cycle-a", &infos, &mut cache),
+            ["sda"]
+        );
+        // Fan-out bounds the queued nodes and retained physical leaves.
+        cache.insert(
+            "wide".into(),
+            (0..300).map(|index| format!("disk-{index}")).collect(),
+        );
+        assert_eq!(
+            sysfs.backing_disks_cached("wide", &infos, &mut cache).len(),
+            64
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

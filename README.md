@@ -109,13 +109,17 @@ file capabilities are only `CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`.
   with privileges. Policies must contain valid UTF-8 and at most 64 valid
   absolute roots. A malformed policy or one larger than 64 KiB is rejected
   in its entirety; its prefix is never interpreted as an allowlist. Below an allowed root the
-  path is opened component by component without following symlinks, so a link such as `/home/alice/x ->
+  path is opened component by component without following symlinks. System aliases
+  such as `/home -> /var/home` are accepted only through root-owned, non-writable
+  ancestors; user-controlled aliases cannot enlarge the allowlist. A link such as `/home/alice/x ->
   /root` is refused. For any other path the interface scans without the helper,
   as if it were not installed, and says so. An administrator adds roots with,
   for example, `echo /srv/home | sudo tee -a /etc/dwtop/scan-roots` (create
   the file with `/home` first to keep the default).
 - **hidepid:** if `/proc` is mounted with `hidepid`, the helper keeps that policy
-  for other users' processes although `CAP_SYS_PTRACE` bypasses it:
+  for other users' processes although `CAP_SYS_PTRACE` bypasses it. The policy
+  and `gid=` exemption are checked on every sample, so remount changes take
+  effect without restarting the helper:
   `hidepid=1`/`noaccess` sends only their task name, never the command line;
   `hidepid=2`/`invisible`/`ptraceable` omits them and counts them as hidden.
   Members of the `gid=` group of the mount see everything, as without the helper.
@@ -131,6 +135,9 @@ The UI starts the fixed helper over private stdin/stdout pipes with a bounded,
 versioned protocol: no service, port, or arbitrary file/command API. Replies have
 a deadline; a stalled, crashed, outdated or revoked helper is replaced by direct,
 unprivileged collection at startup or at runtime, with a visible notice.
+Process data has an aggregate serialized-size budget; omitted rows are reported
+separately from unreadable processes. Oversized combined replies retain the
+Home scan and mark any omitted process or capacity rows as truncated.
 
 Repeat the helper setup after updating dwtop. A helper from an older release
 keeps working: the interface adds what it does not send (fill levels and the
@@ -319,6 +326,8 @@ between two refreshes are not listed; their I/O remains in the device rates.
   one filesystem, never follows symlinks (each directory is opened relative to
   its parent with `O_NOFOLLOW`), counts hard-linked files once, and never reads
   file contents. Sizes are allocated blocks (`du`) or apparent sizes (`du -b`).
+  Growth always measures allocated blocks, including in apparent-size mode;
+  increasing a sparse file's length alone does not count as disk-space growth.
 - Scans are bounded: 20 million entries, 15 minutes, 128 directory levels. The
   retained tree keeps 20,000 directories, sharing retention between top-level
   subtrees and lending unused shares to others. Within each subtree it prefers

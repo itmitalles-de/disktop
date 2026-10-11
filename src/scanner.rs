@@ -7,12 +7,12 @@
 //! in a tree limited by depth, children per directory and total node count.
 
 use std::{
-    collections::{HashMap, HashSet},
-    ffi::{CStr, CString},
+    collections::{HashMap, HashSet, VecDeque},
+    ffi::{CStr, CString, OsString},
     io,
     os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
-        unix::ffi::OsStrExt,
+        unix::ffi::{OsStrExt, OsStringExt},
     },
     path::{Path, PathBuf},
     sync::{
@@ -259,6 +259,96 @@ fn open_component(parent: Option<&OwnedFd>, name: &Path) -> io::Result<OwnedFd> 
     }
 }
 
+/// Resolve administrator-owned aliases (for example /home -> /var/home)
+/// without letting symlinks under user-writable ancestors enlarge the policy.
+/// Each lookup is relative to an opened directory, and symlink targets are
+/// read only while every ancestor is root-owned and not group/world-writable.
+fn resolve_trusted_root(root: &Path) -> io::Result<PathBuf> {
+    let parts = |path: &Path| -> VecDeque<OsString> {
+        path.components()
+            .map(|part| part.as_os_str().to_owned())
+            .collect()
+    };
+    let mut pending = parts(root);
+    let mut directory = open_component(None, Path::new("/"))?;
+    let trusted = |fd: &OwnedFd| -> io::Result<bool> {
+        let stat = stat_fd(fd.as_raw_fd())?;
+        Ok(stat.st_uid == 0 && stat.st_mode & 0o022 == 0)
+    };
+    let mut safe = trusted(&directory)?;
+    let mut resolved = PathBuf::from("/");
+    let mut aliases = 0;
+    while let Some(part) = pending.pop_front() {
+        if part == "/" {
+            directory = open_component(None, Path::new("/"))?;
+            safe = trusted(&directory)?;
+            resolved = PathBuf::from("/");
+            continue;
+        }
+        if part == "." {
+            continue;
+        }
+        if part == ".." {
+            // A symlink target traversing a user-replaceable directory is not
+            // a trustworthy alias. Normal configured roots forbid '..'.
+            if !safe {
+                return Err(not_allowed());
+            }
+            directory = open_component(Some(&directory), Path::new(".."))?;
+            resolved.pop();
+            safe = trusted(&directory)?;
+            continue;
+        }
+        let name = CString::new(part.as_bytes()).map_err(|_| not_allowed())?;
+        let stat = stat_at(directory.as_raw_fd(), &name)?;
+        if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            // procfs magic links such as self/cwd and self/fd are influenced
+            // by process state despite looking root-owned. They are not
+            // administrator-controlled filesystem aliases.
+            let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstatfs(directory.as_raw_fd(), &mut filesystem) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if filesystem.f_type == libc::PROC_SUPER_MAGIC {
+                return Err(not_allowed());
+            }
+            aliases += 1;
+            if !safe || stat.st_uid != 0 || aliases > 40 {
+                return Err(not_allowed());
+            }
+            let mut bytes = vec![0u8; MAX_ROOT_BYTES + 1];
+            // SAFETY: name is terminated; bytes has the declared capacity.
+            let length = unsafe {
+                libc::readlinkat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                )
+            };
+            if length < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if length as usize > MAX_ROOT_BYTES {
+                return Err(not_allowed());
+            }
+            bytes.truncate(length as usize);
+            let target = PathBuf::from(OsString::from_vec(bytes));
+            for component in parts(&target).into_iter().rev() {
+                pending.push_front(component);
+            }
+            continue;
+        }
+        directory = open_component(Some(&directory), Path::new(&part))?;
+        safe &= trusted(&directory)?;
+        resolved.push(part);
+        if resolved.as_os_str().len() > MAX_ROOT_BYTES {
+            return Err(not_allowed());
+        }
+    }
+    Ok(resolved)
+}
+
 /// Check every existing component before treating a missing policy as absent.
 /// A missing leaf below an unsafe or dangling symlink must not enable defaults.
 fn trusted_policy_exists(path: &Path) -> std::result::Result<bool, String> {
@@ -318,6 +408,9 @@ pub fn load_scan_roots(path: &Path) -> (RootPolicy, Option<String>) {
 
 fn load_scan_roots_inner(path: &Path, allow_default: bool) -> (RootPolicy, Option<String>) {
     let parse_roots = |entries: Vec<String>| {
+        // A policy with many slow/offline roots shares one deadline instead
+        // of multiplying a blocking startup delay by the number of entries.
+        let deadline = Instant::now() + Duration::from_secs(1);
         RootPolicy::Allowed(
             entries
                 .into_iter()
@@ -325,9 +418,16 @@ fn load_scan_roots_inner(path: &Path, allow_default: bool) -> (RootPolicy, Optio
                 .take(MAX_SCAN_ROOTS)
                 .map(|entry| {
                     let configured = PathBuf::from(&entry);
-                    let canonical =
-                        crate::probe::resolve_with_timeout(&configured, Duration::from_secs(1))
-                            .unwrap_or_else(|| configured.clone());
+                    // Never authorize a canonical alias controlled by a user.
+                    // An unresolved/unsafe root remains lexical; open() will
+                    // refuse any symlink on that path.
+                    let path = configured.clone();
+                    let canonical = crate::probe::run_with_timeout(
+                        move || resolve_trusted_root(&path),
+                        deadline.saturating_duration_since(Instant::now()),
+                    )
+                    .and_then(std::result::Result::ok)
+                    .unwrap_or_else(|| configured.clone());
                     AllowedRoot {
                         configured,
                         canonical,
@@ -1943,6 +2043,40 @@ mod tests {
             assert!(problem.unwrap().contains("root-owned"));
             assert!(!policy.allows(Path::new("/srv")) && !policy.allows(Path::new("/home")));
         }
+    }
+
+    #[test]
+    fn user_replaceable_scan_roots_never_authorize_startup_aliases() {
+        let tree = TempTree::new("startup-alias");
+        let root = tree.0.join("projects");
+        fs::create_dir(&root).unwrap();
+        let configured = root.clone();
+        let canonical = resolve_trusted_root(&configured).unwrap();
+        let initial = RootPolicy::Allowed(vec![AllowedRoot {
+            configured: configured.clone(),
+            canonical,
+        }]);
+        assert!(initial.open(&root).is_ok());
+        fs::remove_dir(&root).unwrap();
+        symlink("/", &root).unwrap();
+        assert!(
+            initial.open(&root).is_err(),
+            "replacement after startup must fail"
+        );
+        let canonical = resolve_trusted_root(&configured).unwrap_or_else(|_| configured.clone());
+        let restarted = RootPolicy::Allowed(vec![AllowedRoot {
+            configured,
+            canonical,
+        }]);
+        assert!(
+            !restarted.allows(Path::new("/")),
+            "replacement before startup must not grant /"
+        );
+        assert!(restarted.open(&root).is_err());
+        assert!(
+            resolve_trusted_root(Path::new("/proc/self")).is_err(),
+            "magic aliases are not administrator-owned"
+        );
     }
 
     #[test]
