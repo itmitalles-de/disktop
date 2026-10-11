@@ -206,7 +206,9 @@ it unless explicitly enabled; multi-disk stacked devices retain their blocks.
 
 Wide terminals arrange disk blocks in columns. Small terminals reduce graph
 height and then collapse blocks; `+N more` marks hidden disks and Tab scrolls
-the focus. F5/Tab/`--device` select the focused disk; automatic focus follows
+the focus. Short filesystem tables leave more height for fill history, and
+Space/Home blocks reserve only their capacity rows rather than I/O meters.
+F5/Tab/`--device` select the focused disk; automatic focus follows
 the configured home path.
 
 ### Make it yours with F2

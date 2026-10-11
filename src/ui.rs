@@ -1065,6 +1065,8 @@ impl App {
 /// How each disk block of the overview is drawn, from most to least detail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockStyle {
+    /// Capacity label, used/free rows and a fill graph below (zero hides it).
+    Space(u16),
     /// Label row, four meters and a graph of this many rows beside them.
     Side(u16),
     /// Label row, four meters and a graph of this many rows below them.
@@ -1080,6 +1082,7 @@ pub enum BlockStyle {
 impl BlockStyle {
     pub fn height(self) -> u16 {
         match self {
+            Self::Space(graph) => 3 + graph,
             Self::Side(graph) => 1 + graph.max(4),
             Self::Below(graph) => 5 + graph,
             Self::Meters => 5,
@@ -1089,7 +1092,7 @@ impl BlockStyle {
     }
 
     pub fn has_graph(self) -> bool {
-        matches!(self, Self::Side(_) | Self::Below(_))
+        matches!(self, Self::Side(_) | Self::Below(_) | Self::Space(1..))
     }
 }
 
@@ -1133,6 +1136,16 @@ fn side_meter_width(width: u16) -> u16 {
 /// one row per disk, and finally a scrolled list with a "+N more" row.
 /// Wide terminals use several columns, as htop does for CPU meters.
 pub fn disk_layout(width: u16, height: u16, count: usize, graphs: bool) -> DiskLayout {
+    disk_layout_for_view(width, height, count, graphs, false)
+}
+
+fn disk_layout_for_view(
+    width: u16,
+    height: u16,
+    count: usize,
+    graphs: bool,
+    space: bool,
+) -> DiskLayout {
     let make = |columns: u16, style: BlockStyle| {
         let grid_rows = count.div_ceil(usize::from(columns.max(1)));
         // As few columns as give the same number of rows: 4 disks in three
@@ -1158,7 +1171,9 @@ pub fn disk_layout(width: u16, height: u16, count: usize, graphs: bool) -> DiskL
         for columns in preferred..=max_columns {
             let side = column_width(width, columns) >= SIDE_MIN_WIDTH;
             for graph in (GRAPH_MIN..=GRAPH_MAX).rev() {
-                let style = if side {
+                let style = if space {
+                    BlockStyle::Space(graph)
+                } else if side {
                     BlockStyle::Side(graph)
                 } else {
                     BlockStyle::Below(graph)
@@ -1169,7 +1184,12 @@ pub fn disk_layout(width: u16, height: u16, count: usize, graphs: bool) -> DiskL
             }
         }
     }
-    for style in [BlockStyle::Meters, BlockStyle::Pair] {
+    let meter_styles: &[BlockStyle] = if space {
+        &[BlockStyle::Space(0)]
+    } else {
+        &[BlockStyle::Meters, BlockStyle::Pair]
+    };
+    for &style in meter_styles {
         for columns in preferred..=max_columns {
             if fits(columns, style) {
                 return make(columns, style);
@@ -1215,6 +1235,14 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         // Small terminals keep at most three process rows for the disks.
         View::Processes if body < 20 => 1 + rows.min(3),
         View::Processes => 1 + rows,
+        // A short filesystem list must not crowd out fill history.
+        View::Filesystems => ((body / 2).max(TABLE_MIN)).min(
+            app.filesystem_rows()
+                .len()
+                .max(1)
+                .saturating_add(1)
+                .min(u16::MAX as usize) as u16,
+        ),
         _ => (body / 2).max(TABLE_MIN),
     }
     .min(body.saturating_sub(2));
@@ -1222,7 +1250,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let graphs = app.settings.show_graph
         && (app.settings.show_usage_series
             || (app.settings.view == View::Processes && app.settings.show_io_series));
-    let mut layout = disk_layout(area.width, body - reserved, count, graphs);
+    let mut layout = if app.settings.view == View::Processes {
+        disk_layout(area.width, body - reserved, count, graphs)
+    } else {
+        disk_layout_for_view(area.width, body - reserved, count, graphs, true)
+    };
     if count == 0 {
         layout.visible_rows = 0;
     }
@@ -3894,10 +3926,11 @@ mod tests {
         assert!(summary_line(&app, 120).contains("partial"));
     }
 
-    const SIZES: [(u16, u16); 7] = [
+    const SIZES: [(u16, u16); 8] = [
         (36, 16),
         (40, 24),
         (52, 18),
+        (60, 24),
         (80, 24),
         (120, 36),
         (160, 48),
@@ -3946,6 +3979,76 @@ mod tests {
                 })
             })
             .count()
+    }
+
+    #[test]
+    fn short_space_table_leaves_room_for_both_disk_histories() {
+        for language in [Language::En, Language::De] {
+            let mut app = app_with_disks(2);
+            app.settings.view = View::Filesystems;
+            app.settings.language = language;
+            app.snapshot.filesystems.truncate(4);
+            assert_eq!(app.filesystem_rows().len(), 4);
+            let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let text = screen(&terminal);
+            // Real regression: two capacity blocks, both with visible history,
+            // and the complete short table above the footer at 60x24.
+            assert_eq!(text.matches("100%").count(), 2, "{text}");
+            assert_eq!(text.matches("  0%").count(), 2, "{text}");
+            for filesystem in app.filesystem_rows() {
+                assert!(text.contains(&filesystem.mount_point), "{text}");
+            }
+            let lines: Vec<_> = text.lines().collect();
+            assert!(!lines[22].trim().is_empty(), "unused table tail\n{text}");
+            assert!(lines[23].contains("F10"), "{text}");
+            assert!(
+                terminal.backend().buffer().content.iter().any(|cell| {
+                    cell.fg == plot_color(app.settings.usage_color) && cell.symbol() == "─"
+                }),
+                "fill history not drawn\n{text}"
+            );
+
+            // Explicit graph preferences remain authoritative. Each compact
+            // capacity block follows immediately after the preceding Free row.
+            app.settings.show_graph = false;
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let text = screen(&terminal);
+            assert!(!text.contains("100%"), "{text}");
+            let lines: Vec<_> = text.lines().collect();
+            assert!(
+                lines[4].starts_with(app.lang().pick("Free", "Frei")),
+                "{text}"
+            );
+            assert!(lines[5].starts_with("sdb "), "{text}");
+        }
+    }
+
+    #[test]
+    fn space_table_keeps_scroll_room_and_empty_filter_message() {
+        let mut app = app_with_disks(2);
+        app.settings.view = View::Filesystems;
+        let template = app.snapshot.filesystems[0].clone();
+        app.snapshot.filesystems = (0..30)
+            .map(|index| crate::model::Filesystem {
+                mount_point: format!("/mount/{index:02}"),
+                ..template.clone()
+            })
+            .collect();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.visible_rows >= 9);
+        for _ in 0..30 {
+            app.handle_key(KeyCode::Down.into());
+        }
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("/mount/29"));
+        app.filter = "no such mount".into();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("No matching filesystems."), "{text}");
+        assert_eq!(text.matches("100%").count(), 2, "{text}");
+        assert!(text.lines().last().unwrap().contains("F10"));
     }
 
     #[test]

@@ -10,8 +10,10 @@ utilization history, detailed device statistics and the process table.
 `App::overview_devices()` lists visible whole devices plus a focused partition;
 dm/md devices backed by one shown disk fold into it unless `show_stacked`.
 The pure `disk_layout()` reduces graph height, then meters and rows as space
-shrinks; a "+N more" row and focus scrolling expose overflow. Per-device
-`App::history` survives focus changes. RD/WR meters in the I/O view share the
+shrinks; Space/Home use compact capacity blocks and short filesystem tables
+release unused height to fill history. A "+N more" row and focus scrolling
+expose overflow. Per-device `App::history` survives focus changes. RD/WR meters
+in the I/O view share the
 highest visible rate across all overview devices. Space views never substitute
 I/O rates for capacity. Unavailable measurements remain explicit; `demo.rs`
 contains the only synthetic data, used by explicit `--demo` and tests.
