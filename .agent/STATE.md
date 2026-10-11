@@ -1,5 +1,38 @@
 # Verified state
 
+## dwtop rename (2026-10-11)
+
+- Public repository is `itmitalles-de/dwtop`, GPL-3.0-or-later; the local main
+  checkout is `../dwtop`. PR #19 merged as `5eb7a40` (implementation `7282532`).
+  UI and helper executables are `dwtop` and `dwtop-collector`; Space/history,
+  Home growth and the separate I/O menu retain their behavior.
+- Settings and scan policies prefer dwtop, then spctop, then disktop. Only
+  safely absent files permit fallback; higher-priority malformed/unsafe files
+  remain authoritative failures. Saving preserves old settings and unknown
+  fields. Explicit spctop I/O preferences survive. Policies reject invalid
+  UTF-8/paths, more than 64 roots and oversized files completely; a selected
+  policy disappearing during loading cannot enable defaults.
+- Verified: 102 Rust tests on stable and Rust 1.88, fmt, Clippy, release build,
+  terminal/configuration migration, isolated real I/O and capability-helper
+  tests, ShellCheck, dependency audit and site references. PR CI/MSRV/audit,
+  all CodeQL languages and Pages build passed. Public Pages deployment passed;
+  HTML, JS, banner, social card, screenshots and video hashes match the repo.
+- Website remains `disktop.wutz.io`, with dwtop branding and commands. EN/DE,
+  desktop/mobile, themes, tabs, images and complete playback passed. Review:
+  `../disktop-review/rename-dwtop/review.html` (opened in visible Brave).
+- UI is installed at `~/.local/bin/dwtop`; its receipt and SHA-256 match the
+  release. Direct live collection verifies both physical NVMe, marked /home
+  and no nonresponding mounts.
+- Remaining work is tracked by #18: local helper activation is waiting for
+  administrator authentication in `scripts/setup-helper.sh`. The existing
+  spctop UI/helper and their receipts are intentionally retained until the new
+  helper is verified. Keep `../spctop-worktrees/rename-dwtop` while its pending
+  installer references that checkout; then remove the merged worktree/branch.
+  After authentication, verify installed hashes/capabilities and live process
+  readability, then retire only receipt-verified legacy executables. Preserve
+  configuration and policy files. Evidence and narrow verification/retirement
+  scripts are in `../disktop-review/rename-dwtop/`.
+
 ## Full review fixes (2026-10-10)
 
 - #11: current and legacy scan-root policies exceeding 64 KiB fail closed in
