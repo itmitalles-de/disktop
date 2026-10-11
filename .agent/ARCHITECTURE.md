@@ -19,15 +19,17 @@ contains the only synthetic data, used by explicit `--demo` and tests.
 `config.rs` owns versioned preferences, XDG paths and atomic private writes;
 CLI options, `NO_COLOR` and the unavailable-device fallback change only a
 runtime copy, and F12 saves the file values plus fields the user touched.
-When the spctop configuration is absent, legacy disktop
-preferences are read without modification; the legacy process-first view
-migrates to Space. Saving targets spctop and preserves unknown fields.
+Configuration precedence is dwtop, spctop, then disktop. Only an absent file
+permits fallback; malformed or unsafe higher-priority files are preserved and
+reported. Legacy files are read without modification. Explicit spctop I/O
+preferences survive; only the old disktop process-first view migrates to Space.
+Saving targets dwtop and preserves unknown fields.
 `i18n.rs` provides English/German UI text; CLI, stderr and JSON stay English.
 `shutdown.rs` turns SIGINT/SIGTERM/SIGHUP into cooperative exits so the
 terminal is always restored. A hung-up terminal (POLLHUP/POLLERR on stdin)
 ends the monitor like SIGHUP: `run()` polls stdin itself before letting
 crossterm read, because crossterm 0.29 retries reads that return end of file
-forever; a `spctop-hangup` watchdog thread exits after two seconds if a
+forever; a `dwtop-hangup` watchdog thread exits after two seconds if a
 hangup slips into that window, and the dead terminal is not written to on exit; `ratatui::init` restores it on panics.
 
 `collector.rs` samples everything for one snapshot: `diskstats.rs` parses
@@ -82,7 +84,7 @@ Direct collection also detects hidepid: stat EACCES counts as unreadable,
 while invisible processes have no fabricated total. The TUI warns even when
 the kernel hides enumeration; gid exemptions retain the kernel's behavior.
 
-`scanner.rs` runs the home scan in a `spctop-scan` thread (idle I/O priority,
+`scanner.rs` runs the home scan in a `dwtop-scan` thread (idle I/O priority,
 nice 10, only DAC_READ_SEARCH). It walks with fdopendir/readdir, fstatat
 (AT_SYMLINK_NOFOLLOW) and openat (O_DIRECTORY|O_NOFOLLOW), re-checks dev/inode
 after opening, skips other filesystems, dedupes hard links in a bounded set and
@@ -106,16 +108,19 @@ paths for growth/navigation. Legacy helper nodes fall back to their names.
 Breadcrumbs use display names, and new trees truncate navigation to the deepest
 surviving prefix. `RootPolicy` decides how roots
 open: `Follow` (UI, like du) or `Allowed` (helper: roots from the root-owned
-/etc/spctop/scan-roots, falling back to legacy /etc/disktop/scan-roots only
-when absent. /home is the default only if neither file exists; invalid policies
-fail closed. Policy reads probe beyond 64 KiB and reject oversized files in
-their entirety. Roots are opened component by component with
+/etc/dwtop/scan-roots, then /etc/spctop/scan-roots, then
+/etc/disktop/scan-roots. Only a safely absent policy permits fallback; /home is
+the default only if all three are absent. Invalid higher-priority policies fail
+closed without consulting legacy files. Policy reads probe beyond 64 KiB and
+reject oversized files, invalid UTF-8, invalid paths and more than 64 roots in
+their entirety. A selected policy disappearing during loading denies scans
+instead of enabling defaults. Roots are opened component by component with
 O_NOFOLLOW). `collector::HomeScan` drives the service from requests; a root the
 helper refuses (`HomeErrorKind::NotAllowed`) is scanned by the UI's own
 unprivileged `HomeScan` (`Source::Helper`), marked `helper_refused`. Home and
 helper errors carry kinds that `i18n.rs` translates.
 
-`helper.rs` and `bin/spctop-collector.rs` implement the optional root-owned
+`helper.rs` and `bin/dwtop-collector.rs` implement the optional root-owned
 helper: fixed path and ownership checks, cleared environment, `--stdio` only,
 versioned newline-delimited JSON with request (8 KiB) and response (32 MiB)
 bounds, unknown fields rejected, a 10-second reply deadline with cancellation,

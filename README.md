@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://disktop.wutz.io">
-    <img src="site/assets/readme-banner.svg" alt="spctop — your disks, in view" width="100%">
+    <img src="site/assets/readme-banner.svg" alt="dwtop — your disks, in view" width="100%">
   </a>
 </p>
 
@@ -21,10 +21,10 @@
   <a href="https://disktop.wutz.io">Website</a> ·
   <a href="#install">Install</a> ·
   <a href="#keyboard">Keyboard</a> ·
-  <a href="https://github.com/itmitalles-de/spctop">Source</a>
+  <a href="https://github.com/itmitalles-de/dwtop">Source</a>
 </p>
 
-**spctop** (formerly disktop) watches **used space across all your disks**.
+**dwtop** (Disk Watch; formerly spctop and disktop) watches **used space across all your disks**.
 The main view combines used/free capacity, fill-level history and a filesystem
 table. Open Home to find large directories and watch growth between scans.
 Disk throughput, utilization and process I/O live in a separate **I/O** view,
@@ -40,7 +40,7 @@ one-time helper setup adds directory sizes below administrator-approved roots
 interface itself never gains privileges.
 
 <p align="center">
-  <img src="site/assets/disktop-demo.png" alt="spctop terminal showing used space and fill-level history for every disk above the filesystem table" width="100%">
+  <img src="site/assets/disktop-demo.png" alt="dwtop terminal showing used space and fill-level history for every disk above the filesystem table" width="100%">
   <br>
   <sub>Actual terminal output in explicit DEMO mode. Disks, rates and processes are synthetic.</sub>
 </p>
@@ -59,15 +59,15 @@ You need **Linux** and **Rust 1.88+**. The source is licensed under the
 [GNU GPL v3 or later](LICENSE).
 
 ```bash
-git clone https://github.com/itmitalles-de/spctop.git
-cd spctop
+git clone https://github.com/itmitalles-de/dwtop.git
+cd dwtop
 ./scripts/install.sh
 ./scripts/setup-helper.sh   # Optional, one-time administrator authentication.
-~/.local/bin/spctop
+~/.local/bin/dwtop
 ```
 
 The installer builds from source and installs the UI into `~/.local/bin` as your
-regular user. Add that directory to your `PATH`, then start with `spctop`.
+regular user. Add that directory to your `PATH`, then start with `dwtop`.
 
 <details>
 <summary><strong>Installation, updates, and permissions</strong></summary>
@@ -77,12 +77,12 @@ unchanged executable previously installed by that script; unrelated files,
 symlinks and modified executables are preserved.
 
 Without the helper, Linux only lets you read `/proc/PID/io` of your own
-processes and only scan directories you may read. spctop shows exactly that and
+processes and only scan directories you may read. dwtop shows exactly that and
 says how many processes are hidden; it never fills the gap with estimates.
 
 `scripts/setup-helper.sh [--allow-shared-group] [--allow-owner-change]` builds
 as your regular user and requests administrator authentication through `pkexec`
-(or `sudo`) only to install `/usr/local/libexec/spctop-collector`, owned by
+(or `sudo`) only to install `/usr/local/libexec/dwtop-collector`, owned by
 root, mode `0750`, executable by root and your primary group. **Members of that
 group can see all processes' storage I/O and the names and sizes of the
 directories below the allowed scan roots** (never file names or contents). Its
@@ -101,16 +101,18 @@ file capabilities are only `CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`.
   another user ran setup), setup refuses to move access unless
   `--allow-owner-change` is given.
 - **Scan roots:** the helper scans only directories at or below the absolute
-  paths listed one per line in `/etc/spctop/scan-roots` (`#` comments allowed);
-  when absent, the legacy `/etc/disktop/scan-roots` is used if present.
-  Only when both files are absent is `/home` the default. The file and its directories must be
+  paths listed one per line in `/etc/dwtop/scan-roots` (`#` comments allowed);
+  when absent, `/etc/spctop/scan-roots`, then `/etc/disktop/scan-roots` is used.
+  Only when all three files are absent is `/home` the default. A present but
+  invalid higher-priority policy never falls back to a legacy policy. The file and its directories must be
   root-owned and not writable by group or others, otherwise nothing is scanned
-  with privileges. A policy larger than 64 KiB is rejected in its entirety;
-  its prefix is never interpreted as an allowlist. Below an allowed root the
+  with privileges. Policies must contain valid UTF-8 and at most 64 valid
+  absolute roots. A malformed policy or one larger than 64 KiB is rejected
+  in its entirety; its prefix is never interpreted as an allowlist. Below an allowed root the
   path is opened component by component without following symlinks, so a link such as `/home/alice/x ->
   /root` is refused. For any other path the interface scans without the helper,
   as if it were not installed, and says so. An administrator adds roots with,
-  for example, `echo /srv/home | sudo tee -a /etc/spctop/scan-roots` (create
+  for example, `echo /srv/home | sudo tee -a /etc/dwtop/scan-roots` (create
   the file with `/home` first to keep the default).
 - **hidepid:** if `/proc` is mounted with `hidepid`, the helper keeps that policy
   for other users' processes although `CAP_SYS_PTRACE` bypasses it:
@@ -130,13 +132,13 @@ versioned protocol: no service, port, or arbitrary file/command API. Replies hav
 a deadline; a stalled, crashed, outdated or revoked helper is replaced by direct,
 unprivileged collection at startup or at runtime, with a visible notice.
 
-Repeat the helper setup after updating spctop. A helper from an older release
+Repeat the helper setup after updating dwtop. A helper from an older release
 keeps working: the interface adds what it does not send (fill levels and the
 disks below dm/md devices, which need no privilege) and suggests rerunning the
 setup once. `--no-helper` bypasses an
 installed helper. An administrator revokes access by removing
-`/usr/local/libexec/spctop-collector` and its receipt
-`/usr/local/libexec/.spctop-collector.sha256`. For an upgraded installation,
+`/usr/local/libexec/dwtop-collector` and its receipt
+`/usr/local/libexec/.dwtop-collector.sha256`. For an upgraded installation,
 also retire the legacy helper as described below.
 
 </details>
@@ -144,20 +146,20 @@ also retire the legacy helper as described below.
 ## Use
 
 ```bash
-spctop                          # All disks; focus on the disk of /home.
-spctop --device sda             # Focus a block device (also /dev/sda).
-spctop --device all             # No focus: summary of physical whole disks.
-spctop --view filesystems       # Default space overview; also home or io.
-spctop --view io                # Disk throughput and process I/O.
-spctop --home-path /srv/homes   # Tree for the home view (default /home).
-spctop --interval 0.5 --history 120
-spctop --view io --sort write    # Sort the secondary process I/O table.
-spctop --all-devices            # Also show loop, ram and zram devices.
-spctop --no-color               # Start in monochrome (also NO_COLOR=1).
-spctop --once                   # Print one measured snapshot (all disks) and exit.
-spctop --json                   # Machine-readable snapshot (stable, English).
-spctop --json --scan-home       # Include a complete home scan.
-spctop --demo                   # Clearly labeled synthetic UI preview.
+dwtop                          # All disks; focus on the disk of /home.
+dwtop --device sda             # Focus a block device (also /dev/sda).
+dwtop --device all             # No focus: summary of physical whole disks.
+dwtop --view filesystems       # Default space overview; also home or io.
+dwtop --view io                # Disk throughput and process I/O.
+dwtop --home-path /srv/homes   # Tree for the home view (default /home).
+dwtop --interval 0.5 --history 120
+dwtop --view io --sort write    # Sort the secondary process I/O table.
+dwtop --all-devices            # Also show loop, ram and zram devices.
+dwtop --no-color               # Start in monochrome (also NO_COLOR=1).
+dwtop --once                   # Print one measured snapshot (all disks) and exit.
+dwtop --json                   # Machine-readable snapshot (stable, English).
+dwtop --json --scan-home       # Include a complete home scan.
+dwtop --demo                   # Clearly labeled synthetic UI preview.
 ```
 
 The default refresh interval is **1 second** (`-d`, 0.1–60 s); history defaults
@@ -225,13 +227,13 @@ help, errors, `--once` and `--json` stay English.
 <summary><strong>Settings file and command-line overrides</strong></summary>
 
 Settings are saved atomically with private permissions to
-`$XDG_CONFIG_HOME/spctop/config.json` or `~/.config/spctop/config.json`.
+`$XDG_CONFIG_HOME/dwtop/config.json` or `~/.config/dwtop/config.json`.
 Command-line options and `NO_COLOR` apply to that run only; F12 keeps the saved
 values and adds only what you changed in Setup or with keys. Malformed settings
 produce a warning, defaults are used and the file is preserved; unknown keys are
 kept; settings files from older versions get defaults for newer options. A
 saved device that no longer exists falls back to automatic selection for that
-run. As root, spctop refuses to save into another user's settings
+run. As root, dwtop refuses to save into another user's settings
 directory.
 
 </details>
@@ -344,8 +346,8 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --release --locked
 shellcheck scripts/*.sh
-python3 tests/terminal.py target/release/spctop
-python3 tests/setup.py target/release/spctop
+python3 tests/terminal.py target/release/dwtop
+python3 tests/setup.py target/release/dwtop
 ```
 
 <details>
@@ -355,17 +357,17 @@ These run as root inside a disposable container with a read-only repository
 mount and no network:
 
 ```bash
-docker build -t spctop-test tests
-docker run --rm --network none -v "$PWD:/work:ro" spctop-test \
-  python3 tests/live_io.py --isolated target/release/spctop
+docker build -t dwtop-test tests
+docker run --rm --network none -v "$PWD:/work:ro" dwtop-test \
+  python3 tests/live_io.py --isolated target/release/dwtop
 docker run --rm --network none --cap-add DAC_READ_SEARCH --cap-add SYS_PTRACE \
-  -v "$PWD:/work:ro" spctop-test python3 tests/helper.py --isolated \
-  target/release/spctop target/release/spctop-collector
+  -v "$PWD:/work:ro" dwtop-test python3 tests/helper.py --isolated \
+  target/release/dwtop target/release/dwtop-collector
 ```
 
 `tests/live_io.py` has separate unprivileged writer and reader processes write
 and fsync a file on the container's disk-backed layer and read it back after
-dropping its cached pages; spctop must attribute the bytes to the right PIDs
+dropping its cached pages; dwtop must attribute the bytes to the right PIDs
 and the physical disks must show the writes. `tests/helper.py` checks the
 installer, per-thread capabilities, the cleared helper environment, root
 processes visible only through the helper, a private home directory scanned
@@ -393,10 +395,10 @@ Its terminal images and recording use explicit DEMO mode with synthetic data.
 
 Copyright (C) 2026 itmitalles
 
-spctop is free software: you can redistribute it and/or modify it under the
+dwtop is free software: you can redistribute it and/or modify it under the
 terms of the GNU General Public License as published by the Free Software
 Foundation, either version 3 of the License, or (at your option) any later
-version (SPDX: `GPL-3.0-or-later`). spctop is distributed in the hope that it
+version (SPDX: `GPL-3.0-or-later`). dwtop is distributed in the hope that it
 will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE) for
 the full license text.
@@ -408,20 +410,28 @@ License; see [`site/assets/fonts/`](site/assets/fonts/).
 
 [GPL-3.0-or-later](LICENSE) · Inspired by htop, nvtop and iotop.
 
-### Upgrading from disktop
+### Upgrading from spctop or disktop
 
-Run both installation scripts to install `spctop` and `spctop-collector`.
-Legacy `disktop/config.json` preferences are read when no spctop configuration
-exists; saving writes to `spctop/config.json` and preserves the old file.
-The old process-first view migrates to the Space overview.
+Run both installation scripts to install `dwtop` and `dwtop-collector`.
+Preferences are read from `dwtop/config.json`, then `spctop/config.json`, then
+`disktop/config.json` in your XDG configuration directory. Only a missing file
+allows the next path; malformed or unsafe preferences remain visible and are
+never silently bypassed. Saving writes only `dwtop/config.json` and preserves
+legacy files and unknown fields. An explicit spctop I/O preference stays I/O;
+the old disktop process-first view migrates to the Space overview.
 
-The privileged scanner uses `/etc/spctop/scan-roots`; when absent, an existing
-`/etc/disktop/scan-roots` remains authoritative. Only when both are absent does
-the `/home` default apply. An invalid policy fails closed.
+The privileged scanner checks `/etc/dwtop/scan-roots`, then
+`/etc/spctop/scan-roots`, then `/etc/disktop/scan-roots`. A present legacy file
+remains authoritative until a newer policy exists. Only when all three are
+absent does the `/home` default apply. Invalid, unsafe or oversized policies
+fail closed without falling back to a less restrictive policy.
 
-The installers leave any legacy executable untouched. After validating spctop,
-remove `~/.local/bin/disktop` and `~/.local/bin/.disktop-install.sha256`.
-An administrator can retire `/usr/local/libexec/disktop-collector` and
-`/usr/local/libexec/.disktop-collector.sha256`; removing only the new helper
-does not revoke the old helper's access. Keep old settings until migration
-is verified. The website remains at https://disktop.wutz.io.
+The installers leave legacy executables untouched. After validating dwtop,
+retire `~/.local/bin/spctop` and its `.spctop-install.sha256` receipt; an older
+installation may also have `disktop` and `.disktop-install.sha256` there.
+An administrator can retire `/usr/local/libexec/spctop-collector` and
+`/usr/local/libexec/.spctop-collector.sha256`, plus the corresponding disktop
+files if present. Removing only the new helper does not revoke old helpers'
+access. Verify each installation receipt before removing a legacy executable,
+and keep settings and scan policies until migration is verified.
+The website remains at https://disktop.wutz.io.

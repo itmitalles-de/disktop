@@ -152,7 +152,7 @@ impl MountProber {
                 let owned = path.clone();
                 let started = Instant::now();
                 let spawned = std::thread::Builder::new()
-                    .name("spctop-probe".into())
+                    .name("dwtop-probe".into())
                     .stack_size(256 * 1024)
                     .spawn(move || {
                         let result = probe(&owned);
@@ -226,7 +226,7 @@ pub fn resolve_with_timeout(path: &Path, timeout: Duration) -> Option<PathBuf> {
     let (sender, receiver) = mpsc::channel();
     let owned = path.to_owned();
     std::thread::Builder::new()
-        .name("spctop-resolve".into())
+        .name("dwtop-resolve".into())
         .stack_size(256 * 1024)
         .spawn(move || {
             let _ = sender.send(canonicalize(&owned));
@@ -281,7 +281,7 @@ impl Resolver {
                 let resolve = self.resolve;
                 let owned = path.to_owned();
                 let spawned = std::thread::Builder::new()
-                    .name("spctop-resolve".into())
+                    .name("dwtop-resolve".into())
                     .stack_size(256 * 1024)
                     .spawn(move || {
                         let _ = sender.send(resolve(&owned));
@@ -535,8 +535,8 @@ mod tests {
         }
         let mut real = Resolver::default();
         assert_eq!(
-            real.resolve(Path::new("/nonexistent-spctop/x")),
-            Path::new("/nonexistent-spctop/x")
+            real.resolve(Path::new("/nonexistent-dwtop/x")),
+            Path::new("/nonexistent-dwtop/x")
         );
         assert_eq!(
             resolve_with_timeout(Path::new("/"), Duration::from_secs(2)),

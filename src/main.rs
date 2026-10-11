@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use crossterm::event::{self, Event, KeyEventKind};
-use spctop::{
+use dwtop::{
     collector::{Collector, HomeScan, complete_storage, default_device},
     config::{ConfigFile, RootWithForeignSettings, Settings, SortKey, View},
     demo, diskstats,
@@ -497,7 +497,7 @@ fn spawn_hangup_watchdog(shutdown: &SignalGuard) -> Arc<AtomicBool> {
     let done = Arc::clone(&finished);
     let requested = shutdown.flag();
     let spawned = std::thread::Builder::new()
-        .name("spctop-hangup".into())
+        .name("dwtop-hangup".into())
         .spawn(move || {
             while !done.load(Ordering::Relaxed) {
                 let mut descriptor = libc::pollfd {
@@ -625,7 +625,7 @@ fn sample_once(
     }
 }
 
-/// A reader that exits early, as in `spctop --json | head`, is not an error.
+/// A reader that exits early, as in `dwtop --json | head`, is not an error.
 fn ignore_closed_output(result: io::Result<()>) -> io::Result<()> {
     match result {
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
@@ -777,7 +777,7 @@ fn print_snapshot(out: &mut impl Write, app: &App, snapshot: &Snapshot) -> io::R
     };
     writeln!(
         out,
-        "spctop{}  {title}",
+        "dwtop{}  {title}",
         if snapshot.demo { " DEMO" } else { "" }
     )?;
     if !snapshot.truncated.is_empty() {
@@ -795,8 +795,8 @@ fn print_snapshot(out: &mut impl Write, app: &App, snapshot: &Snapshot) -> io::R
             writeln!(
                 out,
                 "WARNING ZFS pool {}: {}",
-                spctop::text::sanitize(&pool.name),
-                spctop::text::sanitize(error)
+                dwtop::text::sanitize(&pool.name),
+                dwtop::text::sanitize(error)
             )?;
         }
     }
@@ -1020,7 +1020,7 @@ mod tests {
             ..Settings::default()
         };
         let args = Args::parse_from([
-            "spctop",
+            "dwtop",
             "--interval",
             "0.1",
             "--history",
@@ -1076,7 +1076,7 @@ mod tests {
         let mut output = Vec::new();
         print_snapshot(&mut output, &app, &snapshot).unwrap();
         let text = String::from_utf8(output).unwrap();
-        assert!(text.starts_with("spctop DEMO  nvme0n1 (NVMe"), "{text}");
+        assert!(text.starts_with("dwtop DEMO  nvme0n1 (NVMe"), "{text}");
         assert!(text.contains("*/home"), "{text}");
         assert!(
             !text.contains("READ/s") && !text.contains("IOPS") && !text.contains("COMMAND"),
@@ -1099,7 +1099,7 @@ mod tests {
 
     #[test]
     fn once_reports_unavailable_zfs_once_per_pool() {
-        let pool = spctop::model::ZfsPool {
+        let pool = dwtop::model::ZfsPool {
             name: "tank".into(),
             error: Some("ZFS pool discovery pending".into()),
             ..Default::default()
@@ -1107,7 +1107,7 @@ mod tests {
         let snapshot = Snapshot {
             filesystems: ["tank", "tank/home"]
                 .into_iter()
-                .map(|source| spctop::model::Filesystem {
+                .map(|source| dwtop::model::Filesystem {
                     source: source.into(),
                     fs_type: "zfs".into(),
                     zfs: Some(pool.clone()),

@@ -74,7 +74,7 @@ impl Pools {
         self.result = None;
         let (sender, receiver) = mpsc::channel();
         if std::thread::Builder::new()
-            .name("spctop-zfs".into())
+            .name("dwtop-zfs".into())
             .spawn(move || {
                 let _ = sender.send(discover());
             })

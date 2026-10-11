@@ -1,12 +1,12 @@
 [package]
-name = "spctop"
+name = "dwtop"
 version = "0.1.0"
 edition = "2024"
-default-run = "spctop"
+default-run = "dwtop"
 rust-version = "1.88"
 description = "A Linux storage-space monitor with used-space history, directory growth and a separate I/O view"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/itmitalles-de/spctop"
+repository = "https://github.com/itmitalles-de/dwtop"
 
 [dependencies]
 anyhow = "1.0"
@@ -20,12 +20,12 @@ signal-hook = "0.3"
 unicode-width = "0.2"
 
 [[bin]]
-name = "spctop"
+name = "dwtop"
 path = "src/main.rs"
 
 [[bin]]
-name = "spctop-collector"
-path = "src/bin/spctop-collector.rs"
+name = "dwtop-collector"
+path = "src/bin/dwtop-collector.rs"
 
 [profile.release]
 lto = "thin"

@@ -22,11 +22,11 @@ import tempfile
 import termios
 import time
 
-HELPER = Path('/usr/local/libexec/spctop-collector')
-RECEIPT = HELPER.with_name('.spctop-collector.sha256')
-EXPORT = Path('/etc/exports.d/spctop-kernel-test.exports')
-TABLE = 'spctop_kernel_test'
-SECRET = 'spctop-peer-private-command-line'
+HELPER = Path('/usr/local/libexec/dwtop-collector')
+RECEIPT = HELPER.with_name('.dwtop-collector.sha256')
+EXPORT = Path('/etc/exports.d/dwtop-kernel-test.exports')
+TABLE = 'dwtop_kernel_test'
+SECRET = 'dwtop-peer-private-command-line'
 
 
 def run(*args, **kwargs):
@@ -150,11 +150,11 @@ def interactive(binary, account, root, helper, evidence):
 
 
 def nfs(binary, account, evidence):
-    base = Path(tempfile.mkdtemp(prefix='spctop-kernel-', dir='/var/tmp'))
+    base = Path(tempfile.mkdtemp(prefix='dwtop-kernel-', dir='/var/tmp'))
     base.chmod(0o755)
     source = base / 'export'
     source.mkdir()
-    target = Path(tempfile.mkdtemp(prefix='spctop-nfs-', dir='/home'))
+    target = Path(tempfile.mkdtemp(prefix='dwtop-nfs-', dir='/home'))
     target.chmod(0o755)
     (source / 'home').mkdir()
     (source / 'home' / 'payload').write_bytes(b'x' * 4096)
@@ -240,13 +240,14 @@ def main():
         parser.error('requires root, --isolated-vm and a disposable QEMU/KVM VM')
     assert not HELPER.exists() and not RECEIPT.exists(), 'refusing existing helper installation'
     assert not EXPORT.exists(), 'refusing existing export configuration'
-    assert not Path('/etc/spctop/scan-roots').exists(), 'requires default helper scan policy'
+    assert not Path('/etc/dwtop/scan-roots').exists(), 'requires default helper scan policy'
+    assert not Path('/etc/spctop/scan-roots').exists(), 'requires absent intermediate helper scan policy'
     assert not Path('/etc/disktop/scan-roots').exists(), 'requires absent legacy helper scan policy'
     assert os.readlink('/proc/self/ns/mnt') != os.readlink('/proc/1/ns/mnt'), (
         'run with unshare --mount --propagation private')
     if subprocess.run(['nft', 'list', 'table', 'inet', TABLE], capture_output=True).returncode == 0:
         raise AssertionError('refusing existing nft test table')
-    for name in ('spctop-test-owner', 'spctop-test-peer'):
+    for name in ('dwtop-test-owner', 'dwtop-test-peer'):
         try:
             pwd.getpwnam(name)
         except KeyError:
@@ -259,7 +260,7 @@ def main():
         run('cat', '/etc/os-release').stdout + run('mount').stdout)
     created = []
     try:
-        for name in ('spctop-test-owner', 'spctop-test-peer'):
+        for name in ('dwtop-test-owner', 'dwtop-test-peer'):
             run('useradd', '--no-create-home', '--user-group', name)
             created.append(name)
         account, peer = (pwd.getpwnam(name) for name in created)

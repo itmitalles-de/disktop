@@ -339,7 +339,7 @@ impl Settings {
     pub fn validate(&self) -> Result<()> {
         if self.version != VERSION {
             bail!(
-                "unsupported settings version {}; this spctop supports version {VERSION}",
+                "unsupported settings version {}; this dwtop supports version {VERSION}",
                 self.version
             );
         }
@@ -374,15 +374,15 @@ pub struct Loaded {
 }
 
 /// Saving or loading as root in another user's settings directory, typically
-/// after `sudo -E spctop`, would create root-owned files there.
+/// after `sudo -E dwtop`, would create root-owned files there.
 #[derive(Debug)]
 pub struct RootWithForeignSettings;
 
 impl std::fmt::Display for RootWithForeignSettings {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(
-            "spctop runs as root, but the settings directory belongs to another user \
-             (for example after sudo -E); start spctop without sudo to change preferences",
+            "dwtop runs as root, but the settings directory belongs to another user \
+             (for example after sudo -E); start dwtop without sudo to change preferences",
         )
     }
 }
@@ -405,6 +405,7 @@ struct StoredRef<'a> {
 #[derive(Clone, Debug)]
 pub struct ConfigFile {
     path: PathBuf,
+    previous_path: Option<PathBuf>,
     legacy_path: Option<PathBuf>,
 }
 
@@ -423,7 +424,8 @@ impl ConfigFile {
             }
         };
         Ok(Self {
-            path: base.join("spctop/config.json"),
+            path: base.join("dwtop/config.json"),
+            previous_path: Some(base.join("spctop/config.json")),
             legacy_path: Some(base.join("disktop/config.json")),
         })
     }
@@ -431,6 +433,7 @@ impl ConfigFile {
     pub fn at(path: PathBuf) -> Self {
         Self {
             path,
+            previous_path: None,
             legacy_path: None,
         }
     }
@@ -468,20 +471,25 @@ impl ConfigFile {
     }
 
     fn read_legacy(&self) -> Result<Option<Stored>> {
-        let Some(path) = &self.legacy_path else {
-            return Ok(None);
-        };
-        let mut stored = Self::at(path.clone())
-            .read_stored()
-            .with_context(|| format!("cannot read legacy settings {}", path.display()))?;
-        // The old product opened its process strip by default. Start migrated
-        // installations in Space; an explicit new I/O preference is preserved.
-        if let Some(stored) = &mut stored
-            && stored.settings.view == View::Processes
+        for (path, migrate_process_default) in
+            [(&self.previous_path, false), (&self.legacy_path, true)]
         {
-            stored.settings.view = View::Filesystems;
+            let Some(path) = path else {
+                continue;
+            };
+            let Some(mut stored) = Self::at(path.clone())
+                .read_stored()
+                .with_context(|| format!("cannot read legacy settings {}", path.display()))?
+            else {
+                continue;
+            };
+            // Only disktop was process-first. Preserve an explicit spctop I/O choice.
+            if migrate_process_default && stored.settings.view == View::Processes {
+                stored.settings.view = View::Filesystems;
+            }
+            return Ok(Some(stored));
         }
-        Ok(stored)
+        Ok(None)
     }
 
     fn read_stored(&self) -> Result<Option<Stored>> {
@@ -489,6 +497,20 @@ impl ConfigFile {
         let directory = match open_directory(parent) {
             Ok(directory) => directory,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // A dangling directory symlink is not an absent configuration
+                // eligible for legacy fallback. Existing settings directories
+                // are validated below; an absent one need not make its shared
+                // XDG base private before older private settings can be read.
+                for ancestor in parent.ancestors() {
+                    match fs::symlink_metadata(ancestor) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error.into()),
+                        Ok(_) => {
+                            open_directory(ancestor)?;
+                            break;
+                        }
+                    }
+                }
                 return Ok(None);
             }
             Err(error) => return Err(error.into()),
@@ -676,7 +698,7 @@ impl<'a> TemporaryFile<'a> {
     fn create(directory: &'a File) -> Result<(File, Self)> {
         for _ in 0..100 {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let name = CString::new(format!(".spctop-{}-{sequence}.tmp", std::process::id()))?;
+            let name = CString::new(format!(".dwtop-{}-{sequence}.tmp", std::process::id()))?;
             // SAFETY: name is a valid C string; O_EXCL reserves a new owned file.
             let descriptor = unsafe {
                 libc::openat(
@@ -732,7 +754,7 @@ mod tests {
         fn new() -> Self {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = env::temp_dir().join(format!(
-                "spctop-config-test-{}-{sequence}",
+                "dwtop-config-test-{}-{sequence}",
                 std::process::id()
             ));
             DirBuilder::new().mode(0o700).create(&path).unwrap();
@@ -740,7 +762,7 @@ mod tests {
         }
 
         fn config(&self) -> ConfigFile {
-            ConfigFile::at(self.0.join("spctop/config.json"))
+            ConfigFile::at(self.0.join("dwtop/config.json"))
         }
     }
 
@@ -748,6 +770,76 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn rename_chain_preserves_spctop_io_and_prefers_current_settings() {
+        let directory = TestDirectory::new();
+        let previous = ConfigFile::at(directory.0.join("spctop/config.json"));
+        let legacy = ConfigFile::at(directory.0.join("disktop/config.json"));
+        previous
+            .save(&Settings {
+                view: View::Processes,
+                ..Settings::default()
+            })
+            .unwrap();
+        legacy
+            .save(&Settings {
+                view: View::Home,
+                ..Settings::default()
+            })
+            .unwrap();
+        let original = br#"{"view":"io","home_path":"/srv","future_option":true}"#;
+        fs::write(previous.path(), original).unwrap();
+        let config = ConfigFile {
+            path: directory.config().path,
+            previous_path: Some(previous.path.clone()),
+            legacy_path: Some(legacy.path.clone()),
+        };
+        let loaded = config.load_with_unknown_keys().unwrap();
+        assert_eq!(loaded.settings.view, View::Processes);
+        assert_eq!(loaded.settings.home_path, "/srv");
+        assert_eq!(loaded.unknown_keys, ["future_option"]);
+        assert!(!config.path().exists());
+        config.save(&loaded.settings).unwrap();
+        assert_eq!(fs::read(previous.path()).unwrap(), original);
+        assert_eq!(legacy.load().unwrap().view, View::Home);
+        fs::write(previous.path(), "invalid").unwrap();
+        assert_eq!(config.load_with_unknown_keys().unwrap(), loaded);
+        config.save(&loaded.settings).unwrap();
+    }
+
+    #[test]
+    fn invalid_higher_priority_settings_never_fall_back() {
+        let directory = TestDirectory::new();
+        let previous = ConfigFile::at(directory.0.join("spctop/config.json"));
+        let legacy = ConfigFile::at(directory.0.join("disktop/config.json"));
+        previous.save(&Settings::default()).unwrap();
+        legacy.save(&Settings::default()).unwrap();
+        let config = ConfigFile {
+            path: directory.config().path,
+            previous_path: Some(previous.path.clone()),
+            legacy_path: Some(legacy.path.clone()),
+        };
+        fs::write(previous.path(), "invalid").unwrap();
+        assert!(config.load().is_err());
+        assert!(config.save(&Settings::default()).is_err());
+        assert!(!config.path().exists());
+        fs::remove_file(previous.path()).unwrap();
+        fs::remove_dir(previous.path().parent().unwrap()).unwrap();
+        symlink(
+            directory.0.join("missing"),
+            previous.path().parent().unwrap(),
+        )
+        .unwrap();
+        assert!(config.load().is_err());
+        assert!(config.save(&Settings::default()).is_err());
+        fs::remove_file(previous.path().parent().unwrap()).unwrap();
+        assert_eq!(config.load().unwrap(), Settings::default());
+        directory.config().save(&Settings::default()).unwrap();
+        fs::write(config.path(), "invalid").unwrap();
+        assert!(config.load().is_err());
+        assert!(config.save(&Settings::default()).is_err());
     }
 
     #[test]
@@ -759,6 +851,7 @@ mod tests {
         fs::write(legacy.path(), original).unwrap();
         let config = ConfigFile {
             path: directory.config().path,
+            previous_path: None,
             legacy_path: Some(legacy.path.clone()),
         };
         let loaded = config.load_with_unknown_keys().unwrap();
@@ -785,6 +878,7 @@ mod tests {
         legacy.save(&Settings::default()).unwrap();
         let config = ConfigFile {
             path: directory.config().path,
+            previous_path: None,
             legacy_path: Some(legacy.path.clone()),
         };
         fs::write(legacy.path(), "invalid").unwrap();
@@ -981,7 +1075,7 @@ mod tests {
     #[test]
     fn root_refuses_settings_below_another_users_directory() {
         let directory = TestDirectory::new();
-        let nested = directory.0.join("missing/spctop");
+        let nested = directory.0.join("missing/dwtop");
         // Ordinary users are never affected by the root-only refusal.
         assert!(refuse_foreign_directory_as_root(&nested, 1000).is_ok());
         let owner = fs::metadata(&directory.0).unwrap().uid();

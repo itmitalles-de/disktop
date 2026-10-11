@@ -1193,8 +1193,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if area.width < 36 || area.height < 16 {
         frame.render_widget(
             Paragraph::new(app.lang().pick(
-                "spctop\nTerminal too small.\nUse at least 36 x 16.\nq / F10 to quit.",
-                "spctop\nTerminal zu klein.\nMindestens 36 x 16.\nq / F10 beendet.",
+                "dwtop\nTerminal too small.\nUse at least 36 x 16.\nq / F10 to quit.",
+                "dwtop\nTerminal zu klein.\nMindestens 36 x 16.\nq / F10 beendet.",
             ))
             .style(Style::default().fg(if app.settings.color {
                 KEY

@@ -36,7 +36,8 @@ pub const MAX_ROOT_BYTES: usize = 4096;
 pub const MAX_NAME_CHARS: usize = 256;
 /// Root-owned list of the trees the helper may scan, one absolute path per
 /// line; `#` starts a comment. Without the file only /home is allowed.
-pub const SCAN_ROOTS_PATH: &str = "/etc/spctop/scan-roots";
+pub const SCAN_ROOTS_PATH: &str = "/etc/dwtop/scan-roots";
+pub const PREVIOUS_SCAN_ROOTS_PATH: &str = "/etc/spctop/scan-roots";
 pub const LEGACY_SCAN_ROOTS_PATH: &str = "/etc/disktop/scan-roots";
 pub const DEFAULT_SCAN_ROOTS: &[&str] = &["/home"];
 const MAX_SCAN_ROOTS: usize = 64;
@@ -292,12 +293,19 @@ fn trusted_policy_exists(path: &Path) -> std::result::Result<bool, String> {
 }
 
 /// Prefer the current policy; only a safely absent path permits legacy fallback.
-pub fn load_scan_roots_with_legacy(path: &Path, legacy: &Path) -> (RootPolicy, Option<String>) {
-    match trusted_policy_exists(path) {
-        Ok(false) => load_scan_roots(legacy),
-        Ok(true) => load_scan_roots(path),
-        Err(problem) => (RootPolicy::Allowed(Vec::new()), Some(problem)),
+pub fn load_scan_roots_with_legacy(
+    path: &Path,
+    previous: &Path,
+    legacy: &Path,
+) -> (RootPolicy, Option<String>) {
+    for candidate in [path, previous, legacy] {
+        match trusted_policy_exists(candidate) {
+            Ok(false) => continue,
+            Ok(true) => return load_scan_roots_inner(candidate, false),
+            Err(problem) => return (RootPolicy::Allowed(Vec::new()), Some(problem)),
+        }
     }
+    load_scan_roots(legacy)
 }
 
 /// The helper's scan roots from `path`. The file and every directory above it
@@ -305,6 +313,10 @@ pub fn load_scan_roots_with_legacy(path: &Path, legacy: &Path) -> (RootPolicy, O
 /// otherwise nothing may be scanned with privileges. Safely missing file: /home.
 /// The second value describes a problem with the file, for diagnostics.
 pub fn load_scan_roots(path: &Path) -> (RootPolicy, Option<String>) {
+    load_scan_roots_inner(path, true)
+}
+
+fn load_scan_roots_inner(path: &Path, allow_default: bool) -> (RootPolicy, Option<String>) {
     let parse_roots = |entries: Vec<String>| {
         RootPolicy::Allowed(
             entries
@@ -325,6 +337,15 @@ pub fn load_scan_roots(path: &Path) -> (RootPolicy, Option<String>) {
         )
     };
     match trusted_policy_exists(path) {
+        Ok(false) if !allow_default => {
+            return (
+                RootPolicy::Allowed(Vec::new()),
+                Some(format!(
+                    "{} disappeared while loading; no helper scans are allowed",
+                    path.display()
+                )),
+            );
+        }
         Ok(false) => {
             return (
                 parse_roots(
@@ -364,11 +385,24 @@ fn read_scan_roots(path: &Path) -> io::Result<Vec<String>> {
             "scan-roots exceeds 64 KiB; no helper scans are allowed",
         ));
     }
-    Ok(String::from_utf8_lossy(&bytes)
+    let contents = String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "scan-roots must be UTF-8; no helper scans are allowed",
+        )
+    })?;
+    let entries: Vec<String> = contents
         .lines()
         .map(|line| line.split('#').next().unwrap_or("").trim().to_owned())
         .filter(|line| !line.is_empty())
-        .collect())
+        .collect();
+    if entries.len() > MAX_SCAN_ROOTS || entries.iter().any(|entry| validate_root(entry).is_err()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "scan-roots contains invalid paths or too many roots; no helper scans are allowed",
+        ));
+    }
+    Ok(entries)
 }
 
 /// Sanitize a directory name for display and bound its length in
@@ -1066,7 +1100,7 @@ impl HomeService {
         });
         let worker = Arc::clone(&shared);
         std::thread::Builder::new()
-            .name("spctop-scan".into())
+            .name("dwtop-scan".into())
             // Directory recursion is depth-bounded; leave generous room.
             .stack_size(16 * 1024 * 1024)
             .spawn(move || run(worker, limits, prepare))?;
@@ -1288,7 +1322,7 @@ mod tests {
         fn new(label: &str) -> Self {
             static SEQUENCE: AtomicU64 = AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
-                "spctop-scan-{label}-{}-{}",
+                "dwtop-scan-{label}-{}-{}",
                 std::process::id(),
                 SEQUENCE.fetch_add(1, Ordering::Relaxed)
             ));
@@ -1821,7 +1855,7 @@ mod tests {
         }
         assert!(
             scan(
-                Path::new("/nonexistent-spctop"),
+                Path::new("/nonexistent-dwtop"),
                 &Limits::default(),
                 &AtomicBool::new(false),
                 &AtomicU64::new(0)
@@ -1883,7 +1917,7 @@ mod tests {
         // / is trusted even when tests run as an ordinary user. /tmp and the
         // user-owned fixture are deliberately not trusted policy ancestors.
         let missing = PathBuf::from(format!(
-            "/nonexistent-spctop-policy-{}-{}",
+            "/nonexistent-dwtop-policy-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1915,16 +1949,16 @@ mod tests {
     fn policy_migration_never_uses_defaults_below_unsafe_ancestors() {
         let tree = TempTree::new("policy-migration");
         let missing = PathBuf::from(format!(
-            "/nonexistent-spctop-migration-{}-{}",
+            "/nonexistent-dwtop-migration-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let current = missing.join("spctop/scan-roots");
+        let current = missing.join("dwtop/scan-roots");
         let legacy = missing.join("disktop/scan-roots");
-        let (policy, problem) = load_scan_roots_with_legacy(&current, &legacy);
+        let (policy, problem) = load_scan_roots_with_legacy(&current, &legacy, &legacy);
         assert!(problem.is_none());
         assert!(policy.allows(Path::new("/home/alice")));
         assert!(!policy.allows(Path::new("/root")));
@@ -1933,19 +1967,19 @@ mod tests {
         // whether it is the current policy or the legacy fallback.
         let unsafe_missing = tree.0.join("missing/scan-roots");
         for (new, old) in [(&unsafe_missing, &legacy), (&current, &unsafe_missing)] {
-            let (policy, problem) = load_scan_roots_with_legacy(new, old);
+            let (policy, problem) = load_scan_roots_with_legacy(new, old, old);
             assert_eq!(policy, RootPolicy::Allowed(Vec::new()));
             assert!(problem.unwrap().contains("root-owned"));
         }
 
         // /proc/self is a root-owned symlink under trusted /proc. Looking only
         // at the missing leaf would miss it and incorrectly enable /home.
-        let symlink_parent = Path::new("/proc/self/nonexistent-spctop-policy/scan-roots");
+        let symlink_parent = Path::new("/proc/self/nonexistent-dwtop-policy/scan-roots");
         for (new, old) in [
             (symlink_parent, legacy.as_path()),
             (current.as_path(), symlink_parent),
         ] {
-            let (policy, problem) = load_scan_roots_with_legacy(new, old);
+            let (policy, problem) = load_scan_roots_with_legacy(new, old, old);
             assert_eq!(policy, RootPolicy::Allowed(Vec::new()));
             assert!(problem.unwrap().contains("/proc/self"));
         }
@@ -2034,6 +2068,37 @@ mod tests {
             fs::write(&path, accepted).unwrap();
             assert_eq!(read_scan_roots(&path).unwrap(), ["/home"]);
         }
+    }
+
+    #[test]
+    fn malformed_policy_rejects_the_entire_allowlist() {
+        let tree = TempTree::new("invalid-policy");
+        let path = tree.0.join("scan-roots");
+        for contents in [
+            b"/home\nrelative\n".to_vec(),
+            b"/home\n/srv/../etc\n".to_vec(),
+            b"/home\n\xff\n".to_vec(),
+            "/home\n".repeat(MAX_SCAN_ROOTS + 1).into_bytes(),
+        ] {
+            fs::write(&path, contents).unwrap();
+            assert_eq!(
+                read_scan_roots(&path).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        fs::write(&path, "# no privileged roots\n").unwrap();
+        assert!(read_scan_roots(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn disappearing_selected_policy_never_enables_defaults() {
+        let path = PathBuf::from(format!(
+            "/dwtop-policy-missing-{}/scan-roots",
+            std::process::id()
+        ));
+        let (policy, error) = load_scan_roots_inner(&path, false);
+        assert!(!policy.allows(Path::new("/home")));
+        assert!(error.unwrap().contains("disappeared"));
     }
 
     #[test]
@@ -2257,7 +2322,7 @@ mod tests {
             "new root resets growth"
         );
         service.configure(
-            PathBuf::from("/nonexistent-spctop"),
+            PathBuf::from("/nonexistent-dwtop"),
             Duration::from_secs(3600),
         );
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -2273,7 +2338,7 @@ mod tests {
                 .status()
                 .error
                 .unwrap()
-                .contains("nonexistent-spctop")
+                .contains("nonexistent-dwtop")
         );
     }
 }

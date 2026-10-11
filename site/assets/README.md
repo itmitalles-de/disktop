@@ -1,7 +1,7 @@
 # Public site assets
 
-`disktop-demo.png` and `disktop-filesystems.png` show the default spctop Space
-view. `disktop-home.png` shows directory sizes and growth; `spctop-io.png` shows
+`disktop-demo.png` and `disktop-filesystems.png` show the default dwtop Space
+view. `disktop-home.png` shows directory sizes and growth; `dwtop-io.png` shows
 the secondary I/O view. `disktop-demo.mp4` demonstrates Space, Home (including
 navigation into a directory), the view menu, I/O, return to Space, and F2 Setup.
 The existing asset filenames retain the former project name for compatibility.
@@ -10,7 +10,7 @@ All terminal media show the real release binary in explicit `--demo` mode at
 120 × 36 after the 60-second history has filled. Disks, rates, fill levels,
 processes and directories are synthetic. These are deliberate public product
 assets, not live captures or desktop screenshots. Media was refreshed for the
-space-first spctop interface in [issue #9](https://github.com/itmitalles-de/spctop/issues/9).
+dwtop rename in [issue #18](https://github.com/itmitalles-de/dwtop/issues/18).
 
 They were made by running the release binary in a pseudo-terminal with an empty
 config directory and `LANG=en_US.UTF-8`, rendering the pyte screen buffer with

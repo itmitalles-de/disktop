@@ -14,8 +14,8 @@ fi
 : "${HOME:?HOME must be set}"
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 install_dir="$HOME/.local/bin"
-destination="$install_dir/spctop"
-receipt="$install_dir/.spctop-install.sha256"
+destination="$install_dir/dwtop"
+receipt="$install_dir/.dwtop-install.sha256"
 staged_binary=''
 staged_receipt=''
 
@@ -61,9 +61,9 @@ check_destination() {
 check_destination
 cargo build --release --locked --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target"
 mkdir -p -- "$install_dir"
-staged_binary="$(mktemp "$install_dir/.spctop-binary.XXXXXX")"
-staged_receipt="$(mktemp "$install_dir/.spctop-receipt.XXXXXX")"
-install -m 755 -- "$repo_dir/target/release/spctop" "$staged_binary"
+staged_binary="$(mktemp "$install_dir/.dwtop-binary.XXXXXX")"
+staged_receipt="$(mktemp "$install_dir/.dwtop-receipt.XXXXXX")"
+install -m 755 -- "$repo_dir/target/release/dwtop" "$staged_binary"
 read -r installed_digest _ < <(sha256sum -- "$staged_binary")
 printf '%s\n' "$installed_digest" > "$staged_receipt"
 chmod 600 -- "$staged_receipt"
