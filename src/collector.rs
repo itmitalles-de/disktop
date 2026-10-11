@@ -102,6 +102,7 @@ impl Collector {
         let (policy, problem) = if helper {
             scanner::load_scan_roots_with_legacy(
                 Path::new(scanner::SCAN_ROOTS_PATH),
+                Path::new(scanner::PREVIOUS_SCAN_ROOTS_PATH),
                 Path::new(scanner::LEGACY_SCAN_ROOTS_PATH),
             )
         } else {
@@ -943,7 +944,7 @@ mod tests {
 
     #[test]
     fn long_pseudo_files_are_cut_at_a_complete_line() {
-        let path = std::env::temp_dir().join(format!("spctop-pseudo-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("dwtop-pseudo-{}", std::process::id()));
         let line = "8 0 sda 1 2 3 4 5 6 7 8 9 10 11\n";
         let count = MAX_PSEUDO_FILE / line.len() + 10;
         fs::write(&path, line.repeat(count)).unwrap();
@@ -959,8 +960,7 @@ mod tests {
 
     #[test]
     fn older_helper_capacity_follows_partitions_of_every_holder() {
-        let root =
-            std::env::temp_dir().join(format!("spctop-helper-stacks-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("dwtop-helper-stacks-{}", std::process::id()));
         let block = root.join("class/block");
         for name in [
             "sda", "sda1", "sdb", "sdb1", "md0", "md0p1", "dm-0", "dm-0p1",
@@ -1051,7 +1051,7 @@ mod tests {
 
     #[test]
     fn requested_scan_delivers_a_tree_once_per_generation() {
-        let root = std::env::temp_dir().join(format!("spctop-collector-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("dwtop-collector-{}", std::process::id()));
         fs::create_dir_all(root.join("a")).unwrap();
         fs::write(root.join("a/file"), vec![1u8; 8192]).unwrap();
         let mut collector = Collector::new(false).unwrap();

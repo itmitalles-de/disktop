@@ -18,7 +18,7 @@ use crate::{
     scanner,
 };
 
-pub const HELPER_PATH: &str = "/usr/local/libexec/spctop-collector";
+pub const HELPER_PATH: &str = "/usr/local/libexec/dwtop-collector";
 pub const PROTOCOL_VERSION: u32 = 1;
 /// A request carries at most a 4 KiB home path plus small fields.
 pub const MAX_REQUEST: usize = 8 * 1024;
@@ -47,7 +47,7 @@ impl std::fmt::Display for HelperError {
             Self::Interrupted => "helper interrupted",
             Self::ResponseTooLarge => "helper response exceeds limit",
             Self::ProtocolMismatch => {
-                "helper protocol mismatch; rerun scripts/setup-helper.sh after updating spctop"
+                "helper protocol mismatch; rerun scripts/setup-helper.sh after updating dwtop"
             }
         })
     }

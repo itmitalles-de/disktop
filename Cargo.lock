@@ -265,7 +265,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "spctop"
+name = "dwtop"
 version = "0.1.0"
 dependencies = [
  "anyhow",

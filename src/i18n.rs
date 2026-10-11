@@ -97,8 +97,8 @@ impl Lang {
 
     pub fn root_with_foreign_settings(self) -> String {
         self.pick(
-            "Save refused: spctop runs as root with another user's settings; start without sudo",
-            "Nicht gespeichert: spctop läuft als root mit fremden Einstellungen; ohne sudo starten",
+            "Save refused: dwtop runs as root with another user's settings; start without sudo",
+            "Nicht gespeichert: dwtop läuft als root mit fremden Einstellungen; ohne sudo starten",
         )
         .into()
     }
@@ -112,10 +112,10 @@ impl Lang {
 
     pub fn helper_outdated(self) -> String {
         match self {
-            Self::En => "Helper is older than this spctop; fill levels are added without it. \
+            Self::En => "Helper is older than this dwtop; fill levels are added without it. \
                          Rerun scripts/setup-helper.sh to update it"
                 .into(),
-            Self::De => "Helper ist älter als dieses spctop; Füllstände werden ohne ihn ergänzt. \
+            Self::De => "Helper ist älter als dieses dwtop; Füllstände werden ohne ihn ergänzt. \
                          scripts/setup-helper.sh erneut ausführen, um ihn zu aktualisieren"
                 .into(),
         }

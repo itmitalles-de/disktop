@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise Setup and persisted preferences through the real terminal UI.
 
-Run without root: python3 tests/setup.py target/release/spctop
+Run without root: python3 tests/setup.py target/release/dwtop
 Every process uses a temporary XDG directory and its own pseudo-terminal.
 """
 
@@ -178,7 +178,7 @@ DEFAULTS = {
 
 
 def persistence_and_overrides(binary, config_home):
-    path = config_home / "spctop/config.json"
+    path = config_home / "dwtop/config.json"
     with Terminal(binary, config_home) as terminal:
         assert not path.exists(), "opening the monitor unexpectedly wrote settings"
         assert b"Settings:" not in terminal.output, "missing settings should silently use defaults"
@@ -219,7 +219,7 @@ def persistence_and_overrides(binary, config_home):
         terminal.expect(b"Saved ")
         mark = terminal.send(F10)
         terminal.expect(b"MOUNT", mark)
-        assert terminal.child.poll() is None, "F10 in Setup unexpectedly quit spctop"
+        assert terminal.child.poll() is None, "F10 in Setup unexpectedly quit dwtop"
         terminal.quit()
 
     before = path.read_bytes()
@@ -242,17 +242,17 @@ def persistence_and_overrides(binary, config_home):
     assert not stderr, f"unexpected warning with CLI overrides: {stderr}"
     assert json.loads(stdout)["home"]["root"] == "/srv", "--home-path did not override"
     stdout, _ = run_once(binary, config_home, "--interval", "0.1", "--device", "/dev/nvme0n1")
-    assert stdout.startswith("spctop DEMO  nvme0n1"), "--device did not override the saved choice"
+    assert stdout.startswith("dwtop DEMO  nvme0n1"), "--device did not override the saved choice"
     assert path.read_bytes() == before, "temporary CLI overrides overwrote saved preferences"
     print("PASS Setup: F2 edits incl. home path, F12 persistence, F10 returns, restart and CLI overrides")
 
 
 def overrides_not_persisted(binary, config_home):
-    path = config_home / "spctop/config.json"
+    path = config_home / "dwtop/config.json"
     path.parent.mkdir(mode=0o700, parents=True)
     original = {
         "version": 1,
-        "device": "spctop-gone",
+        "device": "dwtop-gone",
         "interval_ms": 1000,
         "history_seconds": 120,
         "color": True,
@@ -264,7 +264,7 @@ def overrides_not_persisted(binary, config_home):
                  "--sort", "write", "--home-path", "/srv")
     with Terminal(binary, config_home, arguments, NO_COLOR="1") as terminal:
         terminal.expect(b"unknown keys")
-        terminal.expect(b"Saved device spctop-gone unavailable")
+        terminal.expect(b"Saved device dwtop-gone unavailable")
         # Saving without changes keeps every file value, despite CLI overrides,
         # NO_COLOR and the automatic fallback for the missing device.
         before = path.read_bytes()
@@ -289,7 +289,7 @@ def overrides_not_persisted(binary, config_home):
 
 
 def german_interface(binary, config_home):
-    path = config_home / "spctop/config.json"
+    path = config_home / "dwtop/config.json"
     with Terminal(binary, config_home, ready="Fokus".encode(), LC_ALL=None, LANG="de_DE.UTF-8") as terminal:
         terminal.expect("Hilfe".encode())
         terminal.expect("Speichern".encode())
@@ -319,7 +319,7 @@ def german_interface(binary, config_home):
 
 def disk_overview(binary, config_home):
     """All disks are visible at once; the new overview options persist."""
-    path = config_home / "spctop/config.json"
+    path = config_home / "dwtop/config.json"
     with Terminal(binary, config_home) as terminal:
         # Unchanged (blank) cells are not redrawn, so look for space-free text.
         for text in (b"Disks", b"nvme0n1", b"nvme1n1", b"sda", b"sdb", b"mounted]", b"100%",
@@ -397,7 +397,7 @@ def views_and_home(binary, config_home):
 
 
 def malformed_settings(binary, config_home):
-    path = config_home / "spctop/config.json"
+    path = config_home / "dwtop/config.json"
     path.parent.mkdir(mode=0o700, parents=True)
     original = b'{"show_idle": true, this is deliberately incomplete\n'
     path.write_bytes(original)
@@ -422,18 +422,18 @@ def malformed_settings(binary, config_home):
 
 
 def vanished_device(binary, config_home):
-    path = config_home / "spctop/config.json"
+    path = config_home / "dwtop/config.json"
     path.parent.mkdir(mode=0o700, parents=True)
-    path.write_text(json.dumps({"version": 1, "device": "spctop-gone"}))
+    path.write_text(json.dumps({"version": 1, "device": "dwtop-gone"}))
     path.chmod(0o600)
     original = path.read_bytes()
     stdout, stderr = run_once(binary, config_home, "--interval", "0.1")
-    assert "Saved device spctop-gone unavailable" in stderr, "missing device had no warning"
+    assert "Saved device dwtop-gone unavailable" in stderr, "missing device had no warning"
     assert "automatic selection" in stderr, "device warning did not explain the fallback"
     assert "nvme0n1" in stdout.splitlines()[0], "missing device did not use the demo default"
     assert path.read_bytes() == original, "automatic fallback overwrote the saved device"
     result = subprocess.run(
-        [str(binary), "--demo", "--once", "--device", "spctop-gone"],
+        [str(binary), "--demo", "--once", "--device", "dwtop-gone"],
         env=environment(config_home), capture_output=True, text=True, timeout=3, check=False,
     )
     assert result.returncode != 0 and "does not exist" in result.stderr, result
@@ -442,7 +442,7 @@ def vanished_device(binary, config_home):
 
 def legacy_preferences(binary, config_home):
     legacy = config_home / "disktop/config.json"
-    current = config_home / "spctop/config.json"
+    current = config_home / "dwtop/config.json"
     legacy.parent.mkdir(mode=0o700, parents=True)
     original = json.dumps({"view": "processes", "home_path": "/srv", "future_option": True})
     legacy.write_text(original)
@@ -467,11 +467,53 @@ def legacy_preferences(binary, config_home):
     print("PASS migration: legacy processes opens Space; F12 preserves values; explicit new I/O wins")
 
 
+def spctop_preferences(binary, config_home):
+    previous = config_home / "spctop/config.json"
+    oldest = config_home / "disktop/config.json"
+    current = config_home / "dwtop/config.json"
+    for path in (previous, oldest):
+        path.parent.mkdir(mode=0o700, parents=True)
+    original = json.dumps({"view": "io", "home_path": "/srv", "future_option": {"keep": True}})
+    previous.write_text(original)
+    previous.chmod(0o600)
+    oldest.write_text(json.dumps({"view": "processes", "home_path": "/oldest"}))
+    oldest.chmod(0o600)
+    stdout, _ = run_once(binary, config_home, "--interval", "0.1")
+    assert "READ/s" in stdout, "spctop I/O choice was migrated to Space or shadowed by disktop"
+    assert not current.exists(), "loading wrote dwtop preferences"
+    previous.write_text("invalid")
+    stdout, stderr = run_once(binary, config_home, "--interval", "0.1")
+    assert "cannot load" in stderr and "spctop/config.json" in stderr, stderr
+    with Terminal(binary, config_home) as terminal:
+        mark = terminal.send(F2)
+        terminal.expect(b"Options", mark)
+        mark = terminal.send(F12)
+        terminal.expect(b"Save failed:", mark)
+        assert not current.exists(), "invalid intermediate preferences were silently migrated"
+        terminal.send(F10)
+        terminal.quit()
+    previous.write_text(original)
+    with Terminal(binary, config_home) as terminal:
+        terminal.expect(b"COMMAND")
+        terminal.send(F12)
+        terminal.wait_for(lambda: read_saved(current) is not None, "F12 migrated spctop")
+        saved = read_saved(current)
+        assert saved["view"] == "io" and saved["home_path"] == "/srv", saved
+        assert saved["future_option"] == {"keep": True}, saved
+        terminal.quit()
+    assert previous.read_text() == original
+    assert json.loads(oldest.read_text())["home_path"] == "/oldest"
+    previous.write_text("invalid")
+    stdout, stderr = run_once(binary, config_home, "--interval", "0.1")
+    assert "READ/s" in stdout and "cannot load" not in stderr, stderr
+    print("PASS rename chain: dwtop > spctop > disktop; I/O and unknown keys preserved; invalid higher file blocks migration")
+
+
 def main():
     if len(sys.argv) != 2:
-        raise SystemExit("Usage: python3 tests/setup.py /path/to/spctop")
+        raise SystemExit("Usage: python3 tests/setup.py /path/to/dwtop")
     binary = Path(sys.argv[1]).resolve(strict=True)
-    with tempfile.TemporaryDirectory(prefix="spctop-setup-test-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="dwtop-setup-test-") as temporary:
         root = Path(temporary)
         persistence_and_overrides(binary, root / "preferences")
         overrides_not_persisted(binary, root / "overrides")
@@ -479,6 +521,7 @@ def main():
         disk_overview(binary, root / "overview")
         views_and_home(binary, root / "views")
         legacy_preferences(binary, root / "legacy")
+        spctop_preferences(binary, root / "previous")
         malformed_settings(binary, root / "malformed")
         vanished_device(binary, root / "vanished")
     print("All Setup and configuration integration checks passed.")

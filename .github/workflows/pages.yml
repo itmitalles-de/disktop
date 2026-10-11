@@ -74,11 +74,11 @@ jobs:
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 180 \
             --connect-timeout 10 --max-time 25 \
-            https://disktop.wutz.io/ -o "$RUNNER_TEMP/spctop-index.html"
+            https://disktop.wutz.io/ -o "$RUNNER_TEMP/dwtop-index.html"
           python3 - <<'PY'
           import os
           from pathlib import Path
-          html = (Path(os.environ["RUNNER_TEMP"]) / "spctop-index.html").read_text()
-          assert '<title>spctop — your space, in view</title>' in html
+          html = (Path(os.environ["RUNNER_TEMP"]) / "dwtop-index.html").read_text()
+          assert '<title>dwtop — your space, in view</title>' in html
           assert 'assets/disktop-demo.mp4' in html
           PY
