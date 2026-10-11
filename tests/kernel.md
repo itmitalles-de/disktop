@@ -1,6 +1,7 @@
 # Real kernel integration checks
 
 `kernel.py` covers [issue #7](https://github.com/itmitalles-de/dwtop/issues/7)
+and [issue #23](https://github.com/itmitalles-de/dwtop/issues/23)
 in a **fresh disposable QEMU/KVM VM**. It must never run on the workstation,
 on a production guest, or in a container sharing the workstation's kernel.
 It requires explicit `--isolated-vm`, root, a private mount namespace and
@@ -57,6 +58,10 @@ helper scan-root configuration, export configuration and its nftables table.
   complete visibility or inventing a count. The helper redacts other users'
   command lines in mode 1 and omits their rows in mode 2. A unique synthetic
   command-line marker must not leak into the snapshots.
+- One persistent helper PID survives `hidepid=0 -> 1 -> 2`, primary and
+  supplementary `gid=` exemptions, exemption removal and return to mode zero.
+  Cached private commands must disappear immediately under tighter policy and
+  become readable again when relaxed.
 - Primary and supplementary `gid=` exemptions lift hidepid for the helper.
   The direct kernel cmdline read also succeeds; direct `/proc/PID/io` remains
   subject to its separate ptrace access check, so other-user I/O rows are
@@ -75,15 +80,16 @@ helper scan-root configuration, export configuration and its nftables table.
   file access. Fresh direct/helper home scans must complete; the helper scan
   must report privileged execution, proving it did not silently fall back.
 
-## Verified environment (2026-10-10)
+## Verified environment (2026-10-11)
 
 Ubuntu 24.04 cloud image SHA-256
 `6a81c37564db9b1ee84e141922625e1d7c5b389b99bb3c572e0243607d5bb4d2`,
 guest kernel `6.8.0-142-generic`, 2 vCPUs, 3 GiB RAM, KVM, local ext4 root.
-Both hidepid modes and both gid exemption forms passed. During the hard NFS
-outage, snapshots took approximately 1.51 seconds with direct and helper
-collection; local writes remained visible and both PTYs responded. After
-restoration, home scans completed in approximately 0.36–0.38 seconds. These
+Both hidepid modes, both gid exemption forms and the persistent-helper
+transitions passed. During the hard NFS outage, snapshots took approximately
+1.31 seconds with direct and helper collection; local writes remained visible
+and both PTYs responded. After
+restoration, home scans completed in approximately 0.36 seconds. These
 are observations from this VM, not universal latency guarantees. This does
 not cover every NFS protocol/version, storage failure or procfs policy;
 `hidepid=4` remains parser coverage only.

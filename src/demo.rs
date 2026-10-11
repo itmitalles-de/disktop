@@ -283,6 +283,7 @@ pub fn snapshot(tick: u64, elapsed: f64, home_root: &str, known_generation: u64)
             privileged: true,
             readable: 7,
             unreadable: 0,
+            omitted: 0,
             message: "DEMO data".into(),
         },
         filesystems,

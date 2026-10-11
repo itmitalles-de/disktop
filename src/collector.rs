@@ -254,6 +254,7 @@ impl Collector {
             }
         }
         let mut holders = HashMap::new();
+        let mut slaves = HashMap::new();
         let mut devices = Vec::with_capacity(lines.len());
         let mut members = Vec::with_capacity(lines.len());
         let mut current = HashMap::with_capacity(lines.len());
@@ -276,7 +277,7 @@ impl Collector {
             members.push(descendants);
             let backing_disks = if info.kind.is_stacked() {
                 self.sysfs
-                    .backing_disks(&line.name, infos)
+                    .backing_disks_cached(&line.name, infos, &mut slaves)
                     .into_iter()
                     .map(|name| sanitize(&name))
                     .collect()
@@ -356,6 +357,13 @@ impl Collector {
         }
         apply_usage(&mut devices, &members, &filesystems);
         let (processes, process_access) = self.processes.sample(self.privileged);
+        if process_access.omitted > 0
+            || process_access
+                .message
+                .contains("process count limit reached")
+        {
+            truncated.insert("/proc process data".to_owned());
+        }
         let (home, home_tree) = self.home.sample(request);
         Ok(Snapshot {
             version: JSON_VERSION,
@@ -534,7 +542,7 @@ fn filesystems(
     for (group, outcome) in groups.iter().zip(outcomes) {
         let (usage, not_responding) = match outcome {
             // Docker and others bind individual files such as /etc/hosts.
-            Outcome::Done(probe) if !probe.is_dir => continue,
+            Outcome::Done(probe) if probe.is_dir == Some(false) => continue,
             Outcome::Done(probe) => (probe.usage, false),
             Outcome::NotResponding => (None, true),
         };
@@ -637,9 +645,11 @@ pub fn complete_storage(sysfs: &Sysfs, snapshot: &mut Snapshot) -> bool {
                 )
             })
             .collect();
+        let mut slaves = HashMap::new();
         for device in &mut snapshot.devices {
             if device.kind.is_stacked() && device.backing_disks.is_empty() {
-                device.backing_disks = sysfs.backing_disks(&device.name, &infos);
+                device.backing_disks =
+                    sysfs.backing_disks_cached(&device.name, &infos, &mut slaves);
             }
         }
     }
@@ -800,7 +810,7 @@ mod tests {
         }
         let is_dir = path != Path::new("/etc/hosts");
         probe::Probe {
-            is_dir,
+            is_dir: Some(is_dir),
             usage: is_dir.then_some(mounts::Usage {
                 total: 100,
                 used: 40,
@@ -1077,5 +1087,35 @@ mod tests {
         assert!(again.home_tree.is_none(), "known trees are not resent");
         assert_eq!(again.home.unwrap().generation, 1);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn inaccessible_mounts_remain_visible_without_helper_measurements() {
+        fn unavailable(path: &Path) -> probe::Probe {
+            probe::Probe {
+                is_dir: (path == Path::new("/file")).then_some(false),
+                usage: None,
+            }
+        }
+        let list = mounts::parse(
+            b"1 0 8:1 / /inaccessible rw - ext4 /dev/sda1 rw\n\
+2 0 8:2 / /file rw - ext4 /dev/sda2 rw\n",
+        );
+        let mut prober = MountProber::new(unavailable, Duration::from_millis(100));
+        let rows = filesystems(
+            &list,
+            &[],
+            Some(Path::new("/inaccessible/user")),
+            &|mount| Some(format!("sda{}", mount.minor)),
+            &|_| Vec::new(),
+            &mut prober,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mount_point, "/inaccessible");
+        assert!(rows[0].contains_home);
+        assert!(!rows[0].not_responding);
+        assert!(rows[0].accounting_usage().is_none());
+        let usage = DeviceUsage::from_filesystems(&rows, &BTreeSet::from(["sda1".into()]), false);
+        assert_eq!((usage.filesystems, usage.unmeasured), (0, 1));
     }
 }

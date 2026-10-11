@@ -34,6 +34,9 @@ use crate::{
 
 const MAX_PROC_READ: u64 = 4096;
 const MAX_PROCESSES: usize = 100_000;
+/// Reserve room for capacity data and a simultaneous Home tree; the helper
+/// applies the final exact combined frame budget before writing.
+const MAX_PROCESS_JSON_BYTES: usize = crate::helper::MAX_RESPONSE / 2;
 const MAX_USERS: usize = 4096;
 /// Processes with more threads fall back to the process total for rates.
 const MAX_THREADS: usize = 10_000;
@@ -163,6 +166,8 @@ pub fn hidepid_from_options(options: &str, in_group: impl Fn(u32) -> bool) -> Hi
         match option.split_once('=') {
             Some(("hidepid", "1" | "noaccess")) => mode = Hidepid::NoAccess,
             Some(("hidepid", "2" | "invisible" | "4" | "ptraceable")) => mode = Hidepid::Invisible,
+            Some(("hidepid", "0" | "off")) => mode = Hidepid::Off,
+            Some(("hidepid", _)) => mode = Hidepid::Invisible,
             Some(("gid", gid)) if gid.parse().is_ok_and(&in_group) => return Hidepid::Off,
             _ => {}
         }
@@ -183,13 +188,20 @@ fn caller_in_group(gid: u32) -> bool {
 }
 
 fn proc_hidepid(proc_root: &Path) -> Hidepid {
-    let Ok(bytes) = crate::collector::read_pseudo("/proc/self/mountinfo") else {
-        return Hidepid::Off;
+    let path = proc_root.join("self/mountinfo");
+    let Some(path) = path.to_str() else {
+        return Hidepid::Invisible;
     };
-    crate::mounts::visible(&crate::mounts::parse(&bytes))
+    let Ok(file) = crate::collector::read_pseudo_file(path) else {
+        return Hidepid::Invisible;
+    };
+    if file.truncated {
+        return Hidepid::Invisible;
+    }
+    crate::mounts::visible(&crate::mounts::parse(&file.bytes))
         .into_iter()
         .rfind(|mount| mount.fs_type == "proc" && mount.mount_point == proc_root)
-        .map_or(Hidepid::Off, |mount| {
+        .map_or(Hidepid::Invisible, |mount| {
             hidepid_from_options(&mount.super_options, caller_in_group)
         })
 }
@@ -201,6 +213,8 @@ pub struct ProcessTable {
     clock_ticks: f64,
     users: Option<UserCache>,
     hidepid: Hidepid,
+    /// Root itself is exempt only in the direct reader, not in the helper.
+    enforce_hidepid: bool,
     /// The real uid whose processes hidepid never hides.
     own_uid: u32,
 }
@@ -229,6 +243,7 @@ impl ProcessTable {
             clock_ticks: if ticks > 0 { ticks as f64 } else { 100.0 },
             users: resolve_users.then(UserCache::default),
             hidepid,
+            enforce_hidepid: own_uid != 0,
             own_uid,
         }
     }
@@ -238,6 +253,7 @@ impl ProcessTable {
     pub fn for_helper(proc_root: impl Into<PathBuf>) -> Self {
         let mut table = Self::new(proc_root, false);
         table.hidepid = proc_hidepid(&table.proc_root);
+        table.enforce_hidepid = true;
         table
     }
 
@@ -309,6 +325,20 @@ impl ProcessTable {
     }
 
     pub fn sample(&mut self, privileged: bool) -> (Vec<ProcessRow>, ProcessAccess) {
+        // CAP_SYS_PTRACE bypasses kernel hidepid. Recheck every sample so
+        // procfs remounts and gid exemptions take effect in a running helper.
+        // Failure to read the current policy must never reveal foreign rows.
+        let policy = if self.enforce_hidepid {
+            proc_hidepid(&self.proc_root)
+        } else {
+            Hidepid::Off
+        };
+        if policy != self.hidepid {
+            // Commands redacted under hidepid=1 must be reread when relaxed;
+            // commands cached before a restriction must not survive it.
+            self.previous.clear();
+            self.hidepid = policy;
+        }
         let now = Instant::now();
         let boot_now = boot_seconds();
         let seconds = self
@@ -320,6 +350,9 @@ impl ProcessTable {
         let mut current = HashMap::new();
         let mut unreadable = 0usize;
         let mut hidden_by_hidepid = 0usize;
+        let mut omitted = 0usize;
+        let mut serialized_bytes = 0usize;
+        let mut limit_reached = false;
         let entries = match fs::read_dir(&self.proc_root) {
             Ok(entries) => entries,
             Err(error) => {
@@ -334,9 +367,6 @@ impl ProcessTable {
             }
         };
         for entry in entries.filter_map(Result::ok) {
-            if rows.len() + unreadable >= MAX_PROCESSES {
-                break;
-            }
             let Some(pid) = entry
                 .file_name()
                 .to_str()
@@ -345,6 +375,10 @@ impl ProcessTable {
             else {
                 continue;
             };
+            if rows.len() + unreadable + hidden_by_hidepid + omitted >= MAX_PROCESSES {
+                limit_reached = true;
+                break;
+            }
             let directory = entry.path();
             let stat = match read_bytes_result(&directory.join("stat")) {
                 Ok(stat) => stat,
@@ -422,7 +456,7 @@ impl ProcessTable {
                 _ => None,
             };
             let rate = |value: u64| seconds.map(|seconds| value as f64 / seconds);
-            rows.push(ProcessRow {
+            let row = ProcessRow {
                 pid,
                 uid,
                 user: self
@@ -437,7 +471,15 @@ impl ProcessTable {
                 read_bytes: counters.read_bytes,
                 write_bytes: counters.write_bytes,
                 cancelled_write_bytes: counters.cancelled_write_bytes,
-            });
+            };
+            let bytes =
+                serde_json::to_vec(&row).map_or(usize::MAX, |bytes| bytes.len().saturating_add(1));
+            if serialized_bytes.saturating_add(bytes) > MAX_PROCESS_JSON_BYTES {
+                omitted = omitted.saturating_add(1);
+                continue;
+            }
+            serialized_bytes += bytes;
+            rows.push(row);
             current.insert(
                 pid,
                 Entry {
@@ -452,9 +494,11 @@ impl ProcessTable {
         // Exited processes are dropped, so memory follows the live process set.
         self.previous = current;
         self.last = Some((now, boot_now));
-        let readable = rows.len();
+        // The visibility count includes readable rows omitted only because
+        // their serialized data exceeded the display/transport budget.
+        let readable = rows.len().saturating_add(omitted);
         let unreadable = unreadable + hidden_by_hidepid;
-        let message = if hidden_by_hidepid > 0 {
+        let mut message = if hidden_by_hidepid > 0 {
             format!("{hidden_by_hidepid} processes of other users hidden by /proc hidepid")
         } else if self.hidepid == Hidepid::Invisible && !privileged {
             "Other users' processes hidden by /proc hidepid; total hidden count unavailable"
@@ -475,12 +519,23 @@ impl ProcessTable {
         } else {
             "All visible processes readable".to_owned()
         };
+        if limit_reached {
+            message.push_str(
+                "; process data truncated: process count limit reached; later PIDs not sampled",
+            );
+        }
+        if omitted > 0 {
+            message.push_str(&format!(
+                "; process data truncated: at least {omitted} rows omitted by collection budget"
+            ));
+        }
         (
             rows,
             ProcessAccess {
                 privileged,
                 readable,
                 unreadable,
+                omitted,
                 message,
             },
         )
@@ -707,6 +762,96 @@ mod tests {
         assert_eq!(table.thread_change(&before, 10.0, &reused).read_bytes, 40);
         let stat = b"1234 (a) S 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 7 0 98765 1000 10";
         assert_eq!(parse_num_threads(stat), Some(7));
+    }
+
+    #[test]
+    fn running_helper_refreshes_hidepid_and_commands_and_fails_closed() {
+        let root =
+            std::env::temp_dir().join(format!("dwtop-hidepid-refresh-{}", std::process::id()));
+        fs::create_dir_all(root.join("self")).unwrap();
+        fs::create_dir_all(root.join("42")).unwrap();
+        let metadata = root.join("self/mountinfo");
+        let policy = |options: &str| {
+            fs::write(
+                &metadata,
+                format!("1 0 0:5 / {} rw - proc proc rw,{options}\n", root.display()),
+            )
+            .unwrap();
+        };
+        fs::write(
+            root.join("42/stat"),
+            b"42 (peer) S 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 1000 10",
+        )
+        .unwrap();
+        fs::write(root.join("42/io"), b"read_bytes: 12\nwrite_bytes: 34\n").unwrap();
+        fs::write(root.join("42/cmdline"), b"peer\0private argument\0").unwrap();
+        policy("hidepid=0");
+        let mut table = ProcessTable::for_helper(&root);
+        table.own_uid = unsafe { libc::getuid() }.wrapping_add(1);
+        for (options, visible, private) in [
+            ("hidepid=0", true, true),
+            ("hidepid=1", true, false),
+            ("hidepid=2", false, false),
+            ("hidepid=1", true, false),
+            ("hidepid=0", true, true),
+            ("hidepid=2,gid=4294967294", false, false),
+        ] {
+            policy(options);
+            let (rows, access) = table.sample(true);
+            assert_eq!(!rows.is_empty(), visible, "{options}: {access:?}");
+            assert_eq!(
+                rows.iter()
+                    .any(|row| row.command.contains("private argument")),
+                private,
+                "{options}"
+            );
+        }
+        // A changed gid exemption is applied by the same table, not a restart.
+        policy(&format!("hidepid=2,gid={}", unsafe { libc::getgid() }));
+        assert!(table.sample(true).0[0].command.contains("private argument"));
+        fs::remove_file(&metadata).unwrap();
+        assert!(
+            table.sample(true).0.is_empty(),
+            "unreadable policy must not disclose foreign rows"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn escaped_process_commands_have_an_aggregate_serialized_budget() {
+        let root =
+            std::env::temp_dir().join(format!("dwtop-process-budget-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        for pid in 1..=850 {
+            let path = root.join(pid.to_string());
+            fs::create_dir_all(&path).unwrap();
+            fs::write(
+                path.join("stat"),
+                format!(
+                    "{pid} (peer) S 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 1000 10"
+                ),
+            )
+            .unwrap();
+            fs::write(path.join("io"), b"read_bytes: 12\nwrite_bytes: 34\n").unwrap();
+            fs::write(path.join("cmdline"), [255u8; 4096]).unwrap();
+        }
+        let mut table = ProcessTable::for_helper(&root);
+        let (rows, access) = table.sample(true);
+        assert!(rows.len() < 850 && !rows.is_empty());
+        assert_eq!(access.readable, 850);
+        assert_eq!(access.omitted + rows.len(), 850);
+        assert!(access.message.contains("process data truncated"));
+        assert!(serde_json::to_vec(&rows).unwrap().len() <= MAX_PROCESS_JSON_BYTES + 1);
+        assert_eq!(
+            table.previous.len(),
+            rows.len(),
+            "cached commands obey the same budget"
+        );
+        assert!(
+            table.sample(true).1.omitted > 0,
+            "the next sample keeps collecting"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

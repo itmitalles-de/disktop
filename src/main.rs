@@ -128,6 +128,7 @@ enum Source {
         outdated: bool,
         local_home: Box<HomeScan>,
         local: bool,
+        generations: HomeGenerations,
     },
     Demo {
         tick: u64,
@@ -137,6 +138,33 @@ enum Source {
     Failing {
         helper: bool,
     },
+}
+
+/// Translate each scanner's independent generations into UI acknowledgements.
+#[derive(Default)]
+struct HomeGenerations {
+    offset: u64,
+}
+
+impl HomeGenerations {
+    fn switch(&mut self, acknowledged: u64) {
+        self.offset = acknowledged;
+    }
+
+    fn native(&self, acknowledged: u64) -> u64 {
+        acknowledged.saturating_sub(self.offset)
+    }
+
+    fn publish(&self, snapshot: &mut Snapshot) {
+        if let Some(tree) = &mut snapshot.home_tree {
+            tree.generation = tree.generation.saturating_add(self.offset);
+        }
+        if let Some(status) = &mut snapshot.home
+            && status.generation > 0
+        {
+            status.generation = status.generation.saturating_add(self.offset);
+        }
+    }
 }
 
 impl Source {
@@ -149,8 +177,17 @@ impl Source {
                 outdated,
                 local_home,
                 local,
+                generations,
             } => {
-                let mut snapshot = client.sample(request, || shutdown.requested())?;
+                let mut helper_request = request.clone();
+                helper_request.known_generation = if *local {
+                    // A return to the helper must obtain its current tree,
+                    // even if the previous local scan had a larger number.
+                    0
+                } else {
+                    generations.native(request.known_generation)
+                };
+                let mut snapshot = client.sample(&helper_request, || shutdown.requested())?;
                 // An older helper sends no fill levels; they need no privilege.
                 *outdated |= complete_storage(sysfs, &mut snapshot);
                 let refused = snapshot
@@ -158,12 +195,11 @@ impl Source {
                     .as_ref()
                     .is_some_and(|status| status.error_kind == Some(HomeErrorKind::NotAllowed));
                 if refused {
-                    // Each scanner numbers its trees itself; a switch starts
-                    // from zero so the current tree is delivered.
-                    let mut own = request.clone();
                     if !*local {
-                        own.known_generation = 0;
+                        generations.switch(request.known_generation);
                     }
+                    let mut own = request.clone();
+                    own.known_generation = generations.native(request.known_generation);
                     let (status, tree) = local_home.sample(&own);
                     snapshot.home = status.map(|mut status| {
                         status.helper_refused = true;
@@ -172,19 +208,11 @@ impl Source {
                     snapshot.home_tree = tree;
                     *local = true;
                 } else if *local {
+                    generations.switch(request.known_generation);
                     *local = false;
                     **local_home = HomeScan::unprivileged();
-                    if request.scan && snapshot.home_tree.is_none() {
-                        let again = HomeRequest {
-                            known_generation: 0,
-                            rescan: false,
-                            ..request.clone()
-                        };
-                        let retry = client.sample(&again, || shutdown.requested())?;
-                        snapshot.home = retry.home;
-                        snapshot.home_tree = retry.home_tree;
-                    }
                 }
+                generations.publish(&mut snapshot);
                 Ok(snapshot)
             }
             Self::Demo { tick, start } => {
@@ -332,6 +360,7 @@ fn main() -> Result<()> {
                 outdated: false,
                 local_home: Box::new(HomeScan::unprivileged()),
                 local: false,
+                generations: HomeGenerations::default(),
             },
             Err(error) => {
                 helper_error = Some(error);
@@ -997,6 +1026,44 @@ fn print_snapshot(out: &mut impl Write, app: &App, snapshot: &Snapshot) -> io::R
 mod tests {
     use super::*;
     use crossterm::event::KeyCode;
+
+    #[test]
+    fn scanner_generations_survive_async_switches_and_unaccepted_trees() {
+        let mut generations = HomeGenerations::default();
+        let mut app = App::new(None, Settings::default(), false);
+        app.update(demo::snapshot(160, 160.0, "/home", 0));
+        let acknowledged = app.take_home_request().known_generation;
+        assert!(acknowledged > 1);
+        generations.switch(acknowledged);
+        // No tree during the first asynchronous local request. The next
+        // request still acknowledges zero in that scanner, not the old helper.
+        assert_eq!(generations.native(acknowledged), 0);
+        assert_eq!(generations.native(acknowledged), 0);
+        let mut local = demo::snapshot(0, 161.0, "/home", 0);
+        generations.publish(&mut local);
+        let published = local.home_tree.as_ref().unwrap().generation;
+        assert!(published > acknowledged);
+        app.paused = true;
+        app.update(local.clone());
+        assert_eq!(app.take_home_request().known_generation, acknowledged);
+        assert_eq!(generations.native(acknowledged), 0);
+        app.paused = false;
+        app.update(local);
+        assert_eq!(
+            generations.native(app.take_home_request().known_generation),
+            1
+        );
+        // Reverse switch to a helper that has just started its first scan.
+        generations.switch(published);
+        assert_eq!(generations.native(published), 0);
+        let mut helper = demo::snapshot(0, 162.0, "/srv/new-root", 0);
+        generations.publish(&mut helper);
+        app.update(helper);
+        assert_eq!(
+            generations.native(app.take_home_request().known_generation),
+            1
+        );
+    }
 
     #[test]
     fn argument_parsers_reject_invalid_values() {

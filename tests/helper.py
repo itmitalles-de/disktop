@@ -425,6 +425,89 @@ def check_no_helper(binary, account):
                 monitor.wait(timeout=3)
 
 
+class HelperSession:
+    """One capability helper kept alive for policy and frame regressions."""
+    def __init__(self, account):
+        self.process = subprocess.Popen(
+            [str(HELPER), "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, **unprivileged(account))
+
+    def __enter__(self):
+        return self
+
+    def sample(self, root, scan=False, **overrides):
+        home = {"root": str(root), "scan": scan, "interval_minutes": 5,
+                "rescan": False, "known_generation": 0, **overrides}
+        request = json.dumps({"version": 1, "home": home}).encode() + b"\n"
+        self.process.stdin.write(request)
+        self.process.stdin.flush()
+        assert select.select([self.process.stdout], [], [], 5)[0], "helper did not reply"
+        reply = json.loads(self.process.stdout.readline())
+        assert reply["result"] == "snapshot", reply
+        assert self.process.poll() is None, "persistent helper exited"
+        return reply["snapshot"]
+
+    def __exit__(self, *unused):
+        self.process.stdin.close()
+        try:
+            self.process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=3)
+        self.process.stdout.close()
+        self.process.stderr.close()
+
+
+def check_policy_aliases(account):
+    """A user-replaceable configured root cannot authorize an outside alias."""
+    parent = Path("/srv/dwtop-user-policy")
+    system_alias = Path("/srv/dwtop-system-policy-alias")
+    assert not parent.exists() and not os.path.lexists(system_alias)
+    parent.mkdir()
+    os.chown(parent, account.pw_uid, account.pw_gid)
+    projects = parent / "projects"
+    projects.mkdir()
+    os.chown(projects, account.pw_uid, account.pw_gid)
+    outside = HOME / "alice"
+    try:
+        write_scan_roots(f"{projects}\n")
+        with HelperSession(account) as helper:
+            assert helper.sample(projects)["home"]["privileged"]
+            projects.rmdir()
+            projects.symlink_to(outside)
+            os.lchown(projects, account.pw_uid, account.pw_gid)
+            def scan_refused():
+                data = helper.sample(projects, scan=True)
+                assert not data.get("home_tree"), "outside tree escaped policy"
+                return data["home"].get("error_kind") == "not_allowed"
+            wait_until(scan_refused, "post-startup alias rejection")
+            assert helper.sample(outside)["home"].get("error_kind") == "not_allowed"
+        # Restarting must not bless the same attacker-controlled startup link.
+        with HelperSession(account) as helper:
+            assert helper.sample(outside)["home"].get("error_kind") == "not_allowed"
+            def startup_refused():
+                data = helper.sample(projects, scan=True)
+                assert not data.get("home_tree"), "startup alias escaped policy"
+                return data["home"].get("error_kind") == "not_allowed"
+            wait_until(startup_refused, "pre-startup alias rejection")
+        # A root-owned system alias under trusted /srv remains supported.
+        system_alias.symlink_to(HOME)
+        write_scan_roots(f"{system_alias}\n")
+        with HelperSession(account) as helper:
+            for root in (system_alias, HOME, HOME / "alice"):
+                home = helper.sample(root)["home"]
+                assert home["privileged"] and home.get("error") is None, home
+    finally:
+        if projects.is_symlink():
+            projects.unlink()
+        elif projects.exists():
+            projects.rmdir()
+        parent.rmdir()
+        system_alias.unlink(missing_ok=True)
+        write_scan_roots(f"{HOME}\n")
+    print("PASS user-controlled aliases refused before/after helper startup; trusted system aliases retained")
+
+
 def check_protocol(account):
     home = {"root": "/srv", "scan": False, "interval_minutes": 5, "rescan": False, "known_generation": 0}
     cases = {
@@ -433,7 +516,7 @@ def check_protocol(account):
         "unknown home field": json.dumps({"version": 1, "home": {**home, "follow": True}}).encode() + b"\n",
         "traversal": json.dumps({"version": 1, "home": {**home, "root": "/srv/../etc"}}).encode() + b"\n",
         "relative": json.dumps({"version": 1, "home": {**home, "root": "etc"}}).encode() + b"\n",
-        "oversized request": b"x" * 8193 + b"\n",
+        "oversized request": b"x" * (2 * 4096 + 513) + b"\n",
         "incomplete request": json.dumps({"version": 1, "home": home}).encode(),
     }
     for label, request in cases.items():
@@ -453,7 +536,23 @@ def check_protocol(account):
         [str(HELPER)], capture_output=True, timeout=5, check=False, **unprivileged(account)
     )
     assert result.returncode != 0 and b"launched by dwtop" in result.stdout
-    print("PASS helper rejects invalid versions, unknown fields, unsafe paths and unbounded/incomplete frames")
+    # An accepted maximum path with quotes doubles under JSON escaping. Both
+    # it and a later ordinary request must work on the same connection.
+    parts = []
+    remaining = 4095
+    while remaining:
+        length = min(254, remaining)
+        parts.append('"' * length)
+        remaining -= length
+        if remaining:
+            remaining -= 1
+    escaped_root = "/" + "/".join(parts)
+    assert len(escaped_root.encode()) == 4096
+    with HelperSession(account) as helper:
+        data = helper.sample(escaped_root, known_generation=2**64 - 1, interval_minutes=1440)
+        assert data["process_access"]["privileged"] and data["devices"]
+        assert helper.sample(HOME)["process_access"]["privileged"]
+    print("PASS helper rejects invalid frames and keeps maximum escaped paths/ordinary requests on one connection")
 
 
 def read_terminal(master, output, timeout):
@@ -773,6 +872,7 @@ def main():
                 check_policy_migration(binary, account)
                 check_no_helper(binary, account)
                 check_protocol(account)
+                check_policy_aliases(account)
                 check_stopped_helper(binary, account)
                 check_stopped_helper(binary, account, signal_exit=False)
                 check_abrupt_exit(binary, account)

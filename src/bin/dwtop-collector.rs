@@ -50,13 +50,7 @@ fn serve() -> Result<()> {
             std::thread::sleep(minimum.saturating_sub(previous.elapsed()));
         }
         let snapshot = collector.sample(&request.home)?;
-        helper::write_reply(
-            &mut output,
-            &Reply::Snapshot {
-                version: PROTOCOL_VERSION,
-                snapshot: Box::new(snapshot),
-            },
-        )?;
+        helper::write_reply(&mut output, &helper::bounded_snapshot(snapshot)?)?;
         previous = Some(Instant::now());
     }
     Ok(())

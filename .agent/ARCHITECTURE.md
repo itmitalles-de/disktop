@@ -12,7 +12,9 @@ dm/md devices backed by one shown disk fold into it unless `show_stacked`.
 The pure `disk_layout()` reduces graph height, then meters and rows as space
 shrinks; Space/Home use compact capacity blocks and short filesystem tables
 release unused height to fill history. A "+N more" row and focus scrolling
-expose overflow. Per-device `App::history` survives focus changes. RD/WR meters
+expose overflow. Per-device `App::history` survives focus changes, but resets on collector
+fallback or a backwards elapsed clock. Steps and Braille split each measured
+series at missing values, leaving gaps. RD/WR meters
 in the I/O view share the
 highest visible rate across all overview devices. Space views never substitute
 I/O rates for capacity. Unavailable measurements remain explicit; `demo.rs`
@@ -42,6 +44,8 @@ size and dm/md label every sample, and resolves partitions (one map per
 sample), holders (cached per sample) and slaves to map mounts to devices and
 the home path to a whole disk. A bounded breadth-first traversal follows both
 partitions and holders at every level, including partitioned md/dm holders.
+Backing-device discovery also uses BFS with visited nodes (256 nodes, 64 leaves,
+depth eight), and slave directory listings are shared within each sample.
 Devices with slaves and bcache/drbd/zd/nbd are
 kind `Stacked` (virtual). Multi-device btrfs maps to every member from
 /sys/fs/btrfs/<uuid>/devices. `zfs.rs` discovers mounted pools asynchronously
@@ -52,7 +56,9 @@ Known leaf members map through the same partition/holder logic; pool allocation
 is separate from quota-dependent dataset statvfs. Pending/failed refreshes keep
 last known membership with unknown capacity. File-backed/unresolved vdevs are
 reported, not inferred. No subprocess runs without a mounted ZFS dataset.
-`DeviceUsage.accounting_keys` deduplicates block-backed filesystems and
+Capacity deduplication prefers a complete measured representative over
+unavailable mounts of the same accounting key. `DeviceUsage.accounting_keys`
+deduplicates block-backed filesystems and
 `zfs:<pool>` allocations across disks/datasets. `block_devices` retains real
 device names for compatibility; the UI falls back to it for older helpers.
 Pseudo-files are read up to 16 MiB, cut at
@@ -62,7 +68,11 @@ worker with a shared 0.5 s budget per sample. Each path has at most one
 outstanding call; late results survive to the next sample. Launches rotate,
 with eight calls within their deadline and 64 outstanding overall. Hung or
 not-yet-probed mounts become `not_responding`. The home
-path is canonicalized off-thread and cached; mount matching is lexical.
+path is canonicalized off-thread: at most eight outstanding resolutions
+survive path changes, at most 64 completed paths are cached, and a two-second
+refresh follows symlink/availability changes. A blocked refresh retains a known
+result. Mount metadata failure remains unknown, never a confirmed file bind.
+Mount matching is lexical.
 "All" aggregates non-virtual whole disks only. Each device's `usage`
 (`model::DeviceUsage::from_filesystems`) sums the statvfs values of the
 filesystems whose block device is the device, a partition or a holder, each
@@ -82,6 +92,11 @@ per-thread /proc/PID/task/TID/io deltas keyed by (tid, start time) (read only
 when the process total changed; >10,000 threads fall back to the total), counts
 EACCES as hidden, resolves user names only outside the helper, and in the
 helper applies /proc's hidepid to other users (1: comm only, 2: omitted).
+Policy is reread per sample; changes clear command caches and unreadable policy
+fails closed. Process rows and cached commands share a 16 MiB serialized budget.
+Additive protocol-v1 `ProcessAccess.omitted` defaults to zero for old replies;
+readable counts include sampled rows omitted solely for size, independently of
+permission restrictions.
 Direct collection also detects hidepid: stat EACCES counts as unreadable,
 while invisible processes have no fabricated total. The TUI warns even when
 the kernel hides enumeration; gid exemptions retain the kernel's behavior.
@@ -117,16 +132,26 @@ closed without consulting legacy files. Policy reads probe beyond 64 KiB and
 reject oversized files, invalid UTF-8, invalid paths and more than 64 roots in
 their entirety. A selected policy disappearing during loading denies scans
 instead of enabling defaults. Roots are opened component by component with
-O_NOFOLLOW). `collector::HomeScan` drives the service from requests; a root the
+O_NOFOLLOW). Canonical aliases require root-owned, non-writable ancestors and
+reject procfs magic links; unresolved aliases stay lexical and cannot widen
+policy. Root resolution shares a one-second deadline and a globally bounded
+eight-worker pool that retains slots until actual completion.
+`collector::HomeScan` drives the service from requests; a root the
 helper refuses (`HomeErrorKind::NotAllowed`) is scanned by the UI's own
-unprivileged `HomeScan` (`Source::Helper`), marked `helper_refused`. Home and
+unprivileged `HomeScan` (`Source::Helper`), marked `helper_refused`.
+`HomeGenerations` translates native scanner counters into UI acknowledgements
+across both source switches, including asynchronous/pause-delayed trees. Growth
+always measures allocated blocks; apparent-size headers disclose this. Home and
 helper errors carry kinds that `i18n.rs` translates.
 
 `helper.rs` and `bin/dwtop-collector.rs` implement the optional root-owned
 helper: fixed path and ownership checks, cleared environment, `--stdio` only,
-versioned newline-delimited JSON with request (8 KiB) and response (32 MiB)
-bounds, unknown fields rejected, a 10-second reply deadline with cancellation,
-and kill+reap on drop. `privilege.rs` keeps DAC_READ_SEARCH+SYS_PTRACE in the
+versioned newline-delimited JSON with request (8704 bytes, including worst-case
+path escaping) and response (32 MiB) bounds. Outgoing requests are checked
+before writing. Aggregate replies preserve the bounded Home tree and trim
+process, filesystem, then device rows with visible truncation markers.
+Unknown fields are rejected. Replies have a 10-second deadline with
+cancellation; client drop kills and reaps the helper. `privilege.rs` keeps DAC_READ_SEARCH+SYS_PTRACE in the
 sampling thread and only DAC_READ_SEARCH in scanner threads, all with
 NO_NEW_PRIVS. `scripts/setup-helper.sh` builds unprivileged and installs with
 `cap_dac_read_search,cap_sys_ptrace=ep`: root copies the build root-only, checks

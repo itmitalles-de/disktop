@@ -127,7 +127,8 @@ impl DeviceUsage {
             swap,
             ..Self::default()
         };
-        let mut seen = std::collections::BTreeSet::new();
+        let mut indices = std::collections::HashMap::new();
+        let mut representatives: Vec<(&Filesystem, String)> = Vec::new();
         for filesystem in filesystems {
             let Some(device) = filesystem.accounting_key() else {
                 continue;
@@ -141,9 +142,25 @@ impl DeviceUsage {
                     .member_devices
                     .iter()
                     .any(|member| members.contains(member));
-            if !on_member || !seen.insert(device.clone()) {
+            if !on_member {
                 continue;
             }
+            // Keep the first accounting-key order, but replace an unavailable
+            // representative with a measured bind mount/subvolume. Partial
+            // values never suppress a later complete measurement.
+            if let Some(&index) = indices.get(&device) {
+                let previous: &mut (&Filesystem, String) = &mut representatives[index];
+                if previous.0.accounting_usage().is_none()
+                    && filesystem.accounting_usage().is_some()
+                {
+                    previous.0 = filesystem;
+                }
+            } else {
+                indices.insert(device.clone(), representatives.len());
+                representatives.push((filesystem, device));
+            }
+        }
+        for (filesystem, device) in representatives {
             usage.accounting_keys.push(device);
             if let Some(name) = &filesystem.block_device
                 && !usage.block_devices.contains(name)
@@ -224,6 +241,9 @@ pub struct ProcessAccess {
     /// Processes whose /proc/PID/io could not be read (other users, or
     /// non-dumpable). They are omitted from the table, never shown as idle.
     pub unreadable: usize,
+    /// Readable process rows omitted to keep the bounded helper response valid.
+    #[serde(default)]
+    pub omitted: usize,
     pub message: String,
 }
 
@@ -644,5 +664,51 @@ mod tests {
         let usage =
             DeviceUsage::from_filesystems([&unavailable], &BTreeSet::from(["sdb1".into()]), false);
         assert_eq!(usage.filesystems, 0);
+    }
+
+    #[test]
+    fn capacity_prefers_complete_subvolume_measurements_in_any_order() {
+        let mut unavailable = filesystem("sda1", None, 0);
+        unavailable.mount_point = "/a".into();
+        unavailable.fs_type = "btrfs".into();
+        let mut partial = unavailable.clone();
+        partial.total_bytes = Some(100);
+        partial.used_bytes = Some(80);
+        let mut measured = filesystem("sda1", Some(100), 80);
+        measured.fs_type = "btrfs".into();
+        measured.mount_point = "/b".into();
+        let members = BTreeSet::from(["sda1".into()]);
+        for rows in [
+            [&unavailable, &partial, &measured],
+            [&measured, &unavailable, &partial],
+            [&partial, &measured, &unavailable],
+        ] {
+            let usage = DeviceUsage::from_filesystems(rows, &members, false);
+            assert_eq!((usage.filesystems, usage.unmeasured), (1, 0));
+            assert_eq!(
+                (usage.total_bytes, usage.used_bytes, usage.available_bytes),
+                (100, 80, 20)
+            );
+            assert_eq!(usage.percent(), Some(80.0));
+            assert_eq!(usage.accounting_keys, ["sda1"]);
+        }
+        let usage = DeviceUsage::from_filesystems([&unavailable, &partial], &members, false);
+        assert_eq!((usage.filesystems, usage.unmeasured), (0, 1));
+    }
+
+    #[test]
+    fn legacy_process_access_defaults_omitted_rows_to_zero() {
+        let access: ProcessAccess = serde_json::from_str(
+            r#"{"privileged":false,"readable":3,"unreadable":2,"message":"partial"}"#,
+        )
+        .unwrap();
+        assert_eq!(access.omitted, 0);
+        let updated = ProcessAccess {
+            omitted: 1,
+            ..access
+        };
+        let restored: ProcessAccess =
+            serde_json::from_str(&serde_json::to_string(&updated).unwrap()).unwrap();
+        assert_eq!(restored.omitted, 1);
     }
 }

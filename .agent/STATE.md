@@ -1,5 +1,31 @@
 # Verified state
 
+## Review fixes #22–#34 (2026-10-11)
+
+- Scan-root aliases require trusted root-owned ancestors; user-controlled and
+  procfs aliases cannot widen policy. Running helpers refresh hidepid/GID
+  policy every sample, clear command caches on changes and fail closed.
+- Home scanner counters translate across helper/local source switches,
+  including asynchronous scans and paused UI acceptance. Collector clock
+  resets clear history; missing measurements split Steps/Braille curves.
+  Apparent-size growth columns explicitly retain allocated-block semantics.
+- Inaccessible mount metadata remains visible as unavailable. Capacity
+  deduplication prefers complete measurements. Resolver work remains bounded
+  across path changes and refreshes cached paths; backing graphs use bounded
+  BFS and per-sample slave caches.
+- Process rows share a 16 MiB serialized budget; complete helper replies fit
+  32 MiB by disclosing omitted rows/metadata while retaining the Home tree.
+  Additive protocol-v1 omitted counts preserve older helper compatibility.
+  Requests accept worst-case escaping of every valid 4096-byte root.
+- Verified: 124 Rust tests on stable and Rust 1.88, fmt, Clippy, release,
+  terminal/Setup, isolated real I/O and capability-helper tests, ShellCheck
+  and dependency audit. Dedicated Ubuntu 24.04/KVM kernel tests passed:
+  seven policy/GID transitions on one helper PID, hard-NFS outage response
+  in about 1.31 s and scan recovery in about 0.36 s. VM resources retired.
+- Evidence and tested release hashes: `../disktop-review/review-fixes-20261011/`.
+  Installer receipts remain authoritative for host executable provenance;
+  older installation statements below describe their historical milestones.
+
 ## Space layout (2026-10-11)
 
 - #20: short filesystem tables reserve only their header and actual rows,

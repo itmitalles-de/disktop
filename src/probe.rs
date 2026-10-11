@@ -30,8 +30,9 @@ const MAX_CONCURRENT: usize = 8;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Probe {
     /// The mount point is a directory; Docker binds single files such as
-    /// /etc/hosts, which are not filesystems to show.
-    pub is_dir: bool,
+    /// /etc/hosts, which are not filesystems to show. None means metadata
+    /// could not be read; such mounts must remain visible as unavailable.
+    pub is_dir: Option<bool>,
     pub usage: Option<Usage>,
 }
 
@@ -46,10 +47,14 @@ pub type ProbeFn = fn(&Path) -> Probe;
 
 /// The real calls: lstat on the mount point, statvfs on directories.
 pub fn probe_mount(path: &Path) -> Probe {
-    let is_dir = fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir());
+    let is_dir = fs::symlink_metadata(path)
+        .ok()
+        .map(|metadata| metadata.is_dir());
     Probe {
         is_dir,
-        usage: is_dir.then(|| mounts::statvfs(path)).flatten(),
+        usage: (is_dir == Some(true))
+            .then(|| mounts::statvfs(path))
+            .flatten(),
     }
 }
 
@@ -221,29 +226,93 @@ fn canonicalize(path: &Path) -> Option<PathBuf> {
     fs::canonicalize(path).ok()
 }
 
-/// Resolve `path` with a timeout. `None` while it has not answered.
-pub fn resolve_with_timeout(path: &Path, timeout: Duration) -> Option<PathBuf> {
+/// One-shot filesystem operations share a global bound. A timed-out worker
+/// retains its slot until the actual operation returns; dropping a receiver
+/// never pretends to cancel a blocked kernel call.
+const MAX_ONE_SHOT_WORKERS: usize = 8;
+static ONE_SHOT_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct WorkerSlot(&'static std::sync::atomic::AtomicUsize);
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Run a blocking operation in a bounded worker. None means no worker slot,
+/// thread creation failure, or no reply within the deadline. The caller must
+/// keep its error/fallback behavior safe for all three unavailable outcomes.
+pub fn run_with_timeout<T: Send + 'static>(
+    operation: impl FnOnce() -> T + Send + 'static,
+    timeout: Duration,
+) -> Option<T> {
+    run_with_timeout_in_pool(operation, timeout, &ONE_SHOT_WORKERS)
+}
+
+fn run_with_timeout_in_pool<T: Send + 'static>(
+    operation: impl FnOnce() -> T + Send + 'static,
+    timeout: Duration,
+    workers: &'static std::sync::atomic::AtomicUsize,
+) -> Option<T> {
+    if timeout.is_zero() {
+        return None;
+    }
+    let mut count = workers.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        if count >= MAX_ONE_SHOT_WORKERS {
+            return None;
+        }
+        match workers.compare_exchange_weak(
+            count,
+            count + 1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(current) => count = current,
+        }
+    }
+    let slot = WorkerSlot(workers);
     let (sender, receiver) = mpsc::channel();
-    let owned = path.to_owned();
     std::thread::Builder::new()
         .name("dwtop-resolve".into())
         .stack_size(256 * 1024)
         .spawn(move || {
-            let _ = sender.send(canonicalize(&owned));
+            let _slot = slot;
+            let _ = sender.send(operation());
         })
         .ok()?;
-    receiver.recv_timeout(timeout).ok().flatten()
+    receiver.recv_timeout(timeout).ok()
+}
+
+/// Resolve `path` with a timeout. `None` while it has not answered.
+pub fn resolve_with_timeout(path: &Path, timeout: Duration) -> Option<PathBuf> {
+    let owned = path.to_owned();
+    run_with_timeout(move || canonicalize(&owned), timeout).flatten()
+}
+
+const MAX_RESOLVERS: usize = 8;
+const MAX_RESOLVED_PATHS: usize = 64;
+const RESOLVE_REFRESH: Duration = Duration::from_secs(2);
+
+struct ResolvedPath {
+    value: Option<PathBuf>,
+    checked: Instant,
 }
 
 /// Cached symlink resolution of the home path, done off the sampling thread.
-/// Until the path answers, the lexical path is used; one resolution per
-/// distinct path is outstanding at a time.
+/// Outstanding workers remain tracked across path changes, including after
+/// their deadlines. Results refresh periodically; a stale successful result
+/// remains usable while a refresh is outstanding.
 pub struct Resolver {
     resolve: ResolveFn,
     timeout: Duration,
-    path: PathBuf,
-    resolved: Option<PathBuf>,
-    pending: Option<mpsc::Receiver<Option<PathBuf>>>,
+    refresh: Duration,
+    cached: HashMap<PathBuf, ResolvedPath>,
+    pending: HashMap<PathBuf, Instant>,
+    sender: mpsc::Sender<(PathBuf, Option<PathBuf>)>,
+    receiver: mpsc::Receiver<(PathBuf, Option<PathBuf>)>,
 }
 
 impl Default for Resolver {
@@ -254,57 +323,83 @@ impl Default for Resolver {
 
 impl Resolver {
     pub fn new(resolve: ResolveFn, timeout: Duration) -> Self {
+        let (sender, receiver) = mpsc::channel();
         Self {
             resolve,
             timeout,
-            path: PathBuf::new(),
-            resolved: None,
-            pending: None,
+            refresh: RESOLVE_REFRESH,
+            cached: HashMap::new(),
+            pending: HashMap::new(),
+            sender,
+            receiver,
+        }
+    }
+
+    fn accept(&mut self, (path, value): (PathBuf, Option<PathBuf>)) {
+        self.pending.remove(&path);
+        if !self.cached.contains_key(&path)
+            && self.cached.len() >= MAX_RESOLVED_PATHS
+            && let Some(oldest) = self
+                .cached
+                .iter()
+                .min_by_key(|(_, item)| item.checked)
+                .map(|(path, _)| path.clone())
+        {
+            self.cached.remove(&oldest);
+        }
+        self.cached.insert(
+            path,
+            ResolvedPath {
+                value,
+                checked: Instant::now(),
+            },
+        );
+    }
+
+    fn drain(&mut self) {
+        while let Ok(message) = self.receiver.try_recv() {
+            self.accept(message);
         }
     }
 
     pub fn resolve(&mut self, path: &Path) -> PathBuf {
-        if self.path != path {
-            self.path = path.to_owned();
-            self.resolved = None;
-            // A resolution of the previous path may still be running; its
-            // result is dropped with the receiver.
-            self.pending = None;
-        }
-        if let Some(resolved) = &self.resolved {
-            return resolved.clone();
-        }
-        let receiver = match self.pending.take() {
-            Some(receiver) => receiver,
-            None => {
-                let (sender, receiver) = mpsc::channel();
-                let resolve = self.resolve;
-                let owned = path.to_owned();
-                let spawned = std::thread::Builder::new()
-                    .name("dwtop-resolve".into())
-                    .stack_size(256 * 1024)
-                    .spawn(move || {
-                        let _ = sender.send(resolve(&owned));
-                    });
-                if spawned.is_err() {
-                    return mounts::lexical(path);
-                }
-                receiver
+        self.drain();
+        let fresh = self
+            .cached
+            .get(path)
+            .is_some_and(|cached| cached.checked.elapsed() < self.refresh);
+        if !fresh && !self.pending.contains_key(path) && self.pending.len() < MAX_RESOLVERS {
+            let sender = self.sender.clone();
+            let resolve = self.resolve;
+            let owned = path.to_owned();
+            let started = Instant::now();
+            let spawned = std::thread::Builder::new()
+                .name("dwtop-resolve".into())
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    let _ = sender.send((owned.clone(), resolve(&owned)));
+                });
+            if spawned.is_ok() {
+                self.pending.insert(path.to_owned(), started);
             }
-        };
-        match receiver.recv_timeout(self.timeout) {
-            Ok(result) => {
-                // A path that does not exist (yet) stays lexical.
-                let resolved = result.unwrap_or_else(|| mounts::lexical(path));
-                self.resolved = Some(resolved.clone());
-                resolved
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.pending = Some(receiver);
-                mounts::lexical(path)
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => mounts::lexical(path),
         }
+        // Never spend another timeout on an already expired worker. Other
+        // paths' late answers free slots and enter the bounded cache too.
+        while let Some(started) = self.pending.get(path).copied() {
+            let remaining = (started + self.timeout).saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match self.receiver.recv_timeout(remaining) {
+                Ok(message) => self.accept(message),
+                Err(_) => break,
+            }
+        }
+        self.drain();
+        self.cached
+            .get(path)
+            .and_then(|cached| cached.value.clone())
+            .unwrap_or_else(|| mounts::lexical(path))
     }
 }
 
@@ -329,7 +424,7 @@ mod tests {
             }
         }
         Probe {
-            is_dir: true,
+            is_dir: Some(true),
             usage: Some(Usage {
                 total: path.as_os_str().len() as u64,
                 ..Usage::default()
@@ -377,7 +472,7 @@ mod tests {
             CALLS.fetch_add(1, Ordering::Relaxed);
             std::thread::sleep(Duration::from_millis(250));
             Probe {
-                is_dir: true,
+                is_dir: Some(true),
                 usage: Some(Usage {
                     total: 123,
                     ..Default::default()
@@ -433,7 +528,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(2));
             }
             Probe {
-                is_dir: true,
+                is_dir: Some(true),
                 usage: Some(Usage {
                     total: index as u64,
                     ..Default::default()
@@ -490,7 +585,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(2));
             }
             Probe {
-                is_dir: true,
+                is_dir: Some(true),
                 usage: Some(Usage {
                     total: 42,
                     ..Default::default()
@@ -541,6 +636,222 @@ mod tests {
         assert_eq!(
             resolve_with_timeout(Path::new("/"), Duration::from_secs(2)),
             Some(PathBuf::from("/"))
+        );
+    }
+
+    #[test]
+    fn missing_mount_metadata_is_unknown_not_a_confirmed_file() {
+        let missing =
+            std::env::temp_dir().join(format!("dwtop-missing-mount-{}", std::process::id()));
+        assert!(!missing.exists());
+        assert_eq!(
+            probe_mount(&missing),
+            Probe {
+                is_dir: None,
+                usage: None
+            }
+        );
+        assert_eq!(probe_mount(Path::new("/dev/null")).is_dir, Some(false));
+        assert_eq!(probe_mount(Path::new("/tmp")).is_dir, Some(true));
+    }
+
+    #[test]
+    fn resolver_bounds_workers_across_changes_and_recovers_late_answers() {
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        struct Release;
+        impl Drop for Release {
+            fn drop(&mut self) {
+                RELEASE.store(true, Ordering::Release);
+            }
+        }
+        fn blocked(path: &Path) -> Option<PathBuf> {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            while !RELEASE.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Some(Path::new("/resolved").join(path.strip_prefix("/").unwrap()))
+        }
+        let _release = Release;
+        let mut resolver = Resolver::new(blocked, Duration::from_millis(5));
+        for index in 0..MAX_RESOLVERS * 3 {
+            let path = PathBuf::from(format!("/root-{index}"));
+            assert_eq!(resolver.resolve(&path), path);
+            assert!(resolver.pending.len() <= MAX_RESOLVERS);
+        }
+        for _ in 0..20 {
+            resolver.resolve(Path::new("/root-0"));
+            resolver.resolve(Path::new("/root-1"));
+        }
+        assert_eq!(resolver.pending.len(), MAX_RESOLVERS);
+        let start_deadline = Instant::now() + Duration::from_secs(2);
+        while CALLS.load(Ordering::Relaxed) < MAX_RESOLVERS {
+            assert!(
+                Instant::now() < start_deadline,
+                "resolver worker did not start"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(CALLS.load(Ordering::Relaxed), MAX_RESOLVERS);
+        RELEASE.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let resolved = resolver.resolve(Path::new("/root-0"));
+            if resolver.pending.is_empty() {
+                assert_eq!(resolved, Path::new("/resolved/root-0"));
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(CALLS.load(Ordering::Relaxed), MAX_RESOLVERS);
+        assert_eq!(
+            resolver.resolve(Path::new("/new")),
+            Path::new("/resolved/new")
+        );
+        assert_eq!(CALLS.load(Ordering::Relaxed), MAX_RESOLVERS + 1);
+    }
+
+    #[test]
+    fn resolver_refreshes_retargeted_symlinks_and_initially_missing_paths() {
+        let root =
+            std::env::temp_dir().join(format!("dwtop-resolver-refresh-{}", std::process::id()));
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(root.join("a"), &link).unwrap();
+        let mut resolver = Resolver {
+            refresh: Duration::ZERO,
+            ..Resolver::default()
+        };
+        assert_eq!(resolver.resolve(&link), root.join("a"));
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(root.join("b"), &link).unwrap();
+        assert_eq!(resolver.resolve(&link), root.join("b"));
+        let missing = link.join("new");
+        assert_eq!(resolver.resolve(&missing), missing);
+        fs::create_dir(root.join("b/new")).unwrap();
+        assert_eq!(resolver.resolve(&missing), root.join("b/new"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn resolver_keeps_last_known_result_during_a_stalled_refresh() {
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        struct Release;
+        impl Drop for Release {
+            fn drop(&mut self) {
+                RELEASE.store(true, Ordering::Release);
+            }
+        }
+        fn changing(_: &Path) -> Option<PathBuf> {
+            if CALLS.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Some("/first".into());
+            }
+            while !RELEASE.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Some("/second".into())
+        }
+        let _release = Release;
+        let mut resolver = Resolver::new(changing, Duration::from_millis(10));
+        resolver.refresh = Duration::ZERO;
+        assert_eq!(resolver.resolve(Path::new("/link")), Path::new("/first"));
+        assert_eq!(resolver.resolve(Path::new("/link")), Path::new("/first"));
+        assert_eq!(resolver.resolve(Path::new("/link")), Path::new("/first"));
+        assert_eq!(CALLS.load(Ordering::Relaxed), 2);
+        RELEASE.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while resolver.resolve(Path::new("/link")) != Path::new("/second") {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn resolver_completed_cache_is_bounded() {
+        fn ready(path: &Path) -> Option<PathBuf> {
+            Some(path.to_owned())
+        }
+        let mut resolver = Resolver::new(ready, Duration::from_millis(200));
+        for index in 0..MAX_RESOLVED_PATHS * 2 {
+            let path = PathBuf::from(format!("/root-{index}"));
+            assert_eq!(resolver.resolve(&path), path);
+            assert!(resolver.cached.len() <= MAX_RESOLVED_PATHS);
+        }
+        assert!(resolver.pending.is_empty());
+    }
+
+    #[test]
+    fn one_shot_timeouts_keep_worker_slots_until_real_completion() {
+        static WORKERS: AtomicUsize = AtomicUsize::new(0);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        struct Release;
+        impl Drop for Release {
+            fn drop(&mut self) {
+                RELEASE.store(true, Ordering::Release);
+            }
+        }
+        let _release = Release;
+        assert!(run_with_timeout_in_pool(|| 1, Duration::ZERO, &WORKERS).is_none());
+        assert_eq!(WORKERS.load(Ordering::Acquire), 0);
+        for _ in 0..MAX_ONE_SHOT_WORKERS {
+            assert!(
+                run_with_timeout_in_pool(
+                    || {
+                        while !RELEASE.load(Ordering::Acquire) {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        42
+                    },
+                    Duration::from_millis(2),
+                    &WORKERS
+                )
+                .is_none()
+            );
+        }
+        assert_eq!(WORKERS.load(Ordering::Acquire), MAX_ONE_SHOT_WORKERS);
+        // A dropped/timed-out reply cannot open another lane.
+        assert!(run_with_timeout_in_pool(|| 1, Duration::from_secs(1), &WORKERS).is_none());
+        RELEASE.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while WORKERS.load(Ordering::Acquire) > 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            run_with_timeout_in_pool(|| 7, Duration::from_secs(1), &WORKERS),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn inaccessible_parent_does_not_turn_a_directory_mount_into_a_file() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root bypasses fixture permissions; the unprivileged suite exercises
+        // the actual EACCES path, while unknown-metadata tests also run as root.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("dwtop-probe-permissions-{}", std::process::id()));
+        fs::create_dir_all(root.join("mount")).unwrap();
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _fixture = Fixture(root.clone());
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o0)).unwrap();
+        assert_eq!(
+            probe_mount(&root.join("mount")),
+            Probe {
+                is_dir: None,
+                usage: None
+            }
         );
     }
 }

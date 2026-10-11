@@ -51,11 +51,68 @@ def snapshot(binary, account, *args, groups=()):
     return data, elapsed
 
 
+def persistent_hidepid(account, peer, writer, evidence):
+    """Remounts must affect the very same capability helper, including caches."""
+    run('mount', '-o', 'remount,hidepid=0,gid=0', '/proc')
+    groups = (peer.pw_gid,)
+    helper = subprocess.Popen([str(HELPER), '--stdio'], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              **identity(account, groups))
+    helper_pid = helper.pid
+    try:
+        steps = ((0, 0, 'private'), (1, 0, 'redacted'), (2, 0, 'hidden'),
+                 (1, account.pw_gid, 'private'), (2, peer.pw_gid, 'private'),
+                 (2, 0, 'hidden'), (0, 0, 'private'))
+        for number, (mode, group, visibility) in enumerate(steps):
+            run('mount', '-o', f'remount,hidepid={mode},gid={group}', '/proc')
+            kernel = subprocess.run(['cat', f'/proc/{writer.pid}/cmdline'],
+                                    capture_output=True, **identity(account, groups))
+            assert (kernel.returncode == 0) == (visibility == 'private'), (
+                mode, group, kernel.returncode)
+            request = {'version': 1, 'home': {'root': '/home', 'scan': False,
+                       'interval_minutes': 5, 'rescan': False, 'known_generation': 0}}
+            started = time.monotonic()
+            helper.stdin.write(json.dumps(request).encode() + b'\n')
+            helper.stdin.flush()
+            assert select.select([helper.stdout], [], [], 5)[0], 'persistent helper stopped replying'
+            reply = json.loads(helper.stdout.readline())
+            elapsed = time.monotonic() - started
+            assert reply['result'] == 'snapshot', reply
+            assert elapsed < 5
+            assert helper.pid == helper_pid and helper.poll() is None, 'helper restarted/exited'
+            data = reply['snapshot']
+            rows = {row['pid']: row for row in data['processes']}
+            assert data['process_access']['privileged']
+            if visibility == 'private':
+                assert SECRET in rows[writer.pid]['command'], rows.get(writer.pid)
+            elif visibility == 'redacted':
+                assert rows[writer.pid]['command'] == '[python3]', rows.get(writer.pid)
+                assert SECRET not in json.dumps(data)
+            else:
+                assert writer.pid not in rows
+                assert SECRET not in json.dumps(data)
+            (evidence / f'hidepid-persistent-{number}-{mode}-gid-{group}.json').write_text(
+                json.dumps(data, indent=2))
+            print(f'PASS persistent helper pid={helper_pid} hidepid={mode} gid={group}: '
+                  f'{visibility}; {elapsed:.3f}s', flush=True)
+    finally:
+        helper.stdin.close()
+        try:
+            helper.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            helper.kill()
+            helper.wait(timeout=3)
+        helper.stdout.close()
+        helper.stderr.close()
+        run('mount', '-o', 'remount,hidepid=0,gid=0', '/proc')
+
+
 def hidepid(binary, account, peer, evidence):
     writer = subprocess.Popen(['python3', '-c', 'import time; time.sleep(300)', SECRET],
                               **identity(peer))
     try:
         time.sleep(0.1)
+        persistent_hidepid(account, peer, writer, evidence)
         for mode in (1, 2):
             run('mount', '-o', f'remount,hidepid={mode},gid=0', '/proc')
             # Prove real kernel enforcement before examining application output.
