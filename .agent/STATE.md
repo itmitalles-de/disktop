@@ -20,18 +20,16 @@
 - Website remains `disktop.wutz.io`, with dwtop branding and commands. EN/DE,
   desktop/mobile, themes, tabs, images and complete playback passed. Review:
   `../disktop-review/rename-dwtop/review.html` (opened in visible Brave).
-- UI is installed at `~/.local/bin/dwtop`; its receipt and SHA-256 match the
-  release. Direct live collection verifies both physical NVMe, marked /home
-  and no nonresponding mounts.
-- Remaining work is tracked by #18: local helper activation is waiting for
-  administrator authentication in `scripts/setup-helper.sh`. The existing
-  spctop UI/helper and their receipts are intentionally retained until the new
-  helper is verified. Keep `../spctop-worktrees/rename-dwtop` while its pending
-  installer references that checkout; then remove the merged worktree/branch.
-  After authentication, verify installed hashes/capabilities and live process
-  readability, then retire only receipt-verified legacy executables. Preserve
-  configuration and policy files. Evidence and narrow verification/retirement
-  scripts are in `../disktop-review/rename-dwtop/`.
+- UI and helper are installed with hashes matching the validated release;
+  helper root:tim 0750, DAC_READ_SEARCH and SYS_PTRACE; UI has no capabilities.
+  Live Space/I/O --once and JSON verify both physical NVMe, marked /home,
+  1,089 readable processes, no hidden processes and no nonresponding mounts.
+  All three scan-policy files are absent on this host, so /home is the default.
+- Receipt/hash-verified legacy spctop UI/helper and receipts were retired;
+  settings and policies remain untouched. The merged rename worktree and
+  local/remote branch were removed. #18 is complete; GitHub Issues remain the
+  canonical source of open work. Verification and retirement evidence is in
+  `../disktop-review/rename-dwtop/`.
 
 ## Full review fixes (2026-10-10)
 
