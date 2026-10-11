@@ -1,5 +1,18 @@
 # Verified state
 
+## Space layout (2026-10-11)
+
+- #20: short filesystem tables reserve only their header and actual rows,
+  releasing unused height to fill history. Space/Home blocks budget three
+  capacity rows plus history instead of the I/O meter layout. At 60x24, two
+  disks and four mounts now show both graphs and the complete table.
+- I/O layout, graph preferences, long-table scrolling and empty filter
+  messages retain their behavior. The EN/DE matrix covers eight terminal
+  sizes and 1, 2, 4, 8 and 16 disks. Verified: 104 Rust tests, fmt, Clippy,
+  release build, terminal restoration and Setup/configuration integration.
+- Actual before/after 60x24 captures and validation logs are local only in
+  `../disktop-review/space-layout/`. Collection and helper code are unchanged.
+
 ## dwtop rename (2026-10-11)
 
 - Public repository is `itmitalles-de/dwtop`, GPL-3.0-or-later; the local main
