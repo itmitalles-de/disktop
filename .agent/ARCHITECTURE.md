@@ -1,5 +1,32 @@
 # Architecture
 
+## Refactoring inventory (#36)
+
+The source has three layers: kernel/filesystem adapters and bounded background
+workers; snapshots, configuration and the helper protocol; CLI and terminal
+presentation. Adapters depend on `model`, `text` and privilege boundaries; the
+renderer consumes snapshots and never collects data. The helper and CLI share
+the library. Shell installers and Python integration checks exercise executable
+and privilege boundaries; `site/` is an independent static publication.
+
+The initial hotspots were `ui.rs` (5,252 lines), `scanner.rs` (2,478),
+`main.rs` (1,242), `config.rs` (1,138) and `collector.rs` (1,121), including
+their tests. Large regression suites and explicit bilingual text are retained
+because they document behavior. Kernel parsing, bounded probing, ZFS and
+privilege modules already have distinct responsibilities; file size alone is
+not a reason to change their boundaries. No dependencies or public interfaces
+need changing for this pass.
+
+Terminal presentation is separated by responsibility under `ui/`: `state`
+owns snapshot history and row selection; `input` handles keys and settings;
+`layout` computes disk placement; `disks`, `graphs`, `tables`, `summary` and
+`overlays` render their respective content. `ui.rs` defines shared application
+state and composes the frame. Existing `ui::App`, `ui::Sort`, layout types,
+`ui::disk_layout` and `ui::draw` retain their public paths. Internal imports are
+explicit and the existing rendering/navigation tests live in `ui/tests.rs`.
+
+## Runtime and data flow
+
 `main.rs` owns CLI validation, source selection (helper, direct collector or
 explicit demo), refresh timing, `--once`/`--json` output and terminal
 restoration. `ui.rs` receives snapshots and draws a compact htop-style layout.
