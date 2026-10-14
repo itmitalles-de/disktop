@@ -33,6 +33,12 @@ Both policy and traversal use the small descriptor metadata boundary in
 suite remains together in `scanner/tests.rs`, including tree-retention and
 permission edge cases.
 
+Configuration schema, validation and the public `ConfigFile` handle stay in
+`config.rs`. `config/storage.rs` owns file migration, ownership checks and
+atomic writes; `config/tests.rs` preserves the existing file-safety regressions.
+Field comparison/copy matches remain explicit so new settings require an
+exhaustive compiler-checked choice rather than an untyped property table.
+
 ## Runtime and data flow
 
 `main.rs` owns CLI validation, source selection (helper, direct collector or
