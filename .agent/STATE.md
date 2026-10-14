@@ -1,5 +1,20 @@
 # Verified state
 
+## Refactoring #36 (local, 2026-10-15)
+
+- Worktree `../dwtop-refactor-20261015`, branch `refactor/full-pass-20261015`,
+  based on `7030a0d`; no publication or installed-binary changes.
+- Terminal state/input/layout/renderers and scanner policy/traversal/service
+  now have explicit module boundaries; public import paths are preserved.
+  The inventory and dependency boundaries are in `ARCHITECTURE.md`.
+- Verified so far: all 124 Rust tests, formatting and Clippy; terminal/Setup
+  checks before/after UI extraction; 864 deterministic terminal text/style
+  fingerprints unchanged. A real unprivileged scan of the same synthetic
+  directory tree is identical, excluding only start time and duration.
+- Isolated I/O/helper validation and the remaining issue acceptance checks are
+  pending. Evidence is local in
+  `/home/tim/.codex/reports/refactoring-2026-10-15/dwtop/`.
+
 ## Review fixes #22–#34 (2026-10-11)
 
 - Scan-root aliases require trusted root-owned ancestors; user-controlled and

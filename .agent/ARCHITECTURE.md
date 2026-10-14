@@ -25,6 +25,14 @@ state and composes the frame. Existing `ui::App`, `ui::Sort`, layout types,
 `ui::disk_layout` and `ui::draw` retain their public paths. Internal imports are
 explicit and the existing rendering/navigation tests live in `ui/tests.rs`.
 
+The scanner keeps its public API in `scanner.rs`. `scanner/policy.rs` validates
+and securely opens roots; `scanner/walk.rs` owns traversal and bounded tree
+retention; `scanner/service.rs` owns background scheduling and growth history.
+Both policy and traversal use the small descriptor metadata boundary in
+`scanner/fs.rs`, avoiding a dependency cycle. The existing scanner regression
+suite remains together in `scanner/tests.rs`, including tree-retention and
+permission edge cases.
+
 ## Runtime and data flow
 
 `main.rs` owns CLI validation, source selection (helper, direct collector or
