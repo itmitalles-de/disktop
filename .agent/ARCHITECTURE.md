@@ -41,9 +41,11 @@ exhaustive compiler-checked choice rather than an untyped property table.
 
 ## Runtime and data flow
 
-`main.rs` owns CLI validation, source selection (helper, direct collector or
-explicit demo), refresh timing, `--once`/`--json` output and terminal
-restoration. `ui.rs` receives snapshots and draws a compact htop-style layout.
+`main.rs` orchestrates startup and shutdown. Modules under `main/` isolate
+CLI validation/runtime preferences (`cli`), helper/direct/demo source selection
+and scanner generations (`source`), polling/restoration (`terminal`) and
+`--once`/`--json` sampling and formatting (`output`). Existing binary-level
+regressions remain in `main/tests.rs`. `ui.rs` receives snapshots and draws a compact htop-style layout.
 The default Space view shows used/free capacity and fill-level history per disk
 above a filesystem table; Home shows directory sizes and growth. F4 opens the
 view menu, including the secondary I/O view, which retains RD/WR/IO meters,
