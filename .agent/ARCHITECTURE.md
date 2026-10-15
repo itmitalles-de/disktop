@@ -39,6 +39,12 @@ atomic writes; `config/tests.rs` preserves the existing file-safety regressions.
 Field comparison/copy matches remain explicit so new settings require an
 exhaustive compiler-checked choice rather than an untyped property table.
 
+Collection orchestration and caches remain in `collector.rs`; `collector/home`
+owns request-driven scan scheduling, `collector/storage` maps capacity and
+backing devices and fills older helper replies, and `collector/pseudo` bounds
+kernel pseudo-file reads. The existing public collector exports are re-exported
+unchanged. Its tests retain real sampling, mount probing and compatibility cases.
+
 ## Runtime and data flow
 
 `main.rs` orchestrates startup and shutdown. Modules under `main/` isolate

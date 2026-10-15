@@ -5,7 +5,8 @@
 - Worktree `../dwtop-refactor-20261015`, branch `refactor/full-pass-20261015`,
   based on `7030a0d`; no publication or installed-binary changes.
 - Terminal state/input/layout/renderers, scanner policy/traversal/service,
-  configuration persistence and CLI/source/output/terminal control now have
+  configuration persistence, CLI/source/output/terminal control and collector
+  adapters now have
   explicit module boundaries; public import paths are preserved.
   The inventory and dependency boundaries are in `ARCHITECTURE.md`.
 - Verified so far: all 124 Rust tests, formatting and Clippy; terminal/Setup
