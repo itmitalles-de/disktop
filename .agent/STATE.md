@@ -9,12 +9,17 @@
   adapters now have
   explicit module boundaries; public import paths are preserved.
   The inventory and dependency boundaries are in `ARCHITECTURE.md`.
-- Verified so far: all 124 Rust tests, formatting and Clippy; terminal/Setup
-  checks before/after UI extraction; 864 deterministic terminal text/style
-  fingerprints unchanged. A real unprivileged scan of the same synthetic
-  directory tree is identical, excluding only start time and duration.
-- Isolated I/O/helper validation and the remaining issue acceptance checks are
-  pending. Evidence is local in
+- Verified: all 124 Rust tests on stable and Rust 1.88, formatting, Clippy,
+  release build, ShellCheck and dependency audit. Real terminal/Setup checks
+  pass before/after; 864 deterministic terminal text/style fingerprints are
+  unchanged. A real unprivileged fixture scan is identical except timestamps.
+- Both unchanged isolated integration suites (`live_io.py`, `helper.py`) pass
+  against the release binaries in a dedicated disposable Ubuntu 24.04 KVM
+  guest: real disk/process I/O, installer/permissions, per-thread capabilities,
+  root-policy migration, private scans, fallback and shutdown. The guest
+  inherits the required host CPU reserve and idle scheduling. Hosted CI and
+  exact Docker CI execution remain pending; no runtime installation occurred
+  on the host. Evidence is local in
   `/home/tim/.codex/reports/refactoring-2026-10-15/dwtop/`.
 
 ## Review fixes #22–#34 (2026-10-11)
