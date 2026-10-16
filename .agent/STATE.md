@@ -1,5 +1,27 @@
 # Verified state
 
+## Refactoring #36 (local, 2026-10-15)
+
+- Worktree `../dwtop-refactor-20261015`, branch `refactor/full-pass-20261015`,
+  based on `7030a0d`; no publication or installed-binary changes.
+- Terminal state/input/layout/renderers, scanner policy/traversal/service,
+  configuration persistence, CLI/source/output/terminal control and collector
+  adapters now have
+  explicit module boundaries; public import paths are preserved.
+  The inventory and dependency boundaries are in `ARCHITECTURE.md`.
+- Verified: all 124 Rust tests on stable and Rust 1.88, formatting, Clippy,
+  release build, ShellCheck and dependency audit. Real terminal/Setup checks
+  pass before/after; 864 deterministic terminal text/style fingerprints are
+  unchanged. A real unprivileged fixture scan is identical except timestamps.
+- Both unchanged isolated integration suites (`live_io.py`, `helper.py`) pass
+  against the release binaries in a dedicated disposable Ubuntu 24.04 KVM
+  guest: real disk/process I/O, installer/permissions, per-thread capabilities,
+  root-policy migration, private scans, fallback and shutdown. The guest
+  inherits the required host CPU reserve and idle scheduling. Hosted CI and
+  exact Docker CI execution remain pending; no runtime installation occurred
+  on the host. Evidence is local in
+  `/home/tim/.codex/reports/refactoring-2026-10-15/dwtop/`.
+
 ## Review fixes #22–#34 (2026-10-11)
 
 - Scan-root aliases require trusted root-owned ancestors; user-controlled and

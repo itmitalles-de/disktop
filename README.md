@@ -351,6 +351,12 @@ between two refreshes are not listed; their I/O remains in the device rates.
 
 ## Development
 
+The [architecture guide](.agent/ARCHITECTURE.md) records the source inventory
+and module boundaries. CLI control lives under `src/main/`, terminal state and
+rendering under `src/ui/`, root policy/traversal under `src/scanner/`, and
+collection adapters under `src/collector/`. Public library entry points remain
+in their parent modules.
+
 ```bash
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings

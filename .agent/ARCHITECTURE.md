@@ -1,8 +1,57 @@
 # Architecture
 
-`main.rs` owns CLI validation, source selection (helper, direct collector or
-explicit demo), refresh timing, `--once`/`--json` output and terminal
-restoration. `ui.rs` receives snapshots and draws a compact htop-style layout.
+## Refactoring inventory (#36)
+
+The source has three layers: kernel/filesystem adapters and bounded background
+workers; snapshots, configuration and the helper protocol; CLI and terminal
+presentation. Adapters depend on `model`, `text` and privilege boundaries; the
+renderer consumes snapshots and never collects data. The helper and CLI share
+the library. Shell installers and Python integration checks exercise executable
+and privilege boundaries; `site/` is an independent static publication.
+
+The initial hotspots were `ui.rs` (5,252 lines), `scanner.rs` (2,478),
+`main.rs` (1,242), `config.rs` (1,138) and `collector.rs` (1,121), including
+their tests. Large regression suites and explicit bilingual text are retained
+because they document behavior. Kernel parsing, bounded probing, ZFS and
+privilege modules already have distinct responsibilities; file size alone is
+not a reason to change their boundaries. No dependencies or public interfaces
+need changing for this pass.
+
+Terminal presentation is separated by responsibility under `ui/`: `state`
+owns snapshot history and row selection; `input` handles keys and settings;
+`layout` computes disk placement; `disks`, `graphs`, `tables`, `summary` and
+`overlays` render their respective content. `ui.rs` defines shared application
+state and composes the frame. Existing `ui::App`, `ui::Sort`, layout types,
+`ui::disk_layout` and `ui::draw` retain their public paths. Internal imports are
+explicit and the existing rendering/navigation tests live in `ui/tests.rs`.
+
+The scanner keeps its public API in `scanner.rs`. `scanner/policy.rs` validates
+and securely opens roots; `scanner/walk.rs` owns traversal and bounded tree
+retention; `scanner/service.rs` owns background scheduling and growth history.
+Both policy and traversal use the small descriptor metadata boundary in
+`scanner/fs.rs`, avoiding a dependency cycle. The existing scanner regression
+suite remains together in `scanner/tests.rs`, including tree-retention and
+permission edge cases.
+
+Configuration schema, validation and the public `ConfigFile` handle stay in
+`config.rs`. `config/storage.rs` owns file migration, ownership checks and
+atomic writes; `config/tests.rs` preserves the existing file-safety regressions.
+Field comparison/copy matches remain explicit so new settings require an
+exhaustive compiler-checked choice rather than an untyped property table.
+
+Collection orchestration and caches remain in `collector.rs`; `collector/home`
+owns request-driven scan scheduling, `collector/storage` maps capacity and
+backing devices and fills older helper replies, and `collector/pseudo` bounds
+kernel pseudo-file reads. The existing public collector exports are re-exported
+unchanged. Its tests retain real sampling, mount probing and compatibility cases.
+
+## Runtime and data flow
+
+`main.rs` orchestrates startup and shutdown. Modules under `main/` isolate
+CLI validation/runtime preferences (`cli`), helper/direct/demo source selection
+and scanner generations (`source`), polling/restoration (`terminal`) and
+`--once`/`--json` sampling and formatting (`output`). Existing binary-level
+regressions remain in `main/tests.rs`. `ui.rs` receives snapshots and draws a compact htop-style layout.
 The default Space view shows used/free capacity and fill-level history per disk
 above a filesystem table; Home shows directory sizes and growth. F4 opens the
 view menu, including the secondary I/O view, which retains RD/WR/IO meters,
